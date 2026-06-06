@@ -1029,13 +1029,37 @@ impl eframe::App for MainApp {
 
                     // Grouped Controls bar directly below video viewport
                     ui.horizontal(|ui| {
-                        // Centering layout
-                        let total_width = ui.available_width();
-                        let controls_width = 280.0; // Layout width for 7 player controls + AddSnippet button
-                        let offset = (total_width - controls_width) * 0.5;
+                        let full_width = ui.available_width();
+
+                        // 1. Right-justified Add Snippet button
+                        let mut clicked = false;
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let enabled = self.in_marker.is_some() && self.out_marker.is_some();
+                            ui.add_enabled_ui(enabled, |ui| {
+                                if playback_control_button(ui, PlaybackIcon::AddSnippet, false, "Add current selection as a new snippet") {
+                                    clicked = true;
+                                }
+                            });
+                        });
+
+                        if clicked {
+                            if let (Some(inf), Some(outf)) = (self.in_marker, self.out_marker) {
+                                if inf < outf {
+                                    self.ranges.push(ExportRange {
+                                        id: self.next_range_id,
+                                        in_frame: inf,
+                                        out_frame: outf,
+                                    });
+                                    self.next_range_id += 1;
+                                }
+                            }
+                        }
+
+                        // 2. Playback controls centered relative to the full_width
+                        let controls_width = 238.0; // 6 * 26 + 34 (play) + 6 * 8 (spacing) = 238
+                        let offset = (full_width - controls_width) * 0.5;
                         ui.add_space(offset.max(0.0));
 
-                        // Pre-allocate a 34px tall region to force all buttons to align on the same horizontal center axis from the start
                         ui.allocate_ui_with_layout(
                             egui::vec2(controls_width, 34.0),
                             egui::Layout::left_to_right(egui::Align::Center),
@@ -1069,30 +1093,6 @@ impl eframe::App for MainApp {
                                 }
                                 if playback_control_button(ui, PlaybackIcon::End, false, "Go to end of video") {
                                     self.current_frame = self.total_frames;
-                                }
-
-                                ui.add_space(8.0); // Extra gap for visual separation
-
-                                // Add Snippet button (Green with a +)
-                                let enabled = self.in_marker.is_some() && self.out_marker.is_some();
-                                let mut clicked = false;
-                                ui.add_enabled_ui(enabled, |ui| {
-                                    if playback_control_button(ui, PlaybackIcon::AddSnippet, false, "Add current selection as a new snippet") {
-                                        clicked = true;
-                                    }
-                                });
-
-                                if clicked {
-                                    if let (Some(inf), Some(outf)) = (self.in_marker, self.out_marker) {
-                                        if inf < outf {
-                                            self.ranges.push(ExportRange {
-                                                id: self.next_range_id,
-                                                in_frame: inf,
-                                                out_frame: outf,
-                                            });
-                                            self.next_range_id += 1;
-                                        }
-                                    }
                                 }
                             },
                         );
