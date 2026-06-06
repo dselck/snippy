@@ -898,16 +898,7 @@ impl eframe::App for MainApp {
                         }
                     });
 
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                        ui.add_space(10.0);
-                        let btn = ui.add_enabled(
-                            !self.ranges.is_empty(),
-                            egui::Button::new("🚀 Export All Snippets").min_size(egui::vec2(ui.available_width(), 42.0))
-                        ).on_hover_text("Export all queued snippets to separate video files");
-                        if btn.clicked() {
-                            // Trigger Batch Export
-                        }
-                    });
+
                 });
             });
 
