@@ -962,9 +962,9 @@ impl eframe::App for MainApp {
                                     ui,
                                     PlaybackIcon::ExportVideo,
                                     false,
-                                    "Export all snippets to separate video files",
+                                    "Export video based on snippets",
                                 ) {
-                                    println!("Export clicked: exporting {} snippets", self.ranges.len());
+                                    println!("Export clicked: exporting single video with {} ranges", self.ranges.len());
                                 }
                             });
 
