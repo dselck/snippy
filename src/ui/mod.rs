@@ -962,7 +962,7 @@ impl eframe::App for MainApp {
                                     ui,
                                     PlaybackIcon::ExportVideo,
                                     false,
-                                    "Export video based on snippets",
+                                    "export video",
                                 ) {
                                     println!("Export clicked: exporting single video with {} ranges", self.ranges.len());
                                 }
