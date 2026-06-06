@@ -950,6 +950,36 @@ impl eframe::App for MainApp {
                                     .font(egui::FontId::proportional(14.0))
                             );
                         }
+
+                        // Right-justified Load and Export buttons
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(4.0);
+
+                            // Export button
+                            let has_ranges = !self.ranges.is_empty();
+                            ui.add_enabled_ui(has_ranges, |ui| {
+                                if playback_control_button(
+                                    ui,
+                                    PlaybackIcon::ExportVideo,
+                                    false,
+                                    "Export all snippets to separate video files",
+                                ) {
+                                    println!("Export clicked: exporting {} snippets", self.ranges.len());
+                                }
+                            });
+
+                            ui.add_space(4.0);
+
+                            // Load button
+                            if playback_control_button(
+                                ui,
+                                PlaybackIcon::LoadVideo,
+                                false,
+                                "Load video file",
+                            ) {
+                                println!("Load clicked: loading new video");
+                            }
+                        });
                     });
                     
                     ui.add_space(10.0);
