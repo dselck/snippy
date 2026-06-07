@@ -55,8 +55,8 @@ impl AudioPlaybackState {
 }
 
 pub struct AudioEngine {
-    _stream: cpal::Stream,
-    pub tx: CachingProd<Arc<SharedRb<Heap<f32>>>>,
+    pub stream: cpal::Stream,
+    pub tx: Option<CachingProd<Arc<SharedRb<Heap<f32>>>>>,
     pub playback_state: Arc<AudioPlaybackState>,
 }
 
@@ -105,8 +105,8 @@ impl AudioEngine {
         let fallback_base_time = Arc::new(std::sync::Mutex::new(0.0));
 
         Ok(Self {
-            _stream: stream,
-            tx: prod,
+            stream,
+            tx: Some(prod),
             playback_state: Arc::new(AudioPlaybackState {
                 samples_played,
                 sample_rate,
@@ -115,5 +115,13 @@ impl AudioEngine {
                 fallback_base_time,
             }),
         })
+    }
+
+    pub fn play(&self) -> Result<(), cpal::PlayStreamError> {
+        self.stream.play()
+    }
+
+    pub fn pause(&self) -> Result<(), cpal::PauseStreamError> {
+        self.stream.pause()
     }
 }

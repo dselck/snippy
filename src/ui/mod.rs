@@ -2,6 +2,7 @@ pub mod yuv_renderer;
 
 use crate::media;
 use crossbeam_channel::Receiver;
+use ringbuf::traits::Split;
 use eframe::egui;
 use eframe::egui::Color32;
 
@@ -57,6 +58,7 @@ pub struct MainApp {
 
     pub _audio_engine: Option<crate::audio::AudioEngine>,
     pub playback_state: std::sync::Arc<crate::audio::AudioPlaybackState>,
+    pub media_engine: Option<crate::media::MediaEngine>,
 }
 
 impl MainApp {
@@ -112,6 +114,7 @@ impl MainApp {
             timeline_height: 145.0,
             _audio_engine: audio_engine,
             playback_state,
+            media_engine: None,
         }
     }
 
@@ -121,6 +124,17 @@ impl MainApp {
         let seconds = total_seconds.floor() as usize % 60;
         let centiseconds = ((total_seconds - total_seconds.floor()) * 100.0).floor() as usize;
         format!("{:02}:{:02}.{:02}", minutes, seconds, centiseconds)
+    }
+
+    fn seek_to_frame(&mut self, frame: usize) {
+        self.current_frame = frame.clamp(0, self.total_frames);
+        self.playback_state.reset(self.current_frame as f64 / self.video_fps);
+        if let Some(ref me) = self.media_engine {
+            let _ = me.tx.send(crate::media::MediaCommand::Seek { frame_index: self.current_frame });
+        }
+        if let Some(ref rx) = self.frame_rx {
+            while rx.try_recv().is_ok() {}
+        }
     }
 }
 
@@ -652,15 +666,24 @@ impl eframe::App for MainApp {
             let running = self.playback_state.fallback_start_time.lock().unwrap().is_some();
             if !running {
                 self.playback_state.start_fallback_clock();
+                if let Some(ref ae) = self._audio_engine {
+                    let _ = ae.play();
+                }
             }
             self.current_frame = (self.playback_state.current_time() * self.video_fps) as usize;
             if self.current_frame >= self.total_frames {
                 self.current_frame = self.total_frames;
                 self.is_playing = false;
                 self.playback_state.stop_fallback_clock();
+                if let Some(ref ae) = self._audio_engine {
+                    let _ = ae.pause();
+                }
             }
         } else {
             self.playback_state.stop_fallback_clock();
+            if let Some(ref ae) = self._audio_engine {
+                let _ = ae.pause();
+            }
         }
 
         // 1. Process background frames
@@ -847,7 +870,7 @@ impl eframe::App for MainApp {
                             let response_id = ui.make_persistent_id(format!("filmstrip_th_{}", i));
                             let th_response = ui.interact(thub_rect, response_id, egui::Sense::click());
                             if th_response.clicked() {
-                                self.current_frame = target_frame as usize;
+                                self.seek_to_frame(target_frame as usize);
                                 self.is_playing = false; // Stop playback on seek
                             }
                         } else {
@@ -1058,7 +1081,7 @@ impl eframe::App for MainApp {
                             let rel_x = (mouse_pos.x - wave_rect.left()).clamp(0.0, wave_rect.width());
                             let pct = rel_x / wave_rect.width();
                             let target_frame = start_frame + (pct * visible_range_width) as isize;
-                            self.current_frame = target_frame.clamp(0, self.total_frames as isize) as usize;
+                            self.seek_to_frame(target_frame.clamp(0, self.total_frames as isize) as usize);
                             self.is_playing = false;
                         }
                     }
@@ -1254,7 +1277,78 @@ impl eframe::App for MainApp {
                                 false,
                                 "Load video file",
                             ) {
-                                println!("Load clicked: loading new video");
+                                if let Some(path) = rfd::FileDialog::new()
+                                    .add_filter("Video File", &["mp4", "mkv", "avi", "mov"])
+                                    .pick_file()
+                                {
+                                    // 1. Stop current playback and drop old engines
+                                    self.is_playing = false;
+                                    self.media_engine = None;
+                                    self._audio_engine = None;
+                                    self.latest_frame = None;
+
+                                    // 2. Initialize fresh Audio Engine
+                                    let mut audio_engine = crate::audio::AudioEngine::new().ok();
+                                    
+                                    // 3. Setup channels
+                                    let (frame_tx, frame_rx) = crossbeam_channel::bounded(4);
+                                    let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+
+                                    let target_sample_rate = audio_engine.as_ref().map(|ae| ae.playback_state.sample_rate).unwrap_or(44100);
+                                    let target_channels = 1; // Mono samples expected by CPAL callback
+                                    
+                                    // Set default audio producer
+                                    let audio_tx = audio_engine.as_mut().and_then(|ae| ae.tx.take()).unwrap_or_else(|| {
+                                        // Fallback/dummy buffer if no audio engine
+                                        let rb = ringbuf::SharedRb::<ringbuf::storage::Heap<f32>>::new(1024);
+                                        let (prod, _) = rb.split();
+                                        prod
+                                    });
+
+                                    // 4. Initialize MediaEngine
+                                    match crate::media::MediaEngine::new(
+                                        &path,
+                                        target_sample_rate,
+                                        target_channels,
+                                        frame_tx,
+                                        audio_tx,
+                                        cmd_rx,
+                                    ) {
+                                        Ok((me, metadata)) => {
+                                            self.total_frames = metadata.total_frames;
+                                            self.video_fps = metadata.fps;
+                                            self.video_path = Some(path.to_string_lossy().into_owned());
+                                            self.current_frame = 0;
+                                            self.in_marker = None;
+                                            self.out_marker = None;
+                                            self.ranges.clear();
+                                            
+                                            // Update active playback state and audio flag
+                                            let playback_state = audio_engine.as_ref()
+                                                .map(|ae| std::sync::Arc::clone(&ae.playback_state))
+                                                .unwrap_or_else(|| std::sync::Arc::new(crate::audio::AudioPlaybackState {
+                                                    samples_played: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                                                    sample_rate: 44100,
+                                                    has_audio: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                                                    fallback_start_time: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                                                    fallback_base_time: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
+                                                }));
+                                            
+                                            playback_state.reset(0.0);
+                                            playback_state.has_audio.store(metadata.has_audio, std::sync::atomic::Ordering::Relaxed);
+                                            
+                                            self.playback_state = playback_state;
+                                            self._audio_engine = audio_engine;
+                                            self.media_engine = Some(me);
+                                            self.frame_rx = Some(frame_rx);
+                                            
+                                            println!("Loaded video: {}", path.display());
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Failed to load video: {:?}", e);
+                                        }
+                                    }
+                                }
                             }
                         });
                     });
@@ -1312,6 +1406,7 @@ impl eframe::App for MainApp {
                     // Sleek progress slider
                     if self.progress_bar(ui) {
                         self.is_playing = false; // Stop playback on manual scrub
+                        self.seek_to_frame(self.current_frame);
                     }
 
                     ui.add_space(10.0);
@@ -1332,10 +1427,10 @@ impl eframe::App for MainApp {
                                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
                                 if playback_control_button(ui, PlaybackIcon::Start, false, "Go to start of video") {
-                                    self.current_frame = 0;
+                                    self.seek_to_frame(0);
                                 }
                                 if playback_control_button(ui, PlaybackIcon::PrevFrame, false, "Step backward one frame") {
-                                    self.current_frame = self.current_frame.saturating_sub(1);
+                                    self.seek_to_frame(self.current_frame.saturating_sub(1));
                                 }
                                 if playback_control_button(ui, PlaybackIcon::SetIn, false, "Set In marker at current frame [") {
                                     self.in_marker = Some(self.current_frame);
@@ -1352,12 +1447,10 @@ impl eframe::App for MainApp {
                                     self.out_marker = Some(self.current_frame);
                                 }
                                 if playback_control_button(ui, PlaybackIcon::NextFrame, false, "Step forward one frame") {
-                                    if self.current_frame < self.total_frames {
-                                        self.current_frame += 1;
-                                    }
+                                    self.seek_to_frame(self.current_frame + 1);
                                 }
                                 if playback_control_button(ui, PlaybackIcon::End, false, "Go to end of video") {
-                                    self.current_frame = self.total_frames;
+                                    self.seek_to_frame(self.total_frames);
                                 }
                             },
                         );
