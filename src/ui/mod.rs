@@ -626,7 +626,9 @@ impl eframe::App for MainApp {
 
         // 2. Bottom Panel: Timeline and Waveform Deck (Full width)
         egui::TopBottomPanel::bottom("timeline_deck")
-            .min_height(145.0)
+            .resizable(true)
+            .default_height(145.0)
+            .height_range(100.0..=250.0)
             .frame(egui::Frame::none()
                 .fill(Color32::from_rgb(8, 8, 14))
                 .inner_margin(egui::Margin::symmetric(16.0, 12.0)))
@@ -666,16 +668,9 @@ impl eframe::App for MainApp {
                     ui.add_space(4.0);
 
                     // 2. Sprocket Filmstrip Viewport
-                    let num_thumbnails = 7;
-                    let num_gaps = num_thumbnails - 1;
-                    let thumbnail_spacing = 6.0;
-                    let sprocket_height = 8.0;
-
                     let total_width = ui.available_width();
-                    let total_spacing = thumbnail_spacing * num_gaps as f32;
-                    let thumbnail_width = (total_width - total_spacing) / num_thumbnails as f32;
-                    let thumbnail_height = thumbnail_width * 9.0 / 16.0;
-                    let filmstrip_height = thumbnail_height + (sprocket_height * 2.0);
+                    let total_height = ui.available_height();
+                    let filmstrip_height = (total_height - 56.0).max(30.0);
 
                     let (filmstrip_rect, _response) = ui.allocate_exact_size(
                         egui::vec2(total_width, filmstrip_height),
@@ -687,19 +682,32 @@ impl eframe::App for MainApp {
                     painter.rect_filled(filmstrip_rect, 6.0, Color32::from_rgb(12, 11, 20));
                     painter.rect_stroke(filmstrip_rect, 6.0, egui::Stroke::new(1.0, Color32::from_rgb(26, 25, 43)));
 
-                    let inner_height = thumbnail_height;
+                    let thumbnail_spacing = 6.0;
+                    let sprocket_height = 8.0;
+                    let inner_height = (filmstrip_height - (sprocket_height * 2.0)).max(10.0);
+                    let thumbnail_width = inner_height * 16.0 / 9.0;
+
+                    // Calculate number of odd thumbnails that fit
+                    let mut n = ((total_width + thumbnail_spacing) / (thumbnail_width + thumbnail_spacing)) as usize;
+                    if n % 2 == 0 { n = n.saturating_sub(1); }
+                    let num_thumbnails = n.max(3);
+                    let num_gaps = num_thumbnails - 1;
+
+                    let occupied_width = num_thumbnails as f32 * thumbnail_width + num_gaps as f32 * thumbnail_spacing;
+                    let left_margin = (total_width - occupied_width) * 0.5;
+
                     let inner_rect = egui::Rect::from_min_max(
-                        egui::pos2(filmstrip_rect.left(), filmstrip_rect.top() + sprocket_height),
-                        egui::pos2(filmstrip_rect.right(), filmstrip_rect.bottom() - sprocket_height),
+                        egui::pos2(filmstrip_rect.left() + left_margin, filmstrip_rect.top() + sprocket_height),
+                        egui::pos2(filmstrip_rect.left() + left_margin + occupied_width, filmstrip_rect.bottom() - sprocket_height),
                     );
 
-                    // Draw sprockets on top and bottom margins
+                    // Draw sprockets on top and bottom margins (matching the actual thumbnails row width)
                     let sprocket_width = 8.0;
                     let sprocket_h = 5.0;
-                    let num_sprockets = 15;
-                    let sprocket_gap = (total_width - (sprocket_width * num_sprockets as f32)) / (num_sprockets - 1) as f32;
+                    let num_sprockets = ((occupied_width / 16.0) as usize).max(5);
+                    let sprocket_gap = (occupied_width - (sprocket_width * num_sprockets as f32)) / (num_sprockets - 1) as f32;
                     for s in 0..num_sprockets {
-                        let sx = filmstrip_rect.left() + s as f32 * (sprocket_width + sprocket_gap);
+                        let sx = inner_rect.left() + s as f32 * (sprocket_width + sprocket_gap);
                         
                         // Top sprocket hole
                         let top_sprocket_rect = egui::Rect::from_min_size(
@@ -754,21 +762,27 @@ impl eframe::App for MainApp {
                                 ((hash_val * 59) % 120 + 30) as u8,
                                 ((hash_val * 97) % 120 + 60) as u8,
                             );
-                            let content_rect = egui::Rect::from_min_max(
-                                egui::pos2(thub_rect.left() + 3.0, thub_rect.top() + 3.0),
-                                egui::pos2(thub_rect.right() - 3.0, thub_rect.bottom() - 13.0),
-                            );
-                            painter.rect_filled(content_rect, 2.0, bar_color);
+                            
+                            // Don't draw preview rectangle if it is too small
+                            if inner_height > 18.0 {
+                                let content_rect = egui::Rect::from_min_max(
+                                    egui::pos2(thub_rect.left() + 3.0, thub_rect.top() + 3.0),
+                                    egui::pos2(thub_rect.right() - 3.0, thub_rect.bottom() - 13.0),
+                                );
+                                painter.rect_filled(content_rect, 2.0, bar_color);
+                            }
 
-                            // Underlay text code (timecode)
-                            let time_text = self.frame_to_time(target_frame as usize);
-                            painter.text(
-                                egui::pos2(thub_rect.center().x, thub_rect.bottom() - 6.0),
-                                egui::Align2::CENTER_CENTER,
-                                time_text,
-                                egui::FontId::monospace(8.0),
-                                Color32::from_rgb(148, 163, 184),
-                            );
+                            // Underlay text code (timecode) - hide if too small
+                            if inner_height > 12.0 {
+                                let time_text = self.frame_to_time(target_frame as usize);
+                                painter.text(
+                                    egui::pos2(thub_rect.center().x, thub_rect.bottom() - 6.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    time_text,
+                                    egui::FontId::monospace(8.0),
+                                    Color32::from_rgb(148, 163, 184),
+                                );
+                            }
 
                             // Handle click interaction to center this frame
                             let response_id = ui.make_persistent_id(format!("filmstrip_th_{}", i));
@@ -782,13 +796,15 @@ impl eframe::App for MainApp {
                             painter.rect_filled(thub_rect, 4.0, Color32::from_rgb(8, 8, 14));
                             painter.rect_stroke(thub_rect, 4.0, egui::Stroke::new(1.0, Color32::from_rgb(20, 19, 32)));
                             
-                            painter.text(
-                                thub_rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "OUT",
-                                egui::FontId::proportional(9.0),
-                                Color32::from_rgb(45, 43, 75),
-                            );
+                            if inner_height > 12.0 {
+                                painter.text(
+                                    thub_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "OUT",
+                                    egui::FontId::proportional(9.0),
+                                    Color32::from_rgb(45, 43, 75),
+                                );
+                            }
                         }
                     }
 
@@ -823,8 +839,9 @@ impl eframe::App for MainApp {
                     );
 
                     // Synced frame calculations matching filmstrip
-                    let visible_range_width = (6 * delta) as f32;
-                    let start_frame = self.current_frame as isize - 3 * delta as isize;
+                    let half_width = num_thumbnails / 2;
+                    let start_frame = self.current_frame as isize - half_width as isize * delta as isize;
+                    let visible_range_width = (2 * half_width * delta) as f32;
 
                     let frame_to_x = |frame: usize| -> f32 {
                         let pct = (frame as isize - start_frame) as f32 / visible_range_width;
@@ -990,7 +1007,8 @@ impl eframe::App for MainApp {
             });
 
         egui::SidePanel::right("sidebar_deck")
-            .width_range(280.0..=350.0)
+            .resizable(false)
+            .default_width(300.0)
             .frame(egui::Frame::none()
                 .fill(Color32::from_rgb(11, 10, 18))
                 .stroke(egui::Stroke::new(1.0, Color32::from_rgb(22, 21, 38)))
