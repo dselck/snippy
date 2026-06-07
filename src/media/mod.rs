@@ -73,6 +73,7 @@ pub struct VideoMetadata {
     pub width: u32,
     pub height: u32,
     pub fps: f64,
+    pub has_audio: bool,
 }
 
 pub struct MediaEngine {
@@ -104,16 +105,23 @@ impl MediaEngine {
         let codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())?;
         let decoder = codec_ctx.decoder().video()?;
 
+        let has_audio = input
+            .streams()
+            .best(ffmpeg_next::media::Type::Audio)
+            .is_some();
+
         let metadata = VideoMetadata {
             total_frames: stream.frames() as usize,
             width: decoder.width(),
             height: decoder.height(),
             fps: stream.avg_frame_rate().numerator() as f64
                 / stream.avg_frame_rate().denominator() as f64,
+            has_audio,
         };
 
         // 2. Spawn the background Media Engine decoding loop
         let (cmd_tx, background_rx) = crossbeam_channel::unbounded();
+        let fps_clone = metadata.fps;
         let thread_handle = thread::spawn(move || {
             let _ = run_decoding_loop(
                 &path_str,
@@ -123,6 +131,7 @@ impl MediaEngine {
                 audio_tx,
                 background_rx,
                 cmd_rx,
+                fps_clone,
             );
         });
 
@@ -158,6 +167,7 @@ fn run_decoding_loop(
     mut audio_tx: CachingProd<Arc<SharedRb<Heap<f32>>>>,
     background_rx: Receiver<MediaCommand>,
     _cmd_rx: Receiver<MediaCommand>,
+    fps: f64,
 ) -> Result<(), anyhow::Error> {
     let mut input = ffmpeg_next::format::input(&path)?;
 
@@ -348,7 +358,7 @@ fn run_decoding_loop(
                     drop(packets_iter);
 
                     // Flush queues and seeking input context
-                    let seek_pts = (frame_index as f64 * 1_000_000.0 / 30.0) as i64; // mock fps
+                    let seek_pts = (frame_index as f64 * 1_000_000.0 / fps) as i64;
                     let _ = input.seek(seek_pts, ..seek_pts + 1);
 
                     // Notify audio thread to flush
