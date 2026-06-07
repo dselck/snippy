@@ -198,12 +198,15 @@ fn run_decoding_loop(
     let video_codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(video_stream.parameters())?;
     let mut video_decoder = video_codec_ctx.decoder().video()?;
     let frame_tx_clone = frame_tx.clone();
+    let time_base = video_stream.time_base();
+    let time_base_f64 = time_base.numerator() as f64 / time_base.denominator() as f64;
     
     let video_thread = thread::spawn(move || {
         let mut gop_cache = GopCache {
             keyframe_idx: usize::MAX,
             frames: Vec::new(),
         };
+        let mut fallback_frame_idx = 0;
 
         loop {
             crossbeam_channel::select! {
@@ -226,13 +229,21 @@ fn run_decoding_loop(
                                     v_stride: frame.stride(2) as u32,
                                 };
 
-                                let pts = frame.pts().unwrap_or(0) as usize;
+                                let frame_idx = match frame.pts() {
+                                    Some(pts_val) => {
+                                        let time_sec = pts_val as f64 * time_base_f64;
+                                        (time_sec * fps).round() as usize
+                                    }
+                                    None => fallback_frame_idx,
+                                };
+                                fallback_frame_idx = frame_idx + 1;
+
                                 let decoded = DecodedFrame::Cpu {
-                                    frame_idx: pts,
+                                    frame_idx,
                                     planes: planes.clone(),
                                 };
                                 
-                                gop_cache.frames.push((pts, planes));
+                                gop_cache.frames.push((frame_idx, planes));
                                 if gop_cache.frames.len() > 128 {
                                     gop_cache.frames.remove(0);
                                 }
@@ -248,6 +259,7 @@ fn run_decoding_loop(
                 }
                 recv(video_seek_rx) -> seek_res => {
                     if let Ok((frame_index, resp_tx)) = seek_res {
+                        fallback_frame_idx = frame_index;
                         if let Some(planes) = gop_cache.find(frame_index) {
                             let decoded = DecodedFrame::Cpu {
                                 frame_idx: frame_index,
