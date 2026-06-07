@@ -2,6 +2,9 @@ use crossbeam_channel::{Receiver, Sender};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
+use ringbuf::wrap::CachingProd;
+use ringbuf::storage::Heap;
+use ringbuf::SharedRb;
 
 #[derive(Clone, Debug)]
 pub enum GpuFrameDescriptor {
@@ -76,7 +79,10 @@ pub struct MediaEngine {
 impl MediaEngine {
     pub fn new<P: AsRef<Path>>(
         path: P,
-        frame_tx: Sender<YuvPlanes>,
+        target_sample_rate: u32,
+        target_channels: usize,
+        frame_tx: Sender<DecodedFrame>,
+        audio_tx: CachingProd<Arc<SharedRb<Heap<f32>>>>,
         cmd_rx: Receiver<MediaCommand>,
     ) -> Result<(Self, VideoMetadata), anyhow::Error> {
         // Initialize FFmpeg
@@ -105,7 +111,15 @@ impl MediaEngine {
         // 2. Spawn the background Media Engine decoding loop
         let (cmd_tx, background_rx) = crossbeam_channel::unbounded();
         let thread_handle = thread::spawn(move || {
-            let _ = run_decoding_loop(&path_str, frame_tx, background_rx, cmd_rx);
+            let _ = run_decoding_loop(
+                &path_str,
+                target_sample_rate,
+                target_channels,
+                frame_tx,
+                audio_tx,
+                background_rx,
+                cmd_rx,
+            );
         });
 
         Ok((
@@ -126,7 +140,10 @@ struct GopCache {
 
 fn run_decoding_loop(
     _path: &str,
-    _frame_tx: Sender<YuvPlanes>,
+    _target_sample_rate: u32,
+    _target_channels: usize,
+    _frame_tx: Sender<DecodedFrame>,
+    _audio_tx: CachingProd<Arc<SharedRb<Heap<f32>>>>,
     _background_rx: Receiver<MediaCommand>,
     _cmd_rx: Receiver<MediaCommand>,
 ) -> Result<(), anyhow::Error> {
