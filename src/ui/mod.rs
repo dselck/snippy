@@ -46,6 +46,9 @@ pub struct MainApp {
 
     // Mock Audio Loudness Profile (for visual layout)
     pub loudness_profile: Vec<f32>,
+
+    // Filmstrip Zoom Level (0.0 = fully zoomed out, 1.0 = fully zoomed in)
+    pub zoom_level: f32,
 }
 
 impl MainApp {
@@ -79,6 +82,7 @@ impl MainApp {
             frame_rx: None,
             latest_frame: None,
             loudness_profile: loudness,
+            zoom_level: 0.0,
         }
     }
 
