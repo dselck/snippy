@@ -666,9 +666,19 @@ impl eframe::App for MainApp {
                     ui.add_space(4.0);
 
                     // 2. Sprocket Filmstrip Viewport
-                    let filmstrip_height = 56.0;
+                    let num_thumbnails = 7;
+                    let num_gaps = num_thumbnails - 1;
+                    let thumbnail_spacing = 6.0;
+                    let sprocket_height = 8.0;
+
+                    let total_width = ui.available_width();
+                    let total_spacing = thumbnail_spacing * num_gaps as f32;
+                    let thumbnail_width = (total_width - total_spacing) / num_thumbnails as f32;
+                    let thumbnail_height = thumbnail_width * 9.0 / 16.0;
+                    let filmstrip_height = thumbnail_height + (sprocket_height * 2.0);
+
                     let (filmstrip_rect, _response) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), filmstrip_height),
+                        egui::vec2(total_width, filmstrip_height),
                         egui::Sense::hover(),
                     );
                     
@@ -677,19 +687,11 @@ impl eframe::App for MainApp {
                     painter.rect_filled(filmstrip_rect, 6.0, Color32::from_rgb(12, 11, 20));
                     painter.rect_stroke(filmstrip_rect, 6.0, egui::Stroke::new(1.0, Color32::from_rgb(26, 25, 43)));
 
-                    let num_thumbnails = 7;
-                    let num_gaps = num_thumbnails - 1;
-                    let thumbnail_spacing = 6.0;
-                    let sprocket_height = 8.0;
-                    let inner_height = filmstrip_rect.height() - (sprocket_height * 2.0);
+                    let inner_height = thumbnail_height;
                     let inner_rect = egui::Rect::from_min_max(
                         egui::pos2(filmstrip_rect.left(), filmstrip_rect.top() + sprocket_height),
                         egui::pos2(filmstrip_rect.right(), filmstrip_rect.bottom() - sprocket_height),
                     );
-
-                    let total_width = inner_rect.width();
-                    let total_spacing = thumbnail_spacing * num_gaps as f32;
-                    let thumbnail_width = (total_width - total_spacing) / num_thumbnails as f32;
 
                     // Draw sprockets on top and bottom margins
                     let sprocket_width = 8.0;
