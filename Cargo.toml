@@ -1,0 +1,24 @@
+[package]
+name = "snippy2"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = { version = "0.27.2", features = ["wgpu"] }
+ffmpeg-next = "8.1.0"
+cpal = "0.15.3"
+ringbuf = "0.4.4"
+crossbeam-channel = "0.5.12"
+tokio = { version = "1.37.0", features = ["rt", "rt-multi-thread"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0.82"
+bytemuck = { version = "1.16.0", features = ["derive"] }
+rfd = "0.14"
+
+# Workaround for macOS strict Objective-C type checking panic in winit/objc2
+[profile.dev.package.objc2]
+debug-assertions = false
+
+[profile.dev.package.icrate]
+debug-assertions = false
