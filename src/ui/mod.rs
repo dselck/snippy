@@ -1244,8 +1244,12 @@ impl eframe::App for MainApp {
                         ui.add_space(8.0);
 
                         if let Some(path) = &self.video_path {
+                            let filename = std::path::Path::new(path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or(path);
                             ui.label(
-                                egui::RichText::new(format!("—  {}", path))
+                                egui::RichText::new(format!("—  {}", filename))
                                     .color(Color32::from_rgb(142, 144, 166))
                                     .font(egui::FontId::proportional(14.0))
                             );

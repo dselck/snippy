@@ -110,12 +110,20 @@ impl MediaEngine {
             .best(ffmpeg_next::media::Type::Audio)
             .is_some();
 
+        let fps = stream.avg_frame_rate().numerator() as f64
+            / stream.avg_frame_rate().denominator() as f64;
+
+        let mut total_frames = stream.frames() as usize;
+        if total_frames == 0 {
+            let duration_secs = input.duration() as f64 / 1_000_000.0;
+            total_frames = (duration_secs * fps).round() as usize;
+        }
+
         let metadata = VideoMetadata {
-            total_frames: stream.frames() as usize,
+            total_frames,
             width: decoder.width(),
             height: decoder.height(),
-            fps: stream.avg_frame_rate().numerator() as f64
-                / stream.avg_frame_rate().denominator() as f64,
+            fps,
             has_audio,
         };
 
