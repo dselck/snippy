@@ -1,4 +1,4 @@
-use crate::media::YuvPlanes;
+use crate::media;
 use crossbeam_channel::Receiver;
 use eframe::egui;
 use eframe::egui::Color32;
@@ -41,8 +41,8 @@ pub struct MainApp {
     pub cut_mode: bool,
 
     // Channels & Playback
-    pub frame_rx: Option<Receiver<YuvPlanes>>,
-    pub latest_frame: Option<YuvPlanes>,
+    pub frame_rx: Option<Receiver<media::DecodedFrame>>,
+    pub latest_frame: Option<media::DecodedFrame>,
 
     // Mock Audio Loudness Profile (for visual layout)
     pub loudness_profile: Vec<f32>,
@@ -629,7 +629,7 @@ impl eframe::App for MainApp {
         }
 
         // 2. Bottom Panel: Timeline and Waveform Deck (Full width)
-        let panel_response = egui::TopBottomPanel::bottom("timeline_deck")
+        egui::TopBottomPanel::bottom("timeline_deck")
             .resizable(true)
             .default_height(self.timeline_height)
             .height_range(100.0..=250.0)
@@ -673,7 +673,8 @@ impl eframe::App for MainApp {
 
                     // 2. Sprocket Filmstrip Viewport
                     let total_width = ui.available_width();
-                    let filmstrip_height = (self.timeline_height - 80.0).max(30.0);
+                    let spacing_y = ui.spacing().item_spacing.y;
+                    let filmstrip_height = (ui.available_height() - 30.0 - spacing_y).max(30.0);
 
                     let (filmstrip_rect, _response) = ui.allocate_exact_size(
                         egui::vec2(total_width, filmstrip_height),
@@ -1009,10 +1010,8 @@ impl eframe::App for MainApp {
                 });
             });
 
-        let new_height = panel_response.response.rect.height();
-        if new_height != self.timeline_height && ctx.input(|i| i.pointer.any_down()) {
-            self.timeline_height = new_height;
-        }
+        // Egui's TopBottomPanel automatically persists the resized height in its internal memory.
+        // We do not update self.timeline_height here to avoid a layout feedback loop.
 
         egui::SidePanel::right("sidebar_deck")
             .resizable(false)
