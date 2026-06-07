@@ -49,6 +49,9 @@ pub struct MainApp {
 
     // Filmstrip Zoom Level (0.0 = fully zoomed out, 1.0 = fully zoomed in)
     pub zoom_level: f32,
+
+    // Height of the resizable bottom timeline deck panel
+    pub timeline_height: f32,
 }
 
 impl MainApp {
@@ -83,6 +86,7 @@ impl MainApp {
             latest_frame: None,
             loudness_profile: loudness,
             zoom_level: 0.0,
+            timeline_height: 145.0,
         }
     }
 
@@ -625,9 +629,9 @@ impl eframe::App for MainApp {
         }
 
         // 2. Bottom Panel: Timeline and Waveform Deck (Full width)
-        egui::TopBottomPanel::bottom("timeline_deck")
+        let panel_response = egui::TopBottomPanel::bottom("timeline_deck")
             .resizable(true)
-            .default_height(145.0)
+            .default_height(self.timeline_height)
             .height_range(100.0..=250.0)
             .frame(egui::Frame::none()
                 .fill(Color32::from_rgb(8, 8, 14))
@@ -669,8 +673,7 @@ impl eframe::App for MainApp {
 
                     // 2. Sprocket Filmstrip Viewport
                     let total_width = ui.available_width();
-                    let total_height = ui.available_height();
-                    let filmstrip_height = (total_height - 56.0).max(30.0);
+                    let filmstrip_height = (self.timeline_height - 80.0).max(30.0);
 
                     let (filmstrip_rect, _response) = ui.allocate_exact_size(
                         egui::vec2(total_width, filmstrip_height),
@@ -1005,6 +1008,8 @@ impl eframe::App for MainApp {
                     }
                 });
             });
+
+        self.timeline_height = panel_response.response.rect.height();
 
         egui::SidePanel::right("sidebar_deck")
             .resizable(false)
