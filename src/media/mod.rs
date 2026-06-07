@@ -136,6 +136,7 @@ impl MediaEngine {
     }
 }
 
+#[allow(dead_code)]
 struct GopCache {
     keyframe_idx: usize,
     frames: Vec<(usize, YuvPlanes)>,
@@ -156,7 +157,7 @@ fn run_decoding_loop(
     frame_tx: Sender<DecodedFrame>,
     mut audio_tx: CachingProd<Arc<SharedRb<Heap<f32>>>>,
     background_rx: Receiver<MediaCommand>,
-    cmd_rx: Receiver<MediaCommand>,
+    _cmd_rx: Receiver<MediaCommand>,
 ) -> Result<(), anyhow::Error> {
     let mut input = ffmpeg_next::format::input(&path)?;
 
