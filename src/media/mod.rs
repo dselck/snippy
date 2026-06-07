@@ -32,10 +32,12 @@ pub enum DecodedFrame {
     Cpu {
         frame_idx: usize,
         planes: YuvPlanes,
+        sequence_id: usize,
     },
     Gpu {
         frame_idx: usize,
         descriptor: GpuFrameDescriptor,
+        sequence_id: usize,
     },
 }
 
@@ -44,6 +46,13 @@ impl DecodedFrame {
         match self {
             DecodedFrame::Cpu { frame_idx, .. } => *frame_idx,
             DecodedFrame::Gpu { frame_idx, .. } => *frame_idx,
+        }
+    }
+
+    pub fn sequence_id(&self) -> usize {
+        match self {
+            DecodedFrame::Cpu { sequence_id, .. } => *sequence_id,
+            DecodedFrame::Gpu { sequence_id, .. } => *sequence_id,
         }
     }
 }
@@ -64,8 +73,22 @@ pub struct YuvPlanes {
 pub enum MediaCommand {
     Play,
     Pause,
-    Seek { frame_index: usize },
+    Seek { frame_index: usize, keyframe_only: bool, sequence_id: usize },
     Shutdown,
+}
+
+pub enum VideoThreadCommand {
+    Seek {
+        frame_index: usize,
+        keyframe_only: bool,
+        sequence_id: usize,
+        resp_tx: Sender<bool>,
+    },
+    Play,
+}
+
+pub enum AudioThreadCommand {
+    Seek { target_time: f64 },
 }
 
 pub struct VideoMetadata {
@@ -74,6 +97,7 @@ pub struct VideoMetadata {
     pub height: u32,
     pub fps: f64,
     pub has_audio: bool,
+    pub keyframes: Vec<usize>,
 }
 
 pub struct MediaEngine {
@@ -119,12 +143,33 @@ impl MediaEngine {
             total_frames = (duration_secs * fps).round() as usize;
         }
 
+        // Scan keyframes synchronously
+        let keyframes = {
+            let mut scan = ffmpeg_next::format::input(&path_str)?;
+            let video_stream_idx = stream.index();
+            let mut kfs = Vec::new();
+            let mut frame_idx: usize = 0;
+            for (stream, packet) in scan.packets() {
+                if stream.index() == video_stream_idx {
+                    if packet.is_key() {
+                        kfs.push(frame_idx);
+                    }
+                    frame_idx += 1;
+                }
+            }
+            if kfs.is_empty() || kfs[0] != 0 {
+                kfs.insert(0, 0);
+            }
+            kfs
+        };
+
         let metadata = VideoMetadata {
             total_frames,
             width: decoder.width(),
             height: decoder.height(),
             fps,
             has_audio,
+            keyframes,
         };
 
         // 2. Spawn the background Media Engine decoding loop
@@ -191,8 +236,8 @@ fn run_decoding_loop(
     // Channels for routing raw packets to decoder threads
     let (video_packet_tx, video_packet_rx) = crossbeam_channel::bounded::<ffmpeg_next::Packet>(32);
     let (audio_packet_tx, audio_packet_rx) = crossbeam_channel::bounded::<ffmpeg_next::Packet>(64);
-    let (video_seek_tx, video_seek_rx) = crossbeam_channel::bounded::<(usize, Sender<bool>)>(1);
-    let (audio_seek_tx, audio_seek_rx) = crossbeam_channel::bounded::<()>(1);
+    let (video_cmd_tx, video_cmd_rx) = crossbeam_channel::bounded::<VideoThreadCommand>(1);
+    let (audio_cmd_tx, audio_cmd_rx) = crossbeam_channel::bounded::<AudioThreadCommand>(1);
 
     // Spawn Video Decoder Thread
     let video_codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(video_stream.parameters())?;
@@ -207,102 +252,184 @@ fn run_decoding_loop(
             frames: Vec::new(),
         };
         let mut fallback_frame_idx = 0;
-
         let mut scaler: Option<ffmpeg_next::software::scaling::context::Context> = None;
 
+        let mut keyframe_only_mode = false;
+        let mut decode_more = true;
+        let mut current_sequence_id = 0;
+
         loop {
-            crossbeam_channel::select! {
-                recv(video_packet_rx) -> packet_res => {
-                    if let Ok(packet) = packet_res {
-                        if video_decoder.send_packet(&packet).is_ok() {
-                            let mut frame = ffmpeg_next::util::frame::Video::empty();
-                            while video_decoder.receive_frame(&mut frame).is_ok() {
-                                let mut scaled_frame = ffmpeg_next::util::frame::Video::empty();
-                                let video_frame = if frame.format() != ffmpeg_next::format::Pixel::YUV420P {
-                                    let s = match scaler {
-                                        Some(ref mut s) if s.input().format == frame.format()
-                                            && s.input().width == frame.width()
-                                            && s.input().height == frame.height() => s,
-                                        _ => {
-                                            let new_s = ffmpeg_next::software::scaling::context::Context::get(
-                                                frame.format(),
-                                                frame.width(),
-                                                frame.height(),
-                                                ffmpeg_next::format::Pixel::YUV420P,
-                                                frame.width(),
-                                                frame.height(),
-                                                ffmpeg_next::software::scaling::flag::Flags::BILINEAR,
-                                            ).unwrap();
-                                            scaler = Some(new_s);
-                                            scaler.as_mut().unwrap()
-                                        }
+            if decode_more {
+                crossbeam_channel::select! {
+                    recv(video_packet_rx) -> packet_res => {
+                        if let Ok(packet) = packet_res {
+                            if video_decoder.send_packet(&packet).is_ok() {
+                                let mut frame = ffmpeg_next::util::frame::Video::empty();
+                                while video_decoder.receive_frame(&mut frame).is_ok() {
+                                    let mut scaled_frame = ffmpeg_next::util::frame::Video::empty();
+                                    let video_frame = if frame.format() != ffmpeg_next::format::Pixel::YUV420P {
+                                        let s = match scaler {
+                                            Some(ref mut s) if s.input().format == frame.format()
+                                                && s.input().width == frame.width()
+                                                && s.input().height == frame.height() => s,
+                                            _ => {
+                                                let new_s = ffmpeg_next::software::scaling::context::Context::get(
+                                                    frame.format(),
+                                                    frame.width(),
+                                                    frame.height(),
+                                                    ffmpeg_next::format::Pixel::YUV420P,
+                                                    frame.width(),
+                                                    frame.height(),
+                                                    ffmpeg_next::software::scaling::flag::Flags::BILINEAR,
+                                                ).unwrap();
+                                                scaler = Some(new_s);
+                                                scaler.as_mut().unwrap()
+                                            }
+                                        };
+                                        s.run(&frame, &mut scaled_frame).unwrap();
+                                        &scaled_frame
+                                    } else {
+                                        &frame
                                     };
-                                    s.run(&frame, &mut scaled_frame).unwrap();
-                                    &scaled_frame
-                                } else {
-                                    &frame
-                                };
 
-                                let w = video_frame.width();
-                                let h = video_frame.height();
-                                
-                                let planes = YuvPlanes {
-                                    y: video_frame.data(0).to_vec(),
-                                    u: video_frame.data(1).to_vec(),
-                                    v: video_frame.data(2).to_vec(),
-                                    width: w,
-                                    height: h,
-                                    y_stride: video_frame.stride(0) as u32,
-                                    u_stride: video_frame.stride(1) as u32,
-                                    v_stride: video_frame.stride(2) as u32,
-                                };
+                                    let w = video_frame.width();
+                                    let h = video_frame.height();
+                                    
+                                    let planes = YuvPlanes {
+                                        y: video_frame.data(0).to_vec(),
+                                        u: video_frame.data(1).to_vec(),
+                                        v: video_frame.data(2).to_vec(),
+                                        width: w,
+                                        height: h,
+                                        y_stride: video_frame.stride(0) as u32,
+                                        u_stride: video_frame.stride(1) as u32,
+                                        v_stride: video_frame.stride(2) as u32,
+                                    };
 
-                                let frame_idx = match frame.pts() {
-                                    Some(pts_val) => {
-                                        let time_sec = pts_val as f64 * time_base_f64;
-                                        (time_sec * fps).round() as usize
+                                    let frame_idx = match frame.pts() {
+                                        Some(pts_val) => {
+                                            let time_sec = pts_val as f64 * time_base_f64;
+                                            (time_sec * fps).round() as usize
+                                        }
+                                        None => fallback_frame_idx,
+                                    };
+                                    fallback_frame_idx = frame_idx + 1;
+
+                                    let decoded = DecodedFrame::Cpu {
+                                        frame_idx,
+                                        planes: planes.clone(),
+                                        sequence_id: current_sequence_id,
+                                    };
+                                    
+                                    gop_cache.frames.push((frame_idx, planes));
+                                    if gop_cache.frames.len() > 128 {
+                                        gop_cache.frames.remove(0);
                                     }
-                                    None => fallback_frame_idx,
-                                };
-                                fallback_frame_idx = frame_idx + 1;
+                                    
+                                    let mut sent = false;
+                                    crossbeam_channel::select! {
+                                        send(frame_tx_clone, decoded) -> res => {
+                                            if res.is_ok() {
+                                                sent = true;
+                                            }
+                                        }
+                                        recv(video_cmd_rx) -> cmd_res => {
+                                            if let Ok(cmd) = cmd_res {
+                                                match cmd {
+                                                    VideoThreadCommand::Seek { frame_index, keyframe_only, sequence_id, resp_tx } => {
+                                                        fallback_frame_idx = frame_index;
+                                                        keyframe_only_mode = keyframe_only;
+                                                        current_sequence_id = sequence_id;
+                                                        if let Some(planes) = gop_cache.find(frame_index) {
+                                                            let decoded = DecodedFrame::Cpu {
+                                                                frame_idx: frame_index,
+                                                                planes,
+                                                                sequence_id,
+                                                            };
+                                                            let _ = frame_tx_clone.send(decoded);
+                                                        }
+                                                        while video_packet_rx.try_recv().is_ok() {}
+                                                        video_decoder.flush();
+                                                        let _ = resp_tx.send(false); // Always force demuxer seek to sync audio
+                                                        decode_more = true;
+                                                    }
+                                                    VideoThreadCommand::Play => {
+                                                        keyframe_only_mode = false;
+                                                        decode_more = true;
+                                                    }
+                                                }
+                                                break; // break the receive_frame loop
+                                            } else {
+                                                return;
+                                            }
+                                        }
+                                    }
 
-                                let decoded = DecodedFrame::Cpu {
-                                    frame_idx,
-                                    planes: planes.clone(),
-                                };
-                                
-                                gop_cache.frames.push((frame_idx, planes));
-                                if gop_cache.frames.len() > 128 {
-                                    gop_cache.frames.remove(0);
-                                }
-                                
-                                if frame_tx_clone.send(decoded).is_err() {
-                                    return;
+                                    if !sent {
+                                        break; // abort further decoding for the current packet
+                                    }
+
+                                    if keyframe_only_mode {
+                                        decode_more = false;
+                                        break;
+                                    }
                                 }
                             }
+                        } else {
+                            break;
                         }
-                    } else {
-                        break;
+                    }
+                    recv(video_cmd_rx) -> cmd_res => {
+                        match cmd_res {
+                            Ok(VideoThreadCommand::Seek { frame_index, keyframe_only, sequence_id, resp_tx }) => {
+                                fallback_frame_idx = frame_index;
+                                keyframe_only_mode = keyframe_only;
+                                current_sequence_id = sequence_id;
+                                if let Some(planes) = gop_cache.find(frame_index) {
+                                    let decoded = DecodedFrame::Cpu {
+                                        frame_idx: frame_index,
+                                        planes,
+                                        sequence_id,
+                                    };
+                                    let _ = frame_tx_clone.send(decoded);
+                                }
+                                while video_packet_rx.try_recv().is_ok() {}
+                                video_decoder.flush();
+                                let _ = resp_tx.send(false); // Always force demuxer seek to sync audio
+                                decode_more = true;
+                            }
+                            Ok(VideoThreadCommand::Play) => {
+                                keyframe_only_mode = false;
+                                decode_more = true;
+                            }
+                            Err(_) => break,
+                        }
                     }
                 }
-                recv(video_seek_rx) -> seek_res => {
-                    if let Ok((frame_index, resp_tx)) = seek_res {
+            } else {
+                match video_cmd_rx.recv() {
+                    Ok(VideoThreadCommand::Seek { frame_index, keyframe_only, sequence_id, resp_tx }) => {
                         fallback_frame_idx = frame_index;
+                        keyframe_only_mode = keyframe_only;
+                        current_sequence_id = sequence_id;
                         if let Some(planes) = gop_cache.find(frame_index) {
                             let decoded = DecodedFrame::Cpu {
                                 frame_idx: frame_index,
                                 planes,
+                                sequence_id,
                             };
                             let _ = frame_tx_clone.send(decoded);
-                            let _ = resp_tx.send(true);
-                        } else {
-                            while video_packet_rx.try_recv().is_ok() {}
-                            video_decoder.flush();
-                            let _ = resp_tx.send(false);
                         }
-                    } else {
-                        break;
+                        while video_packet_rx.try_recv().is_ok() {}
+                        video_decoder.flush();
+                        let _ = resp_tx.send(false); // Always force demuxer seek to sync audio
+                        decode_more = true;
                     }
+                    Ok(VideoThreadCommand::Play) => {
+                        keyframe_only_mode = false;
+                        decode_more = true;
+                    }
+                    Err(_) => break,
                 }
             }
         }
@@ -312,17 +439,51 @@ fn run_decoding_loop(
     let audio_thread_opt = if let Some(ref stream) = audio_stream_opt {
         let audio_codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())?;
         let mut audio_decoder = audio_codec_ctx.decoder().audio()?;
+        let audio_time_base = stream.time_base();
+        let audio_tb_f64 = audio_time_base.numerator() as f64 / audio_time_base.denominator() as f64;
         
         let audio_thread = thread::spawn(move || {
             let mut resampler: Option<ResamplerContext> = None;
+            let mut skip_until_time = 0.0;
+            let mut is_first_audio_frame = true;
+            let mut current_audio_time = 0.0;
 
             loop {
                 crossbeam_channel::select! {
                     recv(audio_packet_rx) -> packet_res => {
                         if let Ok(packet) = packet_res {
+                            if is_first_audio_frame {
+                                if let Some(pts) = packet.pts() {
+                                    current_audio_time = pts as f64 * audio_tb_f64;
+                                }
+                            }
                             if audio_decoder.send_packet(&packet).is_ok() {
+                                let mut seek_aborted = false;
                                 let mut frame = ffmpeg_next::util::frame::Audio::empty();
                                 while audio_decoder.receive_frame(&mut frame).is_ok() {
+                                    let mut start_idx = 0;
+                                    let mut silence_padding_samples = 0;
+
+                                    let duration_sec = frame.samples() as f64 / frame.rate() as f64;
+                                    let pts_sec = current_audio_time;
+                                    let frame_end_sec = pts_sec + duration_sec;
+                                    current_audio_time += duration_sec;
+
+                                    if is_first_audio_frame {
+                                        if frame_end_sec < skip_until_time {
+                                            continue;
+                                        }
+
+                                        if pts_sec <= skip_until_time {
+                                            let discard_sec = skip_until_time - pts_sec;
+                                            start_idx = (discard_sec * target_sample_rate as f64).round() as usize * target_channels;
+                                        } else {
+                                            let gap_sec = pts_sec - skip_until_time;
+                                            silence_padding_samples = (gap_sec * target_sample_rate as f64).round() as usize * target_channels;
+                                        }
+                                        is_first_audio_frame = false;
+                                    }
+
                                     let r = match resampler {
                                         Some(ref mut r) if r.input().format == frame.format()
                                             && r.input().channel_layout == frame.channel_layout()
@@ -351,14 +512,64 @@ fn run_decoding_loop(
                                     if r.run(&frame, &mut resampled).is_ok() {
                                         let sample_count = resampled.samples();
                                         if sample_count > 0 {
-                                            let data: &[f32] = bytemuck::cast_slice(&resampled.data(0)[..sample_count * 4]);
-                                            for &sample in data {
-                                                // Wait/block if CPAL buffer is full (providing backpressure)
-                                                while audio_tx.try_push(sample).is_err() {
-                                                    thread::sleep(std::time::Duration::from_millis(5));
+                                            let byte_count = sample_count * target_channels * 4;
+                                            let data: &[f32] = bytemuck::cast_slice(&resampled.data(0)[..byte_count]);
+                                            
+                                            // 1. Push silence padding if any
+                                            if silence_padding_samples > 0 {
+                                                for _ in 0..silence_padding_samples {
+                                                    while audio_tx.try_push(0.0).is_err() {
+                                                        if let Ok(cmd) = audio_cmd_rx.try_recv() {
+                                                            match cmd {
+                                                                AudioThreadCommand::Seek { target_time } => {
+                                                                    while audio_packet_rx.try_recv().is_ok() {}
+                                                                    audio_decoder.flush();
+                                                                    skip_until_time = target_time;
+                                                                    is_first_audio_frame = true;
+                                                                    current_audio_time = target_time;
+                                                                    seek_aborted = true;
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                        thread::sleep(std::time::Duration::from_millis(5));
+                                                    }
+                                                    if seek_aborted {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+
+                                            // 2. Push actual samples starting from start_idx
+                                            if !seek_aborted {
+                                                let start_idx = start_idx.min(data.len());
+                                                for &sample in &data[start_idx..] {
+                                                    while audio_tx.try_push(sample).is_err() {
+                                                        if let Ok(cmd) = audio_cmd_rx.try_recv() {
+                                                            match cmd {
+                                                                AudioThreadCommand::Seek { target_time } => {
+                                                                    while audio_packet_rx.try_recv().is_ok() {}
+                                                                    audio_decoder.flush();
+                                                                    skip_until_time = target_time;
+                                                                    is_first_audio_frame = true;
+                                                                    current_audio_time = target_time;
+                                                                    seek_aborted = true;
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                        thread::sleep(std::time::Duration::from_millis(5));
+                                                    }
+                                                    if seek_aborted {
+                                                        break;
+                                                    }
                                                 }
                                             }
                                         }
+                                    }
+
+                                    if seek_aborted {
+                                        break;
                                     }
                                 }
                             }
@@ -366,12 +577,16 @@ fn run_decoding_loop(
                             break;
                         }
                     }
-                    recv(audio_seek_rx) -> seek_res => {
-                        if seek_res.is_ok() {
-                            while audio_packet_rx.try_recv().is_ok() {}
-                            audio_decoder.flush();
-                        } else {
-                            break;
+                    recv(audio_cmd_rx) -> cmd_res => {
+                        match cmd_res {
+                            Ok(AudioThreadCommand::Seek { target_time }) => {
+                                while audio_packet_rx.try_recv().is_ok() {}
+                                audio_decoder.flush();
+                                skip_until_time = target_time;
+                                is_first_audio_frame = true;
+                                current_audio_time = target_time;
+                            }
+                            Err(_) => break,
                         }
                     }
                 }
@@ -384,22 +599,27 @@ fn run_decoding_loop(
 
     // Main demuxer loop using manually advanced packets iterator
     let mut packets_iter = input.packets();
+    let mut pending_packet = None;
+    let mut seek_requested = None;
+
     loop {
-        // Handle incoming command overrides
-        let mut seek_requested = None;
+        // 1. Handle incoming command overrides
         while let Ok(cmd) = background_rx.try_recv() {
             match cmd {
                 MediaCommand::Shutdown => return Ok(()),
-                MediaCommand::Seek { frame_index } => {
-                    seek_requested = Some(frame_index);
+                MediaCommand::Play => {
+                    let _ = video_cmd_tx.send(VideoThreadCommand::Play);
                 }
-                _ => {}
+                MediaCommand::Pause => {}
+                MediaCommand::Seek { frame_index, keyframe_only, sequence_id } => {
+                    seek_requested = Some((frame_index, keyframe_only, sequence_id));
+                }
             }
         }
 
-        if let Some(frame_index) = seek_requested {
+        if let Some((frame_index, keyframe_only, sequence_id)) = seek_requested.take() {
             let (resp_tx, resp_rx) = crossbeam_channel::bounded::<bool>(1);
-            let _ = video_seek_tx.send((frame_index, resp_tx));
+            let _ = video_cmd_tx.send(VideoThreadCommand::Seek { frame_index, keyframe_only, sequence_id, resp_tx });
             if let Ok(found) = resp_rx.recv() {
                 if !found {
                     // Drop packets_iter to release borrow on input
@@ -410,36 +630,124 @@ fn run_decoding_loop(
                     let _ = input.seek(seek_pts, ..seek_pts + 1);
 
                     // Notify audio thread to flush
-                    let _ = audio_seek_tx.send(());
+                    let target_time = frame_index as f64 / fps;
+                    let _ = audio_cmd_tx.send(AudioThreadCommand::Seek { target_time });
 
                     // Recreate packets_iter
                     packets_iter = input.packets();
                 }
             }
+            pending_packet = None; // Clear any pending packet on seek
             continue;
         }
 
-        if let Some(packet_res) = packets_iter.next() {
-            let (stream, packet) = packet_res;
-            if stream.index() == video_stream_idx {
-                if video_packet_tx.send(packet).is_err() {
-                    break;
-                }
-            } else if Some(stream.index()) == audio_stream_idx_opt {
-                if audio_packet_tx.send(packet).is_err() {
-                    break;
+        // 2. Demux next packet if we don't have one pending
+        if pending_packet.is_none() {
+            if let Some(packet_res) = packets_iter.next() {
+                let (stream, packet) = packet_res;
+                pending_packet = Some((stream.index(), packet));
+            } else {
+                // End of stream - wait for further commands (e.g. seek)
+                match background_rx.recv() {
+                    Ok(cmd) => {
+                        match cmd {
+                            MediaCommand::Shutdown => return Ok(()),
+                            MediaCommand::Play => {
+                                let _ = video_cmd_tx.send(VideoThreadCommand::Play);
+                            }
+                            MediaCommand::Pause => {}
+                            MediaCommand::Seek { frame_index, keyframe_only, sequence_id } => {
+                                seek_requested = Some((frame_index, keyframe_only, sequence_id));
+                            }
+                        }
+                        if let Some((frame_index, keyframe_only, sequence_id)) = seek_requested.take() {
+                            let (resp_tx, resp_rx) = crossbeam_channel::bounded::<bool>(1);
+                            let _ = video_cmd_tx.send(VideoThreadCommand::Seek { frame_index, keyframe_only, sequence_id, resp_tx });
+                            if let Ok(found) = resp_rx.recv() {
+                                if !found {
+                                    drop(packets_iter);
+                                    let seek_pts = (frame_index as f64 * 1_000_000.0 / fps) as i64;
+                                    let _ = input.seek(seek_pts, ..seek_pts + 1);
+                                    let target_time = frame_index as f64 / fps;
+                                    let _ = audio_cmd_tx.send(AudioThreadCommand::Seek { target_time });
+                                    packets_iter = input.packets();
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    Err(_) => break,
                 }
             }
-        } else {
-            break;
+        }
+
+        // 3. Send the pending packet, non-blocking on command channel
+        if let Some((stream_idx, packet)) = pending_packet.take() {
+            if stream_idx == video_stream_idx {
+                crossbeam_channel::select! {
+                    send(video_packet_tx, packet) -> res => {
+                        if res.is_err() {
+                            break;
+                        }
+                    }
+                    recv(background_rx) -> cmd_res => {
+                        if let Ok(cmd) = cmd_res {
+                            match cmd {
+                                MediaCommand::Shutdown => return Ok(()),
+                                MediaCommand::Play => {
+                                    let _ = video_cmd_tx.send(VideoThreadCommand::Play);
+                                }
+                                MediaCommand::Pause => {}
+                                MediaCommand::Seek { frame_index, keyframe_only, sequence_id } => {
+                                    seek_requested = Some((frame_index, keyframe_only, sequence_id));
+                                }
+                            }
+                            pending_packet = Some((stream_idx, packet));
+                            if seek_requested.is_some() {
+                                pending_packet = None;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            } else if Some(stream_idx) == audio_stream_idx_opt {
+                crossbeam_channel::select! {
+                    send(audio_packet_tx, packet) -> res => {
+                        if res.is_err() {
+                            break;
+                        }
+                    }
+                    recv(background_rx) -> cmd_res => {
+                        if let Ok(cmd) = cmd_res {
+                            match cmd {
+                                MediaCommand::Shutdown => return Ok(()),
+                                MediaCommand::Play => {
+                                    let _ = video_cmd_tx.send(VideoThreadCommand::Play);
+                                }
+                                MediaCommand::Pause => {}
+                                MediaCommand::Seek { frame_index, keyframe_only, sequence_id } => {
+                                    seek_requested = Some((frame_index, keyframe_only, sequence_id));
+                                }
+                            }
+                            pending_packet = Some((stream_idx, packet));
+                            if seek_requested.is_some() {
+                                pending_packet = None;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 
     // Explicitly drop transmitters to notify receiver threads
     drop(video_packet_tx);
-    drop(video_seek_tx);
+    drop(video_cmd_tx);
     drop(audio_packet_tx);
-    drop(audio_seek_tx);
+    drop(audio_cmd_tx);
 
     let _ = video_thread.join();
     if let Some(ath) = audio_thread_opt {

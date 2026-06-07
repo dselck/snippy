@@ -12,6 +12,7 @@ pub struct AudioPlaybackState {
     pub has_audio: Arc<AtomicBool>,
     pub fallback_start_time: Arc<std::sync::Mutex<Option<Instant>>>,
     pub fallback_base_time: Arc<std::sync::Mutex<f64>>,
+    pub should_flush: Arc<AtomicBool>,
 }
 
 impl AudioPlaybackState {
@@ -51,6 +52,7 @@ impl AudioPlaybackState {
         if lock.is_some() {
             *lock = Some(Instant::now());
         }
+        self.should_flush.store(true, Ordering::SeqCst);
     }
 }
 
@@ -77,19 +79,28 @@ impl AudioEngine {
 
         let samples_played = Arc::new(AtomicU64::new(0));
         let samples_played_callback = Arc::clone(&samples_played);
+        let should_flush = Arc::new(AtomicBool::new(false));
+        let should_flush_callback = Arc::clone(&should_flush);
 
         // CPAL high-priority real-time audio thread callback
         let stream = device.build_output_stream(
             &config.into(),
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                if should_flush_callback.swap(false, Ordering::SeqCst) {
+                    while cons.try_pop().is_some() {}
+                }
                 let mut written = 0;
                 for frame in data.chunks_mut(channels) {
-                    // Pull sample from our ring buffer or write silence if empty
-                    let sample = cons.try_pop().unwrap_or(0.0);
-                    for channel_sample in frame.iter_mut() {
-                        *channel_sample = sample;
+                    if let Some(sample) = cons.try_pop() {
+                        for channel_sample in frame.iter_mut() {
+                            *channel_sample = sample;
+                        }
+                        written += 1;
+                    } else {
+                        for channel_sample in frame.iter_mut() {
+                            *channel_sample = 0.0;
+                        }
                     }
-                    written += 1;
                 }
                 // Update master clock samples counter
                 samples_played_callback.fetch_add(written, Ordering::Relaxed);
@@ -113,6 +124,7 @@ impl AudioEngine {
                 has_audio,
                 fallback_start_time,
                 fallback_base_time,
+                should_flush,
             }),
         })
     }

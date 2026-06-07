@@ -59,6 +59,13 @@ pub struct MainApp {
     pub _audio_engine: Option<crate::audio::AudioEngine>,
     pub playback_state: std::sync::Arc<crate::audio::AudioPlaybackState>,
     pub media_engine: Option<crate::media::MediaEngine>,
+    pub keyframes: Vec<usize>,
+    pub future_frame: Option<media::DecodedFrame>,
+    pub latest_sequence_id: usize,
+    pub show_debug_hud: bool,
+    pub drift_history: std::collections::VecDeque<f32>,
+    pub stale_discards_count: usize,
+    pub drift_pause_count: usize,
 }
 
 impl MainApp {
@@ -91,6 +98,7 @@ impl MainApp {
                 has_audio: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 fallback_start_time: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 fallback_base_time: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
+                should_flush: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }));
 
         Self {
@@ -115,6 +123,13 @@ impl MainApp {
             _audio_engine: audio_engine,
             playback_state,
             media_engine: None,
+            keyframes: (0..1000).step_by(50).collect(),
+            future_frame: None,
+            latest_sequence_id: 0,
+            show_debug_hud: false,
+            drift_history: std::collections::VecDeque::with_capacity(60),
+            stale_discards_count: 0,
+            drift_pause_count: 0,
         }
     }
 
@@ -126,15 +141,53 @@ impl MainApp {
         format!("{:02}:{:02}.{:02}", minutes, seconds, centiseconds)
     }
 
-    fn seek_to_frame(&mut self, frame: usize) {
+    fn set_playing(&mut self, play: bool) {
+        self.is_playing = play;
+        if play {
+            self.playback_state.start_fallback_clock();
+            if let Some(ref ae) = self._audio_engine {
+                let _ = ae.play();
+            }
+            if let Some(ref me) = self.media_engine {
+                let _ = me.tx.send(crate::media::MediaCommand::Play);
+            }
+        } else {
+            self.playback_state.stop_fallback_clock();
+            if let Some(ref ae) = self._audio_engine {
+                let _ = ae.pause();
+            }
+            if let Some(ref me) = self.media_engine {
+                let _ = me.tx.send(crate::media::MediaCommand::Pause);
+            }
+        }
+    }
+
+    fn nearest_keyframe(&self, target: usize) -> usize {
+        if self.keyframes.is_empty() {
+            return target;
+        }
+        match self.keyframes.binary_search(&target) {
+            Ok(i) => self.keyframes[i],
+            Err(0) => self.keyframes[0],
+            Err(i) => self.keyframes[i - 1],
+        }
+    }
+
+    fn seek_to_frame(&mut self, frame: usize, keyframe_only: bool) {
+        self.latest_sequence_id += 1;
         self.current_frame = frame.clamp(0, self.total_frames);
         self.playback_state.reset(self.current_frame as f64 / self.video_fps);
         if let Some(ref me) = self.media_engine {
-            let _ = me.tx.send(crate::media::MediaCommand::Seek { frame_index: self.current_frame });
+            let _ = me.tx.send(crate::media::MediaCommand::Seek {
+                frame_index: self.current_frame,
+                keyframe_only,
+                sequence_id: self.latest_sequence_id,
+            });
         }
         if let Some(ref rx) = self.frame_rx {
             while rx.try_recv().is_ok() {}
         }
+        self.future_frame = None;
     }
 }
 
@@ -659,25 +712,57 @@ impl MainApp {
 
 impl eframe::App for MainApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let ctrl_d = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::D);
+        if ctx.input_mut(|i| i.consume_shortcut(&ctrl_d)) {
+            self.show_debug_hud = !self.show_debug_hud;
+        }
+
         let previous_frame = self.current_frame;
 
-        // Sync fallback clock state with play state
+        // Sync fallback clock state and correct AV drift if lagging
         if self.is_playing {
-            let running = self.playback_state.fallback_start_time.lock().unwrap().is_some();
-            if !running {
-                self.playback_state.start_fallback_clock();
+            let video_time = self.latest_frame.as_ref()
+                .filter(|f| f.sequence_id() == self.latest_sequence_id)
+                .map_or(self.current_frame as f64 / self.video_fps, |f| f.frame_idx() as f64 / self.video_fps);
+            let current_time = self.playback_state.current_time();
+            let drift = current_time - video_time;
+
+            // Harvest drift history
+            self.drift_history.push_back(drift as f32);
+            if self.drift_history.len() > 60 {
+                self.drift_history.pop_front();
+            }
+
+            if drift > 0.15 {
+                // Video is lagging behind audio clock by >150ms!
+                // Pause audio playback temporarily to let video catch up.
+                let mut was_running = false;
                 if let Some(ref ae) = self._audio_engine {
-                    let _ = ae.play();
+                    let running = self.playback_state.fallback_start_time.lock().unwrap().is_some();
+                    if running {
+                        let _ = ae.pause();
+                        was_running = true;
+                    }
+                }
+                if was_running {
+                    self.drift_pause_count += 1;
+                }
+                self.playback_state.stop_fallback_clock();
+            } else {
+                // Video is in sync, ensure playback clock is running
+                let running = self.playback_state.fallback_start_time.lock().unwrap().is_some();
+                if !running {
+                    self.playback_state.start_fallback_clock();
+                    if let Some(ref ae) = self._audio_engine {
+                        let _ = ae.play();
+                    }
                 }
             }
+
             self.current_frame = (self.playback_state.current_time() * self.video_fps) as usize;
             if self.current_frame >= self.total_frames {
                 self.current_frame = self.total_frames;
-                self.is_playing = false;
-                self.playback_state.stop_fallback_clock();
-                if let Some(ref ae) = self._audio_engine {
-                    let _ = ae.pause();
-                }
+                self.set_playing(false);
             }
         } else {
             self.playback_state.stop_fallback_clock();
@@ -690,17 +775,30 @@ impl eframe::App for MainApp {
         if let Some(ref rx) = self.frame_rx {
             let target_frame = (self.playback_state.current_time() * self.video_fps) as usize;
             
-            // Hold if we are already in the future
-            let is_future = self.latest_frame.as_ref().map_or(false, |f| f.frame_idx() > target_frame);
-            
-            if !is_future {
+            // Promote future frame if it's now ready and not stale
+            if let Some(ref f) = self.future_frame {
+                if f.sequence_id() < self.latest_sequence_id {
+                    self.stale_discards_count += 1;
+                    self.future_frame = None;
+                } else if f.frame_idx() <= target_frame {
+                    self.latest_frame = self.future_frame.take();
+                }
+            }
+
+            // Receive new frames from channel
+            if self.future_frame.is_none() {
                 while let Ok(frame) = rx.try_recv() {
-                    let idx = frame.frame_idx();
-                    if idx >= target_frame {
-                        self.latest_frame = Some(frame);
-                        break; // Stop at first future frame
+                    if frame.sequence_id() < self.latest_sequence_id {
+                        self.stale_discards_count += 1;
+                        continue; // Discard stale frame!
                     }
-                    // Loop drops older frames (idx < target_frame) to catch up
+                    let idx = frame.frame_idx();
+                    if idx <= target_frame {
+                        self.latest_frame = Some(frame);
+                    } else {
+                        self.future_frame = Some(frame);
+                        break;
+                    }
                 }
             }
             ctx.request_repaint();
@@ -870,8 +968,8 @@ impl eframe::App for MainApp {
                             let response_id = ui.make_persistent_id(format!("filmstrip_th_{}", i));
                             let th_response = ui.interact(thub_rect, response_id, egui::Sense::click());
                             if th_response.clicked() {
-                                self.seek_to_frame(target_frame as usize);
-                                self.is_playing = false; // Stop playback on seek
+                                self.seek_to_frame(target_frame as usize, false);
+                                self.set_playing(false);
                             }
                         } else {
                             // Out of bounds thumbnail placeholder
@@ -1075,14 +1173,14 @@ impl eframe::App for MainApp {
                         Color32::from_rgb(236, 72, 153),
                     );
 
-                    // Handle seek scrubbing on synced waveform
                     if wave_response.dragged() || wave_response.clicked() {
                         if let Some(mouse_pos) = wave_response.interact_pointer_pos() {
                             let rel_x = (mouse_pos.x - wave_rect.left()).clamp(0.0, wave_rect.width());
                             let pct = rel_x / wave_rect.width();
-                            let target_frame = start_frame + (pct * visible_range_width) as isize;
-                            self.seek_to_frame(target_frame.clamp(0, self.total_frames as isize) as usize);
-                            self.is_playing = false;
+                            let target_frame = (pct * self.total_frames as f32) as usize;
+                            let target_kf = self.nearest_keyframe(target_frame);
+                            self.seek_to_frame(target_kf, true);
+                            self.set_playing(false);
                         }
                     }
                 });
@@ -1286,7 +1384,7 @@ impl eframe::App for MainApp {
                                     .pick_file()
                                 {
                                     // 1. Stop current playback and drop old engines
-                                    self.is_playing = false;
+                                    self.set_playing(false);
                                     self.media_engine = None;
                                     self._audio_engine = None;
                                     self.latest_frame = None;
@@ -1326,6 +1424,9 @@ impl eframe::App for MainApp {
                                             self.in_marker = None;
                                             self.out_marker = None;
                                             self.ranges.clear();
+                                            self.stale_discards_count = 0;
+                                            self.drift_pause_count = 0;
+                                            self.drift_history.clear();
                                             
                                             // Update active playback state and audio flag
                                             let playback_state = audio_engine.as_ref()
@@ -1336,6 +1437,7 @@ impl eframe::App for MainApp {
                                                     has_audio: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                                                     fallback_start_time: std::sync::Arc::new(std::sync::Mutex::new(None)),
                                                     fallback_base_time: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
+                                                    should_flush: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                                                 }));
                                             
                                             playback_state.reset(0.0);
@@ -1345,6 +1447,8 @@ impl eframe::App for MainApp {
                                             self._audio_engine = audio_engine;
                                             self.media_engine = Some(me);
                                             self.frame_rx = Some(frame_rx);
+                                            self.keyframes = metadata.keyframes;
+                                            self.seek_to_frame(0, false);
                                             
                                             println!("Loaded video: {}", path.display());
                                         }
@@ -1431,14 +1535,159 @@ impl eframe::App for MainApp {
                                 8.0,
                                 egui::Stroke::new(1.0, Color32::from_rgba_premultiplied(99, 102, 241, 10)),
                             );
+
+                            // Draw floating HUD overlay if enabled
+                            if self.show_debug_hud {
+                                let hud_width = 300.0;
+                                let hud_height = 295.0;
+                                let margin = 12.0;
+                                let hud_rect = egui::Rect::from_min_max(
+                                    egui::pos2(rect.right() - hud_width - margin, rect.top() + margin),
+                                    egui::pos2(rect.right() - margin, rect.top() + hud_height + margin),
+                                );
+                                
+                                ui.allocate_ui_at_rect(hud_rect, |ui| {
+                                    egui::Frame::none()
+                                        .fill(Color32::from_rgba_unmultiplied(15, 17, 28, 235))
+                                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(63, 66, 97)))
+                                        .rounding(8.0)
+                                        .inner_margin(10.0)
+                                        .show(ui, |ui| {
+                                            ui.vertical(|ui| {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(egui::RichText::new("⚡ AV SYNC TELEMETRY").strong().color(Color32::from_rgb(129, 140, 248)));
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        let active_color = if self.is_playing { Color32::from_rgb(74, 222, 128) } else { Color32::from_rgb(156, 163, 175) };
+                                                        ui.label(egui::RichText::new(if self.is_playing { "● ACTIVE" } else { "■ PAUSED" }).color(active_color).font(egui::FontId::monospace(10.0)));
+                                                    });
+                                                });
+                                                
+                                                ui.separator();
+                                                
+                                                let master_time = self.playback_state.current_time();
+                                                let video_time = self.latest_frame.as_ref()
+                                                    .filter(|f| f.sequence_id() == self.latest_sequence_id)
+                                                    .map_or(self.current_frame as f64 / self.video_fps, |f| f.frame_idx() as f64 / self.video_fps);
+                                                let drift = master_time - video_time;
+                                                
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Master Clock:");
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        ui.label(egui::RichText::new(format!("{:.3}s", master_time)).monospace());
+                                                    });
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Video Clock :");
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        ui.label(egui::RichText::new(format!("{:.3}s", video_time)).monospace());
+                                                    });
+                                                });
+                                                
+                                                let drift_color = if drift.abs() > 0.15 { Color32::LIGHT_RED } else { Color32::LIGHT_GREEN };
+                                                ui.horizontal(|ui| {
+                                                    ui.label("AV Sync Drift:");
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        ui.label(egui::RichText::new(format!("{:.1} ms ({})", drift * 1000.0, if drift > 0.0 { "Video Lag" } else { "Video Lead" })).monospace().color(drift_color));
+                                                    });
+                                                });
+                                                
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Sequence ID :");
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        ui.label(egui::RichText::new(format!("{}", self.latest_sequence_id)).monospace());
+                                                    });
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Stale Drops :");
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        ui.label(egui::RichText::new(format!("{}", self.stale_discards_count)).monospace());
+                                                    });
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Sync Pauses :");
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        ui.label(egui::RichText::new(format!("{}", self.drift_pause_count)).monospace());
+                                                    });
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    ui.label("CPAL Rate   :");
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        ui.label(egui::RichText::new(format!("{} Hz", self.playback_state.sample_rate)).monospace());
+                                                    });
+                                                });
+                                                
+                                                // Task 4: Custom Sparkline Plot
+                                                ui.add_space(6.0);
+                                                let plot_height = 50.0;
+                                                let (plot_rect, _) = ui.allocate_exact_size(
+                                                    egui::vec2(ui.available_width(), plot_height),
+                                                    egui::Sense::hover(),
+                                                );
+                                                
+                                                let plot_painter = ui.painter_at(plot_rect);
+                                                plot_painter.rect_filled(plot_rect, 4.0, Color32::from_rgb(11, 13, 25));
+                                                plot_painter.rect_stroke(plot_rect, 4.0, egui::Stroke::new(1.0, Color32::from_rgb(39, 42, 68)));
+                                                
+                                                let zero_y = plot_rect.center().y;
+                                                plot_painter.line_segment(
+                                                    [egui::pos2(plot_rect.left(), zero_y), egui::pos2(plot_rect.right(), zero_y)],
+                                                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(148, 163, 184, 50)),
+                                                );
+                                                
+                                                let max_scale_sec = 0.3;
+                                                let scale_y = |drift_val_sec: f32| -> f32 {
+                                                    let normalized = (drift_val_sec / max_scale_sec).clamp(-1.0, 1.0);
+                                                    zero_y - normalized * (plot_height * 0.4)
+                                                };
+                                                
+                                                let t_plus_y = scale_y(0.15);
+                                                let t_minus_y = scale_y(-0.15);
+                                                
+                                                plot_painter.line_segment([egui::pos2(plot_rect.left(), t_plus_y), egui::pos2(plot_rect.right(), t_plus_y)], egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(244, 63, 94, 80)));
+                                                plot_painter.line_segment([egui::pos2(plot_rect.left(), t_minus_y), egui::pos2(plot_rect.right(), t_minus_y)], egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(244, 63, 94, 80)));
+                                                
+                                                plot_painter.text(egui::pos2(plot_rect.left() + 4.0, t_plus_y - 2.0), egui::Align2::LEFT_BOTTOM, "+150ms", egui::FontId::monospace(8.0), Color32::from_rgba_unmultiplied(244, 63, 94, 150));
+                                                plot_painter.text(egui::pos2(plot_rect.left() + 4.0, t_minus_y + 2.0), egui::Align2::LEFT_TOP, "-150ms", egui::FontId::monospace(8.0), Color32::from_rgba_unmultiplied(244, 63, 94, 150));
+                                                
+                                                if self.drift_history.len() > 1 {
+                                                    let mut points = Vec::new();
+                                                    let dx = plot_rect.width() / (self.drift_history.len() - 1) as f32;
+                                                    for (i, &d_val) in self.drift_history.iter().enumerate() {
+                                                        let x = plot_rect.left() + i as f32 * dx;
+                                                        let y = scale_y(d_val);
+                                                        points.push(egui::pos2(x, y));
+                                                    }
+                                                    for window in points.windows(2) {
+                                                        plot_painter.line_segment([window[0], window[1]], egui::Stroke::new(1.5, Color32::from_rgb(251, 113, 133)));
+                                                    }
+                                                }
+                                                
+                                                // Task 5: Diagnostic Buttons
+                                                ui.add_space(8.0);
+                                                ui.horizontal(|ui| {
+                                                    if ui.button("Flush Buffer").on_hover_text("Flush/drain audio ring buffer").clicked() {
+                                                        self.playback_state.reset(self.current_frame as f64 / self.video_fps);
+                                                        println!("HUD: Manual flush of audio buffer triggered");
+                                                    }
+                                                    if ui.button("Force Resync").on_hover_text("Force resync clocks").clicked() {
+                                                        let current = self.current_frame;
+                                                        self.seek_to_frame(current, false);
+                                                        println!("HUD: Manual resync triggered to frame {}", current);
+                                                    }
+                                                });
+                                            });
+                                        });
+                                });
+                            }
                         });
 
                     ui.add_space(10.0);
 
                     // Sleek progress slider
                     if self.progress_bar(ui) {
-                        self.is_playing = false; // Stop playback on manual scrub
-                        self.seek_to_frame(self.current_frame);
+                        self.set_playing(false);
+                        let target_kf = self.nearest_keyframe(self.current_frame);
+                        self.seek_to_frame(target_kf, true);
                     }
 
                     ui.add_space(10.0);
@@ -1459,10 +1708,10 @@ impl eframe::App for MainApp {
                                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
                                 if playback_control_button(ui, PlaybackIcon::Start, false, "Go to start of video") {
-                                    self.seek_to_frame(0);
+                                    self.seek_to_frame(0, false);
                                 }
                                 if playback_control_button(ui, PlaybackIcon::PrevFrame, false, "Step backward one frame") {
-                                    self.seek_to_frame(self.current_frame.saturating_sub(1));
+                                    self.seek_to_frame(self.current_frame.saturating_sub(1), false);
                                 }
                                 if playback_control_button(ui, PlaybackIcon::SetIn, false, "Set In marker at current frame [") {
                                     self.in_marker = Some(self.current_frame);
@@ -1472,17 +1721,17 @@ impl eframe::App for MainApp {
                                 let play_icon = if self.is_playing { PlaybackIcon::Pause } else { PlaybackIcon::Play };
                                 let play_tooltip = if self.is_playing { "Pause playback" } else { "Start playback" };
                                 if playback_control_button(ui, play_icon, true, play_tooltip) {
-                                    self.is_playing = !self.is_playing;
+                                    self.set_playing(!self.is_playing);
                                 }
 
                                 if playback_control_button(ui, PlaybackIcon::SetOut, false, "Set Out marker at current frame ]") {
                                     self.out_marker = Some(self.current_frame);
                                 }
                                 if playback_control_button(ui, PlaybackIcon::NextFrame, false, "Step forward one frame") {
-                                    self.seek_to_frame(self.current_frame + 1);
+                                    self.seek_to_frame(self.current_frame + 1, false);
                                 }
                                 if playback_control_button(ui, PlaybackIcon::End, false, "Go to end of video") {
-                                    self.seek_to_frame(self.total_frames);
+                                    self.seek_to_frame(self.total_frames, false);
                                 }
                             },
                         );
@@ -1569,4 +1818,5 @@ impl eframe::egui_wgpu::CallbackTrait for YuvCallback {
         }
     }
 }
+
 
