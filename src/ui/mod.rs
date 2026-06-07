@@ -1,3 +1,5 @@
+pub mod yuv_renderer;
+
 use crate::media;
 use crossbeam_channel::Receiver;
 use eframe::egui;
@@ -58,6 +60,14 @@ impl MainApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_fonts(&cc.egui_ctx);
         configure_theme(&cc.egui_ctx);
+
+        if let Some(wgpu_state) = &cc.wgpu_render_state {
+            let mut renderer = wgpu_state.renderer.write();
+            renderer.callback_resources.insert(yuv_renderer::YuvRenderer::new(
+                &wgpu_state.device,
+                wgpu_state.target_format,
+            ));
+        }
 
         // Generate a mock loudness profile to show a beautiful timeline waveform
         let mut loudness = Vec::with_capacity(300);
