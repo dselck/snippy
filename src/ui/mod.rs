@@ -1378,12 +1378,40 @@ impl eframe::App for MainApp {
 
                             let mut rendered = false;
                             if let Some(media::DecodedFrame::Cpu { planes, .. }) = &self.latest_frame {
-                                let callback = eframe::egui_wgpu::Callback::new_paint_callback(
-                                    rect,
-                                    YuvCallback { planes: planes.clone() },
-                                );
-                                painter.add(callback);
-                                rendered = true;
+                                let video_w = planes.width as f32;
+                                let video_h = planes.height as f32;
+                                if video_w > 0.0 && video_h > 0.0 {
+                                    let video_aspect = video_w / video_h;
+                                    
+                                    let container_w = rect.width();
+                                    let container_h = rect.height();
+                                    let container_aspect = container_w / container_h;
+                                    
+                                    let target_rect = if video_aspect > container_aspect {
+                                        // Fit-to-width (pillarbox)
+                                        let h = container_w / video_aspect;
+                                        let top = rect.top() + (container_h - h) * 0.5;
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(rect.left(), top),
+                                            egui::pos2(rect.right(), top + h),
+                                        )
+                                    } else {
+                                        // Fit-to-height (letterbox)
+                                        let w = container_h * video_aspect;
+                                        let left = rect.left() + (container_w - w) * 0.5;
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(left, rect.top()),
+                                            egui::pos2(left + w, rect.bottom()),
+                                        )
+                                    };
+
+                                    let callback = eframe::egui_wgpu::Callback::new_paint_callback(
+                                        target_rect,
+                                        YuvCallback { planes: planes.clone() },
+                                    );
+                                    painter.add(callback);
+                                    rendered = true;
+                                }
                             }
 
                             if !rendered {

@@ -208,6 +208,8 @@ fn run_decoding_loop(
         };
         let mut fallback_frame_idx = 0;
 
+        let mut scaler: Option<ffmpeg_next::software::scaling::context::Context> = None;
+
         loop {
             crossbeam_channel::select! {
                 recv(video_packet_rx) -> packet_res => {
@@ -215,18 +217,44 @@ fn run_decoding_loop(
                         if video_decoder.send_packet(&packet).is_ok() {
                             let mut frame = ffmpeg_next::util::frame::Video::empty();
                             while video_decoder.receive_frame(&mut frame).is_ok() {
-                                let w = frame.width();
-                                let h = frame.height();
+                                let mut scaled_frame = ffmpeg_next::util::frame::Video::empty();
+                                let video_frame = if frame.format() != ffmpeg_next::format::Pixel::YUV420P {
+                                    let s = match scaler {
+                                        Some(ref mut s) if s.input().format == frame.format()
+                                            && s.input().width == frame.width()
+                                            && s.input().height == frame.height() => s,
+                                        _ => {
+                                            let new_s = ffmpeg_next::software::scaling::context::Context::get(
+                                                frame.format(),
+                                                frame.width(),
+                                                frame.height(),
+                                                ffmpeg_next::format::Pixel::YUV420P,
+                                                frame.width(),
+                                                frame.height(),
+                                                ffmpeg_next::software::scaling::flag::Flags::BILINEAR,
+                                            ).unwrap();
+                                            scaler = Some(new_s);
+                                            scaler.as_mut().unwrap()
+                                        }
+                                    };
+                                    s.run(&frame, &mut scaled_frame).unwrap();
+                                    &scaled_frame
+                                } else {
+                                    &frame
+                                };
+
+                                let w = video_frame.width();
+                                let h = video_frame.height();
                                 
                                 let planes = YuvPlanes {
-                                    y: frame.data(0).to_vec(),
-                                    u: frame.data(1).to_vec(),
-                                    v: frame.data(2).to_vec(),
+                                    y: video_frame.data(0).to_vec(),
+                                    u: video_frame.data(1).to_vec(),
+                                    v: video_frame.data(2).to_vec(),
                                     width: w,
                                     height: h,
-                                    y_stride: frame.stride(0) as u32,
-                                    u_stride: frame.stride(1) as u32,
-                                    v_stride: frame.stride(2) as u32,
+                                    y_stride: video_frame.stride(0) as u32,
+                                    u_stride: video_frame.stride(1) as u32,
+                                    v_stride: video_frame.stride(2) as u32,
                                 };
 
                                 let frame_idx = match frame.pts() {
