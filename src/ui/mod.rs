@@ -804,13 +804,13 @@ impl eframe::App for MainApp {
 
                     ui.add_space(6.0);
 
-                    // 3. Compact Waveform Overview Component
+                    // 3. Compact Synced Waveform Component
                     let wave_height = 24.0;
                     let (wave_rect, wave_response) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), wave_height),
                         egui::Sense::click_and_drag(),
                     );
-                    let wave_response = wave_response.on_hover_text("Waveform Overview: Drag or click to scrub");
+                    let wave_response = wave_response.on_hover_text("Waveform Viewport: Drag or click to scrub");
 
                     let painter = ui.painter_at(wave_rect);
                     painter.rect(
@@ -820,18 +820,36 @@ impl eframe::App for MainApp {
                         egui::Stroke::new(1.0, Color32::from_rgb(26, 25, 43)),
                     );
 
-                    // Render mock waveform loudness bars
+                    // Synced frame calculations matching filmstrip
+                    let visible_range_width = (6 * delta) as f32;
+                    let start_frame = self.current_frame as isize - 3 * delta as isize;
+
+                    let frame_to_x = |frame: usize| -> f32 {
+                        let pct = (frame as isize - start_frame) as f32 / visible_range_width;
+                        wave_rect.left() + pct * wave_rect.width()
+                    };
+
+                    // Render mock waveform loudness bars zoomed in sync
                     let bar_count = self.loudness_profile.len();
                     let bar_width = wave_rect.width() / bar_count as f32;
                     let middle_y = wave_rect.center().y;
 
                     for i in 0..bar_count {
-                        let amplitude = self.loudness_profile[i];
+                        let pct = i as f32 / bar_count as f32;
+                        let frame_idx_isize = start_frame + (pct * visible_range_width) as isize;
+                        let frame_idx = frame_idx_isize.clamp(0, self.total_frames as isize) as usize;
+                        let out_of_bounds = frame_idx_isize < 0 || frame_idx_isize > self.total_frames as isize;
+
+                        let amplitude = if out_of_bounds {
+                            0.02
+                        } else {
+                            let profile_idx = ((frame_idx as f32 / self.total_frames as f32) * (self.loudness_profile.len() - 1) as f32) as usize;
+                            self.loudness_profile[profile_idx.clamp(0, self.loudness_profile.len() - 1)]
+                        };
+
                         let bar_h = amplitude * (wave_rect.height() - 6.0);
                         let x = wave_rect.left() + i as f32 * bar_width;
 
-                        let frame_idx = (i as f32 / bar_count as f32 * self.total_frames as f32) as usize;
-                        
                         let inside_active_selection = match (self.in_marker, self.out_marker) {
                             (Some(inf), Some(outf)) => frame_idx >= inf && frame_idx <= outf,
                             _ => false,
@@ -839,7 +857,9 @@ impl eframe::App for MainApp {
 
                         let inside_queued_range = self.ranges.iter().any(|r| frame_idx >= r.in_frame && frame_idx <= r.out_frame);
 
-                        let bar_color = if inside_active_selection {
+                        let bar_color = if out_of_bounds {
+                            Color32::from_rgb(20, 19, 32)
+                        } else if inside_active_selection {
                             Color32::from_rgb(59, 130, 246)
                         } else if inside_queued_range {
                             if self.cut_mode {
@@ -864,67 +884,86 @@ impl eframe::App for MainApp {
                         );
                     }
 
-                    // Highlight queued ranges
+                    // Highlight queued ranges inside the visible window
                     for range in &self.ranges {
-                        let left_x = wave_rect.left() + (range.in_frame as f32 / self.total_frames as f32) * wave_rect.width();
-                        let right_x = wave_rect.left() + (range.out_frame as f32 / self.total_frames as f32) * wave_rect.width();
+                        let raw_left = frame_to_x(range.in_frame);
+                        let raw_right = frame_to_x(range.out_frame);
                         
-                        let overlay_color = if self.cut_mode {
-                            Color32::from_rgba_premultiplied(239, 68, 68, 15)
-                        } else {
-                            Color32::from_rgba_premultiplied(16, 185, 129, 15)
-                        };
-                        
-                        let line_color = if self.cut_mode {
-                            Color32::from_rgba_premultiplied(239, 68, 68, 100)
-                        } else {
-                            Color32::from_rgba_premultiplied(16, 185, 129, 100)
-                        };
+                        if raw_right >= wave_rect.left() && raw_left <= wave_rect.right() {
+                            let left_x = raw_left.clamp(wave_rect.left(), wave_rect.right());
+                            let right_x = raw_right.clamp(wave_rect.left(), wave_rect.right());
+                            
+                            let overlay_color = if self.cut_mode {
+                                Color32::from_rgba_premultiplied(239, 68, 68, 15)
+                            } else {
+                                Color32::from_rgba_premultiplied(16, 185, 129, 15)
+                            };
+                            
+                            let line_color = if self.cut_mode {
+                                Color32::from_rgba_premultiplied(239, 68, 68, 100)
+                            } else {
+                                Color32::from_rgba_premultiplied(16, 185, 129, 100)
+                            };
 
-                        painter.rect_filled(
-                            egui::Rect::from_min_max(
-                                egui::pos2(left_x, wave_rect.top() + 1.0),
-                                egui::pos2(right_x, wave_rect.bottom() - 1.0),
-                            ),
-                            0.0,
-                            overlay_color,
-                        );
-                        
-                        painter.line_segment(
-                            [egui::pos2(left_x, wave_rect.top()), egui::pos2(left_x, wave_rect.bottom())],
-                            egui::Stroke::new(1.0, line_color),
-                        );
-                        painter.line_segment(
-                            [egui::pos2(right_x, wave_rect.top()), egui::pos2(right_x, wave_rect.bottom())],
-                            egui::Stroke::new(1.0, line_color),
-                        );
+                            painter.rect_filled(
+                                egui::Rect::from_min_max(
+                                    egui::pos2(left_x, wave_rect.top() + 1.0),
+                                    egui::pos2(right_x, wave_rect.bottom() - 1.0),
+                                ),
+                                0.0,
+                                overlay_color,
+                            );
+                            
+                            if raw_left >= wave_rect.left() && raw_left <= wave_rect.right() {
+                                painter.line_segment(
+                                    [egui::pos2(raw_left, wave_rect.top()), egui::pos2(raw_left, wave_rect.bottom())],
+                                    egui::Stroke::new(1.0, line_color),
+                                );
+                            }
+                            if raw_right >= wave_rect.left() && raw_right <= wave_rect.right() {
+                                painter.line_segment(
+                                    [egui::pos2(raw_right, wave_rect.top()), egui::pos2(raw_right, wave_rect.bottom())],
+                                    egui::Stroke::new(1.0, line_color),
+                                );
+                            }
+                        }
                     }
 
-                    // Highlight selected range
+                    // Highlight selected range inside the visible window
                     if let (Some(inf), Some(outf)) = (self.in_marker, self.out_marker) {
-                        let left_x = wave_rect.left() + (inf as f32 / self.total_frames as f32) * wave_rect.width();
-                        let right_x = wave_rect.left() + (outf as f32 / self.total_frames as f32) * wave_rect.width();
-                        painter.rect_filled(
-                            egui::Rect::from_min_max(
-                                egui::pos2(left_x, wave_rect.top() + 1.0),
-                                egui::pos2(right_x, wave_rect.bottom() - 1.0),
-                            ),
-                            0.0,
-                            Color32::from_rgba_premultiplied(59, 130, 246, 15),
-                        );
+                        let raw_left = frame_to_x(inf);
+                        let raw_right = frame_to_x(outf);
                         
-                        painter.line_segment(
-                            [egui::pos2(left_x, wave_rect.top()), egui::pos2(left_x, wave_rect.bottom())],
-                            egui::Stroke::new(2.0, Color32::from_rgb(59, 130, 246)),
-                        );
-                        painter.line_segment(
-                            [egui::pos2(right_x, wave_rect.top()), egui::pos2(right_x, wave_rect.bottom())],
-                            egui::Stroke::new(2.0, Color32::from_rgb(59, 130, 246)),
-                        );
+                        if raw_right >= wave_rect.left() && raw_left <= wave_rect.right() {
+                            let left_x = raw_left.clamp(wave_rect.left(), wave_rect.right());
+                            let right_x = raw_right.clamp(wave_rect.left(), wave_rect.right());
+                            
+                            painter.rect_filled(
+                                egui::Rect::from_min_max(
+                                    egui::pos2(left_x, wave_rect.top() + 1.0),
+                                    egui::pos2(right_x, wave_rect.bottom() - 1.0),
+                                ),
+                                0.0,
+                                Color32::from_rgba_premultiplied(59, 130, 246, 15),
+                            );
+                            
+                            if raw_left >= wave_rect.left() && raw_left <= wave_rect.right() {
+                                painter.line_segment(
+                                    [egui::pos2(raw_left, wave_rect.top()), egui::pos2(raw_left, wave_rect.bottom())],
+                                    egui::Stroke::new(2.0, Color32::from_rgb(59, 130, 246)),
+                                );
+                            }
+                            if raw_right >= wave_rect.left() && raw_right <= wave_rect.right() {
+                                painter.line_segment(
+                                    [egui::pos2(raw_right, wave_rect.top()), egui::pos2(raw_right, wave_rect.bottom())],
+                                    egui::Stroke::new(2.0, Color32::from_rgb(59, 130, 246)),
+                                );
+                            }
+                        }
                     }
 
-                    // Playhead vertical line on compact waveform
-                    let playhead_x = wave_rect.left() + (self.current_frame as f32 / self.total_frames as f32) * wave_rect.width();
+                    // Playhead vertical line is always centered in the synced waveform
+                    let playhead_x = wave_rect.center().x;
                     painter.line_segment(
                         [egui::pos2(playhead_x, wave_rect.top() - 2.0), egui::pos2(playhead_x, wave_rect.bottom() + 2.0)],
                         egui::Stroke::new(2.0, Color32::from_rgb(236, 72, 153)),
@@ -935,13 +974,14 @@ impl eframe::App for MainApp {
                         Color32::from_rgb(236, 72, 153),
                     );
 
-                    // Handle scrub scrubbing on compact waveform
+                    // Handle seek scrubbing on synced waveform
                     if wave_response.dragged() || wave_response.clicked() {
                         if let Some(mouse_pos) = wave_response.interact_pointer_pos() {
                             let rel_x = (mouse_pos.x - wave_rect.left()).clamp(0.0, wave_rect.width());
                             let pct = rel_x / wave_rect.width();
-                            self.current_frame = (pct * self.total_frames as f32) as usize;
-                            self.is_playing = false; // Stop playback on scrub
+                            let target_frame = start_frame + (pct * visible_range_width) as isize;
+                            self.current_frame = target_frame.clamp(0, self.total_frames as isize) as usize;
+                            self.is_playing = false;
                         }
                     }
                 });
