@@ -1009,7 +1009,10 @@ impl eframe::App for MainApp {
                 });
             });
 
-        self.timeline_height = panel_response.response.rect.height();
+        let new_height = panel_response.response.rect.height();
+        if new_height != self.timeline_height && ctx.input(|i| i.pointer.any_down()) {
+            self.timeline_height = new_height;
+        }
 
         egui::SidePanel::right("sidebar_deck")
             .resizable(false)
