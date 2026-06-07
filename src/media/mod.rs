@@ -5,6 +5,10 @@ use std::thread;
 use ringbuf::wrap::CachingProd;
 use ringbuf::storage::Heap;
 use ringbuf::SharedRb;
+use ringbuf::traits::*;
+use ffmpeg_next::software::resampling::context::Context as ResamplerContext;
+use ffmpeg_next::format::Sample;
+use ffmpeg_next::ChannelLayout;
 
 #[derive(Clone, Debug)]
 pub enum GpuFrameDescriptor {
@@ -139,15 +143,154 @@ struct GopCache {
 }
 
 fn run_decoding_loop(
-    _path: &str,
-    _target_sample_rate: u32,
-    _target_channels: usize,
-    _frame_tx: Sender<DecodedFrame>,
-    _audio_tx: CachingProd<Arc<SharedRb<Heap<f32>>>>,
-    _background_rx: Receiver<MediaCommand>,
-    _cmd_rx: Receiver<MediaCommand>,
+    path: &str,
+    target_sample_rate: u32,
+    target_channels: usize,
+    frame_tx: Sender<DecodedFrame>,
+    mut audio_tx: CachingProd<Arc<SharedRb<Heap<f32>>>>,
+    background_rx: Receiver<MediaCommand>,
+    cmd_rx: Receiver<MediaCommand>,
 ) -> Result<(), anyhow::Error> {
-    // This is where the background FFmpeg demuxing & decoding loop runs,
-    // populating the GOP cache and pushing decoded frames to the frame channel.
+    let mut input = ffmpeg_next::format::input(&path)?;
+
+    let video_stream = input
+        .streams()
+        .best(ffmpeg_next::media::Type::Video)
+        .ok_or_else(|| anyhow::anyhow!("No video stream"))?;
+    let video_stream_idx = video_stream.index();
+
+    let audio_stream_opt = input.streams().best(ffmpeg_next::media::Type::Audio);
+    let audio_stream_idx_opt = audio_stream_opt.as_ref().map(|s| s.index());
+
+    // Channels for routing raw packets to decoder threads
+    let (video_packet_tx, video_packet_rx) = crossbeam_channel::bounded::<ffmpeg_next::Packet>(32);
+    let (audio_packet_tx, audio_packet_rx) = crossbeam_channel::bounded::<ffmpeg_next::Packet>(64);
+
+    // Spawn Video Decoder Thread
+    let video_codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(video_stream.parameters())?;
+    let mut video_decoder = video_codec_ctx.decoder().video()?;
+    let frame_tx_clone = frame_tx.clone();
+    
+    let video_thread = thread::spawn(move || {
+        let mut gop_cache = GopCache {
+            keyframe_idx: usize::MAX,
+            frames: Vec::new(),
+        };
+
+        while let Ok(packet) = video_packet_rx.recv() {
+            if video_decoder.send_packet(&packet).is_ok() {
+                let mut frame = ffmpeg_next::util::frame::Video::empty();
+                while video_decoder.receive_frame(&mut frame).is_ok() {
+                    let w = frame.width();
+                    let h = frame.height();
+                    
+                    let planes = YuvPlanes {
+                        y: frame.data(0).to_vec(),
+                        u: frame.data(1).to_vec(),
+                        v: frame.data(2).to_vec(),
+                        width: w,
+                        height: h,
+                        y_stride: frame.stride(0) as u32,
+                        u_stride: frame.stride(1) as u32,
+                        v_stride: frame.stride(2) as u32,
+                    };
+
+                    let decoded = DecodedFrame::Cpu {
+                        frame_idx: frame.pts().unwrap_or(0) as usize,
+                        planes,
+                    };
+                    
+                    if frame_tx_clone.send(decoded).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+
+    // Spawn Audio Decoder Thread
+    let audio_thread_opt = if let Some(ref stream) = audio_stream_opt {
+        let audio_codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())?;
+        let mut audio_decoder = audio_codec_ctx.decoder().audio()?;
+        
+        let audio_thread = thread::spawn(move || {
+            let mut resampler: Option<ResamplerContext> = None;
+
+            while let Ok(packet) = audio_packet_rx.recv() {
+                if audio_decoder.send_packet(&packet).is_ok() {
+                    let mut frame = ffmpeg_next::util::frame::Audio::empty();
+                    while audio_decoder.receive_frame(&mut frame).is_ok() {
+                        let r = match resampler {
+                            Some(ref mut r) if r.input().format == frame.format()
+                                && r.input().channel_layout == frame.channel_layout()
+                                && r.input().rate == frame.rate() => r,
+                            _ => {
+                                let target_layout = if target_channels == 1 {
+                                    ChannelLayout::MONO
+                                } else {
+                                    ChannelLayout::STEREO
+                                };
+                                
+                                let new_r = ResamplerContext::get(
+                                    frame.format(),
+                                    frame.channel_layout(),
+                                    frame.rate(),
+                                    Sample::F32(ffmpeg_next::format::sample::Type::Packed),
+                                    target_layout,
+                                    target_sample_rate,
+                                ).unwrap();
+                                resampler = Some(new_r);
+                                resampler.as_mut().unwrap()
+                            }
+                        };
+
+                        let mut resampled = ffmpeg_next::util::frame::Audio::empty();
+                        if r.run(&frame, &mut resampled).is_ok() {
+                            let sample_count = resampled.samples();
+                            if sample_count > 0 {
+                                let data: &[f32] = bytemuck::cast_slice(&resampled.data(0)[..sample_count * 4]);
+                                for &sample in data {
+                                    // Wait/block if CPAL buffer is full (providing backpressure)
+                                    while audio_tx.try_push(sample).is_err() {
+                                        thread::sleep(std::time::Duration::from_millis(5));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        Some(audio_thread)
+    } else {
+        None
+    };
+
+    // Main demuxer loop
+    for (stream, packet) in input.packets() {
+        // Handle incoming command overrides
+        while let Ok(cmd) = background_rx.try_recv() {
+            match cmd {
+                MediaCommand::Shutdown => return Ok(()),
+                _ => {} // Seeking will be handled in next task
+            }
+        }
+
+        if stream.index() == video_stream_idx {
+            if video_packet_tx.send(packet).is_err() {
+                break;
+            }
+        } else if Some(stream.index()) == audio_stream_idx_opt {
+            if audio_packet_tx.send(packet).is_err() {
+                break;
+            }
+        }
+    }
+
+    let _ = video_thread.join();
+    if let Some(ath) = audio_thread_opt {
+        let _ = ath.join();
+    }
+
     Ok(())
 }
