@@ -1,0 +1,3 @@
+# 5. Multi-threaded Video/Audio Decoding and Synchronization Pipeline
+
+To achieve glitch-free audio playback and responsive video scrubbing, we decided to decode audio and video streams using separate decoder threads fed by a single demuxer thread, communicating via bounded packet queues. Playback synchronization is managed by the UI thread using a "drop-and-hold" frame alignment loop tied to the native audio clock (samples played), with a monotonic system timer fallback for silent files. A future-proof `DecodedFrame` enum abstracts CPU YUV planes and platform-specific GPU hardware surfaces to allow for zero-copy GPU decoding.
