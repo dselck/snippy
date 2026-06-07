@@ -11,6 +11,7 @@ pub struct AudioPlaybackState {
     pub sample_rate: u32,
     pub has_audio: Arc<AtomicBool>,
     pub fallback_start_time: Arc<std::sync::Mutex<Option<Instant>>>,
+    pub fallback_base_time: Arc<std::sync::Mutex<f64>>,
 }
 
 impl AudioPlaybackState {
@@ -21,22 +22,35 @@ impl AudioPlaybackState {
             samples / (self.sample_rate as f64)
         } else {
             let lock = self.fallback_start_time.lock().unwrap();
+            let base = *self.fallback_base_time.lock().unwrap();
             if let Some(start) = *lock {
-                start.elapsed().as_secs_f64()
+                base + start.elapsed().as_secs_f64()
             } else {
-                0.0
+                base
             }
         }
     }
 
     pub fn start_fallback_clock(&self) {
         let mut lock = self.fallback_start_time.lock().unwrap();
-        *lock = Some(Instant::now());
+        if lock.is_none() {
+            *lock = Some(Instant::now());
+        }
     }
 
     pub fn stop_fallback_clock(&self) {
         let mut lock = self.fallback_start_time.lock().unwrap();
         *lock = None;
+    }
+
+    pub fn reset(&self, time_seconds: f64) {
+        self.samples_played.store((time_seconds * self.sample_rate as f64) as u64, Ordering::Relaxed);
+        let mut base = self.fallback_base_time.lock().unwrap();
+        *base = time_seconds;
+        let mut lock = self.fallback_start_time.lock().unwrap();
+        if lock.is_some() {
+            *lock = Some(Instant::now());
+        }
     }
 }
 
@@ -88,6 +102,7 @@ impl AudioEngine {
 
         let has_audio = Arc::new(AtomicBool::new(false));
         let fallback_start_time = Arc::new(std::sync::Mutex::new(None));
+        let fallback_base_time = Arc::new(std::sync::Mutex::new(0.0));
 
         Ok(Self {
             _stream: stream,
@@ -97,6 +112,7 @@ impl AudioEngine {
                 sample_rate,
                 has_audio,
                 fallback_start_time,
+                fallback_base_time,
             }),
         })
     }

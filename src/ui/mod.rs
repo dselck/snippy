@@ -54,6 +54,9 @@ pub struct MainApp {
 
     // Height of the resizable bottom timeline deck panel
     pub timeline_height: f32,
+
+    pub _audio_engine: Option<crate::audio::AudioEngine>,
+    pub playback_state: std::sync::Arc<crate::audio::AudioPlaybackState>,
 }
 
 impl MainApp {
@@ -78,6 +81,16 @@ impl MainApp {
             loudness.push(val.clamp(0.05, 1.0));
         }
 
+        let audio_engine = crate::audio::AudioEngine::new().ok();
+        let playback_state = audio_engine.as_ref().map(|ae| std::sync::Arc::clone(&ae.playback_state))
+            .unwrap_or_else(|| std::sync::Arc::new(crate::audio::AudioPlaybackState {
+                samples_played: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                sample_rate: 44100,
+                has_audio: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                fallback_start_time: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                fallback_base_time: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
+            }));
+
         Self {
             current_frame: 180,
             total_frames: 1000,
@@ -97,6 +110,8 @@ impl MainApp {
             loudness_profile: loudness,
             zoom_level: 0.0,
             timeline_height: 145.0,
+            _audio_engine: audio_engine,
+            playback_state,
         }
     }
 
@@ -630,12 +645,42 @@ impl MainApp {
 
 impl eframe::App for MainApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let previous_frame = self.current_frame;
+
+        // Sync fallback clock state with play state
+        if self.is_playing {
+            let running = self.playback_state.fallback_start_time.lock().unwrap().is_some();
+            if !running {
+                self.playback_state.start_fallback_clock();
+            }
+            self.current_frame = (self.playback_state.current_time() * self.video_fps) as usize;
+            if self.current_frame >= self.total_frames {
+                self.current_frame = self.total_frames;
+                self.is_playing = false;
+                self.playback_state.stop_fallback_clock();
+            }
+        } else {
+            self.playback_state.stop_fallback_clock();
+        }
+
         // 1. Process background frames
         if let Some(ref rx) = self.frame_rx {
-            while let Ok(frame) = rx.try_recv() {
-                self.latest_frame = Some(frame);
-                ctx.request_repaint();
+            let target_frame = (self.playback_state.current_time() * self.video_fps) as usize;
+            
+            // Hold if we are already in the future
+            let is_future = self.latest_frame.as_ref().map_or(false, |f| f.frame_idx() > target_frame);
+            
+            if !is_future {
+                while let Ok(frame) = rx.try_recv() {
+                    let idx = frame.frame_idx();
+                    if idx >= target_frame {
+                        self.latest_frame = Some(frame);
+                        break; // Stop at first future frame
+                    }
+                    // Loop drops older frames (idx < target_frame) to catch up
+                }
             }
+            ctx.request_repaint();
         }
 
         // 2. Bottom Panel: Timeline and Waveform Deck (Full width)
@@ -1233,14 +1278,26 @@ impl eframe::App for MainApp {
 
                             let painter = ui.painter_at(rect);
 
-                            // Draw a visual loading/empty state in the viewport
-                            painter.text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "WORKSPACE DEMO REEL\n\n(wgpu video surface output will render here via Metal/DirectX/Vulkan)\n(YUV conversion handled entirely on the GPU)",
-                                egui::FontId::proportional(15.0),
-                                Color32::from_rgb(85, 83, 115),
-                            );
+                            let mut rendered = false;
+                            if let Some(media::DecodedFrame::Cpu { planes, .. }) = &self.latest_frame {
+                                let callback = eframe::egui_wgpu::Callback::new_paint_callback(
+                                    rect,
+                                    YuvCallback { planes: planes.clone() },
+                                );
+                                painter.add(callback);
+                                rendered = true;
+                            }
+
+                            if !rendered {
+                                // Draw a visual loading/empty state in the viewport
+                                painter.text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "WORKSPACE DEMO REEL\n\n(wgpu video surface output will render here via Metal/DirectX/Vulkan)\n(YUV conversion handled entirely on the GPU)",
+                                    egui::FontId::proportional(15.0),
+                                    Color32::from_rgb(85, 83, 115),
+                                );
+                            }
 
                             // Draw a subtle border glow inside the viewport
                             painter.rect_stroke(
@@ -1331,5 +1388,60 @@ impl eframe::App for MainApp {
                     });
                 });
             });
+
+        if self.current_frame != previous_frame && !self.is_playing {
+            self.playback_state.reset(self.current_frame as f64 / self.video_fps);
+        }
     }
 }
+
+struct YuvCallback {
+    planes: media::YuvPlanes,
+}
+
+impl eframe::egui_wgpu::CallbackTrait for YuvCallback {
+    fn prepare(
+        &self,
+        device: &eframe::wgpu::Device,
+        queue: &eframe::wgpu::Queue,
+        _screen_descriptor: &eframe::egui_wgpu::ScreenDescriptor,
+        _encoder: &mut eframe::wgpu::CommandEncoder,
+        callback_resources: &mut eframe::egui_wgpu::CallbackResources,
+    ) -> Vec<eframe::wgpu::CommandBuffer> {
+        if let Some(renderer) = callback_resources.get_mut::<yuv_renderer::YuvRenderer>() {
+            renderer.update_textures(device, queue, &self.planes);
+        }
+        vec![]
+    }
+
+    fn paint<'a>(
+        &'a self,
+        info: egui::PaintCallbackInfo,
+        render_pass: &mut eframe::wgpu::RenderPass<'a>,
+        callback_resources: &'a eframe::egui_wgpu::CallbackResources,
+    ) {
+        let viewport = info.viewport_in_pixels();
+        let clip_rect = info.clip_rect_in_pixels();
+
+        render_pass.set_viewport(
+            viewport.left_px as f32,
+            viewport.top_px as f32,
+            viewport.width_px as f32,
+            viewport.height_px as f32,
+            0.0,
+            1.0,
+        );
+
+        render_pass.set_scissor_rect(
+            clip_rect.left_px.max(0) as u32,
+            clip_rect.top_px.max(0) as u32,
+            clip_rect.width_px.max(0) as u32,
+            clip_rect.height_px.max(0) as u32,
+        );
+
+        if let Some(renderer) = callback_resources.get::<yuv_renderer::YuvRenderer>() {
+            renderer.paint(render_pass);
+        }
+    }
+}
+
