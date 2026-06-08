@@ -6,6 +6,13 @@ use ringbuf::traits::Split;
 use eframe::egui;
 use eframe::egui::Color32;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackState {
+    Seeking,
+    Paused,
+    Playing,
+}
+
 pub struct ExportRange {
     pub id: usize,
     pub in_frame: usize,
@@ -67,6 +74,9 @@ pub struct MainApp {
     pub stale_discards_count: usize,
     pub drift_pause_count: usize,
     pub seek_in_progress: bool,
+    pub ui_state: PlaybackState,
+    pub last_seek_time: Option<std::time::Instant>,
+    pub target_seek_frame: Option<usize>,
 }
 
 impl MainApp {
@@ -134,6 +144,9 @@ impl MainApp {
             stale_discards_count: 0,
             drift_pause_count: 0,
             seek_in_progress: false,
+            ui_state: PlaybackState::Paused,
+            last_seek_time: None,
+            target_seek_frame: None,
         }
     }
 
