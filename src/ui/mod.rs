@@ -6,12 +6,6 @@ use ringbuf::traits::Split;
 use eframe::egui;
 use eframe::egui::Color32;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlaybackState {
-    Seeking,
-    Paused,
-    Playing,
-}
 
 pub struct ExportRange {
     pub id: usize,
@@ -63,20 +57,13 @@ pub struct MainApp {
     // Height of the resizable bottom timeline deck panel
     pub timeline_height: f32,
 
-    pub _audio_engine: Option<crate::audio::AudioEngine>,
-    pub playback_state: std::sync::Arc<crate::audio::AudioPlaybackState>,
-    pub media_engine: Option<crate::media::MediaEngine>,
-    pub keyframes: Vec<usize>,
-    pub future_frame: Option<media::DecodedFrame>,
-    pub latest_sequence_id: usize,
+    pub playback_controller: media::controller::PlaybackController,
+    pub metadata: Option<media::VideoMetadata>,
     pub show_debug_hud: bool,
     pub drift_history: std::collections::VecDeque<f32>,
-    pub stale_discards_count: usize,
-    pub drift_pause_count: usize,
-    pub seek_in_progress: bool,
-    pub ui_state: PlaybackState,
-    pub last_seek_time: Option<std::time::Instant>,
-    pub target_seek_frame: Option<usize>,
+    pub decode_fps_frame_count: usize,
+    pub decode_fps_last_reset: std::time::Instant,
+    pub decode_fps: f32,
     pub left_arrow_held_since: Option<std::time::Instant>,
     pub right_arrow_held_since: Option<std::time::Instant>,
 }
@@ -103,53 +90,40 @@ impl MainApp {
             loudness.push(val.clamp(0.05, 1.0));
         }
 
-        let audio_engine = crate::audio::AudioEngine::new().ok();
-        let playback_state = audio_engine.as_ref().map(|ae| std::sync::Arc::clone(&ae.playback_state))
-            .unwrap_or_else(|| std::sync::Arc::new(crate::audio::AudioPlaybackState {
-                current_position_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                sample_rate: 44100,
-                has_audio: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                should_flush: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                is_playing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                audio_paused_for_sync: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                fallback_epoch: std::time::Instant::now(),
-                fallback_start_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                fallback_base_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            }));
+        let mut playback_controller = media::controller::PlaybackController::new();
+        let mut metadata = None;
+
+        // Auto-load demo reel if present
+        let demo_path = "workspace_demo_reel.mp4";
+        if std::path::Path::new(demo_path).exists() {
+            if let Ok(meta) = playback_controller.load_source(demo_path) {
+                metadata = Some(meta);
+            }
+        }
 
         Self {
-            current_frame: 180,
-            total_frames: 1000,
+            current_frame: 0,
+            total_frames: metadata.as_ref().map_or(1000, |m| m.total_frames),
             is_playing: false,
-            video_path: Some("workspace_demo_reel.mp4".to_string()),
-            video_fps: 24.0,
-            in_marker: Some(120),
-            out_marker: Some(450),
-            ranges: vec![
-                ExportRange { id: 1, in_frame: 120, out_frame: 450 },
-                ExportRange { id: 2, in_frame: 600, out_frame: 820 },
-            ],
-            next_range_id: 3,
+            video_path: Some(demo_path.to_string()),
+            video_fps: metadata.as_ref().map_or(24.0, |m| m.fps),
+            in_marker: None,
+            out_marker: None,
+            ranges: vec![],
+            next_range_id: 1,
             cut_mode: false,
             frame_rx: None,
             latest_frame: None,
             loudness_profile: loudness,
             zoom_level: 0.0,
             timeline_height: 145.0,
-            _audio_engine: audio_engine,
-            playback_state,
-            media_engine: None,
-            keyframes: (0..1000).step_by(50).collect(),
-            future_frame: None,
-            latest_sequence_id: 0,
+            playback_controller,
+            metadata,
             show_debug_hud: false,
             drift_history: std::collections::VecDeque::with_capacity(60),
-            stale_discards_count: 0,
-            drift_pause_count: 0,
-            seek_in_progress: false,
-            ui_state: PlaybackState::Paused,
-            last_seek_time: None,
-            target_seek_frame: None,
+            decode_fps_frame_count: 0,
+            decode_fps_last_reset: std::time::Instant::now(),
+            decode_fps: 0.0,
             left_arrow_held_since: None,
             right_arrow_held_since: None,
         }
@@ -163,77 +137,45 @@ impl MainApp {
         format!("{:02}:{:02}.{:02}", minutes, seconds, centiseconds)
     }
 
-    fn seek_internal(&mut self, frame: usize, keyframe_only: bool, audio_enabled: bool) {
-        self.latest_sequence_id += 1;
-        self.seek_in_progress = true;
-        self.current_frame = frame.clamp(0, self.total_frames);
-        self.playback_state.reset(self.current_frame as f64 / self.video_fps);
-        self.playback_state.is_playing.store(false, std::sync::atomic::Ordering::SeqCst);
-        if let Some(ref me) = self.media_engine {
-            let _ = me.tx.send(crate::media::MediaCommand::Seek {
-                frame_index: self.current_frame,
-                keyframe_only,
-                sequence_id: self.latest_sequence_id,
-                audio_enabled,
-            });
+    fn seek_internal(&mut self, frame: usize, keyframe_only: bool, _audio_enabled: bool) {
+        let view = self.playback_controller.tick(Some(media::controller::PlaybackCommand::Seek {
+            frame_idx: frame,
+            precise: !keyframe_only,
+        }));
+        self.is_playing = view.is_playing;
+        self.current_frame = view.current_frame;
+        if let Some(frame) = view.frame_to_render {
+            self.latest_frame = Some(frame.clone());
         }
-        // Do NOT flush frame_rx here — the decoder's response frame arrives asynchronously
-        // and would be lost. Stale frames are filtered by sequence_id in the consumption loop.
-        self.future_frame = None;
     }
 
     fn set_playing(&mut self, play: bool) {
-        if play {
-            if self.ui_state == PlaybackState::Seeking {
-                // Quick Play: cancel debounce timer and prime audio synchronously
-                self.ui_state = PlaybackState::Playing;
-                self.is_playing = true;
-                self.playback_state.is_playing.store(true, std::sync::atomic::Ordering::SeqCst);
-                self.last_seek_time = None;
-                if let Some(target_frame) = self.target_seek_frame {
-                    self.seek_internal(target_frame, false, true);
-                }
-                self.target_seek_frame = None;
-            } else if self.ui_state == PlaybackState::Paused {
-                self.ui_state = PlaybackState::Playing;
-                self.is_playing = true;
-                self.playback_state.is_playing.store(true, std::sync::atomic::Ordering::SeqCst);
-                self.playback_state.audio_paused_for_sync.store(false, std::sync::atomic::Ordering::SeqCst);
-                self.playback_state.start_fallback_clock();
-                if let Some(ref me) = self.media_engine {
-                    let _ = me.tx.send(crate::media::MediaCommand::Play);
-                }
-                self.target_seek_frame = None;
-            }
+        let cmd = if play {
+            media::controller::PlaybackCommand::Play
         } else {
-            // Pause
-            self.ui_state = PlaybackState::Paused;
-            self.is_playing = false;
-            self.playback_state.is_playing.store(false, std::sync::atomic::Ordering::SeqCst);
-            self.playback_state.stop_fallback_clock();
-            if let Some(ref me) = self.media_engine {
-                let _ = me.tx.send(crate::media::MediaCommand::Pause);
-            }
+            media::controller::PlaybackCommand::Pause
+        };
+        let view = self.playback_controller.tick(Some(cmd));
+        self.is_playing = view.is_playing;
+        self.current_frame = view.current_frame;
+        if let Some(frame) = view.frame_to_render {
+            self.latest_frame = Some(frame.clone());
         }
     }
 
     fn nearest_keyframe(&self, target: usize) -> usize {
-        if self.keyframes.is_empty() {
-            return target;
+        if let Some(ref meta) = self.metadata {
+            if meta.keyframes.is_empty() {
+                return target;
+            }
+            match meta.keyframes.binary_search(&target) {
+                Ok(i) => meta.keyframes[i],
+                Err(0) => meta.keyframes[0],
+                Err(i) => meta.keyframes[i - 1],
+            }
+        } else {
+            target
         }
-        match self.keyframes.binary_search(&target) {
-            Ok(i) => self.keyframes[i],
-            Err(0) => self.keyframes[0],
-            Err(i) => self.keyframes[i - 1],
-        }
-    }
-
-    fn seek_to_frame(&mut self, frame: usize, keyframe_only: bool) {
-        self.ui_state = PlaybackState::Seeking;
-        self.is_playing = false;
-        self.last_seek_time = Some(std::time::Instant::now());
-        self.target_seek_frame = Some(frame);
-        self.seek_internal(frame, keyframe_only, false);
     }
 }
 
@@ -662,7 +604,7 @@ impl MainApp {
     fn progress_bar(
         &mut self,
         ui: &mut egui::Ui,
-    ) -> bool {
+    ) -> egui::Response {
         let height = 12.0; // Interaction height
         let (rect, response) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), height),
@@ -742,22 +684,22 @@ impl MainApp {
             Color32::from_rgb(236, 72, 153), // Hot pink playhead handle
         );
 
-        // Handle user seeking click/drag
+        // Update current_frame on drag/click so caller can read the new position.
         if response.dragged() || response.clicked() {
             if let Some(mouse_pos) = response.interact_pointer_pos() {
                 let rel_x = (mouse_pos.x - rect.left()).clamp(0.0, rect.width());
                 let pct = rel_x / rect.width();
                 self.current_frame = (pct * self.total_frames as f32) as usize;
-                return true;
             }
         }
 
-        false
+        response
     }
 }
 
 impl eframe::App for MainApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let previous_is_playing = self.is_playing;
         let mut prev_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
         let mut next_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
 
@@ -771,130 +713,54 @@ impl eframe::App for MainApp {
 
         let previous_frame = self.current_frame;
 
-        if self.ui_state == PlaybackState::Seeking {
-            if let Some(last_seek) = self.last_seek_time {
-                if last_seek.elapsed() >= std::time::Duration::from_millis(500) {
-                    self.ui_state = PlaybackState::Paused;
-                    self.last_seek_time = None;
-                    if let Some(target_frame) = self.target_seek_frame {
-                        // Debounce expired: trigger precise seek + audio priming!
-                        self.seek_internal(target_frame, false, true);
-                    }
-                    self.target_seek_frame = None;
-                }
-            }
+        // 1. Gather play/seek commands from UI events
+        let mut cmd = None;
+        if self.is_playing != previous_is_playing {
+            cmd = Some(if self.is_playing {
+                media::controller::PlaybackCommand::Play
+            } else {
+                media::controller::PlaybackCommand::Pause
+            });
         }
 
-        // Sync fallback clock state and correct AV drift if lagging
+        // Apply arrow keyboard seek shortcuts
+        if prev_pressed {
+            cmd = Some(media::controller::PlaybackCommand::Seek {
+                frame_idx: self.current_frame.saturating_sub(1),
+                precise: true,
+            });
+        } else if next_pressed {
+            cmd = Some(media::controller::PlaybackCommand::Seek {
+                frame_idx: self.current_frame.saturating_add(1),
+                precise: true,
+            });
+        }
+
+        // 2. Tick the controller facade
+        let view = self.playback_controller.tick(cmd);
+
+        // 3. Map status view properties to UI state
+        self.is_playing = view.is_playing;
+        self.current_frame = view.current_frame;
+        
+        if let Some(frame) = view.frame_to_render {
+            self.latest_frame = Some(frame.clone());
+        }
+
+        if self.current_frame >= self.total_frames {
+            self.current_frame = self.total_frames;
+            self.set_playing(false);
+        }
+
+        // Calculate drift and populate drift_history for diagnostic HUD
+        let video_time = view.frame_to_render.map_or(view.current_frame as f64 / self.video_fps, |f| f.pts_sec());
+        let drift = view.current_time - video_time;
+        self.drift_history.push_back(drift as f32);
+        if self.drift_history.len() > 60 {
+            self.drift_history.pop_front();
+        }
+
         if self.is_playing {
-            let video_time = self.latest_frame.as_ref()
-                .filter(|f| f.sequence_id() == self.latest_sequence_id)
-                .map_or(self.current_frame as f64 / self.video_fps, |f| f.pts_sec());
-            let current_time = self.playback_state.current_time();
-            let drift = current_time - video_time;
-
-            // Harvest drift history
-            self.drift_history.push_back(drift as f32);
-            if self.drift_history.len() > 60 {
-                self.drift_history.pop_front();
-            }
-
-            // Real-time Drift Correction: Video lag > 150ms
-            if drift > 0.15 && !self.playback_state.audio_paused_for_sync.load(std::sync::atomic::Ordering::SeqCst) {
-                self.playback_state.audio_paused_for_sync.store(true, std::sync::atomic::Ordering::SeqCst);
-                self.drift_pause_count += 1;
-                println!("AV SYNC: Video lag detected ({:.1} ms). Pausing audio for sync.", drift * 1000.0);
-            }
-
-            // Ensure playback clock is running/stopped based on audio_paused_for_sync
-            if !self.playback_state.audio_paused_for_sync.load(std::sync::atomic::Ordering::SeqCst) {
-                let running = self.playback_state.is_playing.swap(true, std::sync::atomic::Ordering::SeqCst);
-                if !running {
-                    self.playback_state.start_fallback_clock();
-                }
-            } else {
-                self.playback_state.stop_fallback_clock();
-            }
-
-            let master_time = self.playback_state.current_time();
-            let calculated_frame = (master_time * self.video_fps) as usize;
-            self.current_frame = self.latest_frame.as_ref()
-                .filter(|f| f.sequence_id() == self.latest_sequence_id)
-                .map_or(calculated_frame, |f| f.frame_idx());
-            if self.current_frame >= self.total_frames {
-                self.current_frame = self.total_frames;
-                self.set_playing(false);
-            }
-        } else {
-            self.playback_state.stop_fallback_clock();
-            self.playback_state.is_playing.store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        // 1. Process background frames
-        if let Some(ref rx) = self.frame_rx {
-            let master_time = self.playback_state.current_time();
-            
-            if !self.is_playing {
-                while let Ok(frame) = rx.try_recv() {
-                    if frame.sequence_id() < self.latest_sequence_id {
-                        self.stale_discards_count += 1;
-                        continue;
-                    }
-                    if frame.sequence_id() == self.latest_sequence_id {
-                        self.latest_frame = Some(frame);
-                        self.future_frame = None;
-                    }
-                }
-            } else {
-                // Promote future frame if it's now ready and not stale
-                if let Some(ref f) = self.future_frame {
-                    if f.sequence_id() < self.latest_sequence_id {
-                        self.stale_discards_count += 1;
-                        self.future_frame = None;
-                    } else if f.pts_sec() <= master_time {
-                        self.latest_frame = self.future_frame.take();
-                    }
-                }
-
-                // Receive new frames from channel
-                if self.future_frame.is_none() {
-                    while let Ok(frame) = rx.try_recv() {
-                        if frame.sequence_id() < self.latest_sequence_id {
-                            self.stale_discards_count += 1;
-                            continue; // Discard stale frame!
-                        }
-                        if frame.pts_sec() <= master_time {
-                            self.latest_frame = Some(frame);
-                        } else {
-                            self.future_frame = Some(frame);
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if self.playback_state.audio_paused_for_sync.load(std::sync::atomic::Ordering::SeqCst) {
-                let mut caught_up = false;
-                if let Some(ref f) = self.latest_frame {
-                    if f.sequence_id() == self.latest_sequence_id {
-                        if self.ui_state == PlaybackState::Seeking {
-                            caught_up = false; // Ignore catch-up in seeking state
-                        } else {
-                            if f.pts_sec() >= master_time || f.frame_idx() >= self.total_frames.saturating_sub(1) {
-                                caught_up = true;
-                            }
-                        }
-                    }
-                }
-                if caught_up {
-                    self.seek_in_progress = false;
-                    if self.ui_state == PlaybackState::Playing {
-                        self.playback_state.audio_paused_for_sync.store(false, std::sync::atomic::Ordering::SeqCst);
-                        self.playback_state.start_fallback_clock();
-                    }
-                }
-            }
-
             ctx.request_repaint();
         }
 
@@ -1062,8 +928,8 @@ impl eframe::App for MainApp {
                             let response_id = ui.make_persistent_id(format!("filmstrip_th_{}", i));
                             let th_response = ui.interact(thub_rect, response_id, egui::Sense::click());
                             if th_response.clicked() {
-                                self.seek_to_frame(target_frame as usize, false);
                                 self.set_playing(false);
+                                self.seek_internal(target_frame as usize, false, true);
                             }
                         } else {
                             // Out of bounds thumbnail placeholder
@@ -1272,12 +1138,18 @@ impl eframe::App for MainApp {
                             let rel_x = (mouse_pos.x - wave_rect.left()).clamp(0.0, wave_rect.width());
                             let pct = rel_x / wave_rect.width();
                             let target_frame = (pct * self.total_frames as f32) as usize;
-                            let target_kf = self.nearest_keyframe(target_frame);
                             self.set_playing(false);
-                            self.last_seek_time = Some(std::time::Instant::now());
-                            if self.target_seek_frame != Some(target_kf) {
-                                self.seek_to_frame(target_kf, true);
-                            }
+                            self.seek_internal(target_frame, true, false);
+                        }
+                    }
+                    // Precise settle: when the drag gesture ends, snap to the keyframe
+                    // we were already displaying — no intra-GOP precise seek.
+                    if wave_response.drag_stopped() {
+                        if let Some(mouse_pos) = wave_response.interact_pointer_pos() {
+                            let rel_x = (mouse_pos.x - wave_rect.left()).clamp(0.0, wave_rect.width());
+                            let pct = rel_x / wave_rect.width();
+                            let target_frame = (pct * self.total_frames as f32) as usize;
+                            self.seek_internal(target_frame, true, false);
                         }
                     }
                 });
@@ -1477,93 +1349,22 @@ impl eframe::App for MainApp {
                                 "Load video file",
                             ).clicked() {
                                 if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("Video File", &["mp4", "mkv", "avi", "mov"])
+                                    .add_filter("Video", &["mp4", "mkv", "avi", "mov"])
                                     .pick_file()
                                 {
-                                    // 1. Stop current playback and drop old engines
-                                    self.set_playing(false);
-                                    self.media_engine = None;
-                                    self._audio_engine = None;
-                                    self.latest_frame = None;
-
-                                    // 2. Initialize fresh Audio Engine
-                                    let mut audio_engine = crate::audio::AudioEngine::new().ok();
-                                    
-                                    // 3. Setup channels
-                                    let (frame_tx, frame_rx) = crossbeam_channel::bounded(4);
-                                    let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
-
-                                    let target_sample_rate = audio_engine.as_ref().map(|ae| ae.playback_state.sample_rate).unwrap_or(44100);
-                                    let target_channels = 1; // Mono samples expected by CPAL callback
-                                    
-                                    // Set default audio producer
-                                    let audio_tx = audio_engine.as_mut().and_then(|ae| ae.tx.take()).unwrap_or_else(|| {
-                                        // Fallback/dummy buffer if no audio engine
-                                        let rb = ringbuf::SharedRb::<ringbuf::storage::Heap<f32>>::new(1024);
-                                        let (prod, _) = rb.split();
-                                        prod
-                                    });
-
-                                    // Set default tags producer
-                                    let tags_tx = audio_engine.as_mut().and_then(|ae| ae.tags_tx.take()).unwrap_or_else(|| {
-                                        // Fallback/dummy buffer if no audio engine
-                                        let rb = ringbuf::SharedRb::<ringbuf::storage::Heap<(u64, u64)>>::new(256);
-                                        let (prod, _) = rb.split();
-                                        prod
-                                    });
-
-                                    // Resolve active playback state first
-                                    let playback_state = audio_engine.as_ref()
-                                        .map(|ae| std::sync::Arc::clone(&ae.playback_state))
-                                        .unwrap_or_else(|| std::sync::Arc::new(crate::audio::AudioPlaybackState {
-                                            current_position_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                                            sample_rate: 44100,
-                                            has_audio: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                                            should_flush: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                                            is_playing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                                            audio_paused_for_sync: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                                            fallback_epoch: std::time::Instant::now(),
-                                            fallback_start_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                                            fallback_base_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                                        }));
-
-                                    // 4. Initialize MediaEngine
-                                    match crate::media::MediaEngine::new(
-                                        &path,
-                                        target_sample_rate,
-                                        target_channels,
-                                        frame_tx,
-                                        audio_tx,
-                                        tags_tx,
-                                        cmd_rx,
-                                        std::sync::Arc::clone(&playback_state),
-                                    ) {
-                                        Ok((me, metadata)) => {
-                                            self.total_frames = metadata.total_frames;
-                                            self.video_fps = metadata.fps;
-                                            self.video_path = Some(path.to_string_lossy().into_owned());
+                                    let path_str = path.to_string_lossy().to_string();
+                                    match self.playback_controller.load_source(&path_str) {
+                                        Ok(meta) => {
+                                            self.video_path = Some(path_str);
+                                            self.total_frames = meta.total_frames;
+                                            self.video_fps = meta.fps;
+                                            self.metadata = Some(meta);
                                             self.current_frame = 0;
-                                            self.in_marker = None;
-                                            self.out_marker = None;
-                                            self.ranges.clear();
-                                            self.stale_discards_count = 0;
-                                            self.drift_pause_count = 0;
-                                            self.drift_history.clear();
-                                            
-                                            playback_state.reset(0.0);
-                                            playback_state.has_audio.store(metadata.has_audio && audio_engine.is_some(), std::sync::atomic::Ordering::Relaxed);
-                                            
-                                            self.playback_state = playback_state;
-                                            self._audio_engine = audio_engine;
-                                            self.media_engine = Some(me);
-                                            self.frame_rx = Some(frame_rx);
-                                            self.keyframes = metadata.keyframes;
-                                            self.seek_to_frame(0, false);
-                                            
+                                            self.seek_internal(0, false, false);
                                             println!("Loaded video: {}", path.display());
                                         }
                                         Err(e) => {
-                                            eprintln!("Failed to load video: {:?}", e);
+                                            eprintln!("Error loading video: {:?}", e);
                                         }
                                     }
                                 }
@@ -1674,9 +1475,10 @@ impl eframe::App for MainApp {
                                                 
                                                 ui.separator();
                                                 
-                                                let master_time = self.playback_state.current_time();
+                                                                                let master_time = self.playback_controller.current_time();
+                                                let seq_id = self.latest_frame.as_ref().map_or(0, |f| f.sequence_id());
                                                 let video_time = self.latest_frame.as_ref()
-                                                    .filter(|f| f.sequence_id() == self.latest_sequence_id)
+                                                    .filter(|f| f.sequence_id() == seq_id)
                                                     .map_or(self.current_frame as f64 / self.video_fps, |f| f.pts_sec());
                                                 let drift = master_time - video_time;
                                                 
@@ -1704,25 +1506,32 @@ impl eframe::App for MainApp {
                                                 ui.horizontal(|ui| {
                                                     ui.label("Sequence ID :");
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        ui.label(egui::RichText::new(format!("{}", self.latest_sequence_id)).monospace());
+                                                        ui.label(egui::RichText::new(format!("{}", seq_id)).monospace());
                                                     });
                                                 });
                                                 ui.horizontal(|ui| {
                                                     ui.label("Stale Drops :");
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        ui.label(egui::RichText::new(format!("{}", self.stale_discards_count)).monospace());
+                                                        ui.label(egui::RichText::new("N/A").monospace());
                                                     });
                                                 });
                                                 ui.horizontal(|ui| {
                                                     ui.label("Sync Pauses :");
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        ui.label(egui::RichText::new(format!("{}", self.drift_pause_count)).monospace());
+                                                        ui.label(egui::RichText::new("N/A").monospace());
                                                     });
                                                 });
                                                 ui.horizontal(|ui| {
                                                     ui.label("CPAL Rate   :");
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        ui.label(egui::RichText::new(format!("{} Hz", self.playback_state.sample_rate)).monospace());
+                                                        ui.label(egui::RichText::new(format!("{} Hz", self.playback_controller.sample_rate())).monospace());
+                                                    });
+                                                });
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Decode FPS  :");
+                                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                        let fps_color = if self.decode_fps >= 20.0 { Color32::LIGHT_GREEN } else { Color32::LIGHT_RED };
+                                                        ui.label(egui::RichText::new(format!("{:.1} fps", self.decode_fps)).monospace().color(fps_color));
                                                     });
                                                 });
                                                 
@@ -1776,12 +1585,12 @@ impl eframe::App for MainApp {
                                                 ui.add_space(8.0);
                                                 ui.horizontal(|ui| {
                                                     if ui.button("Flush Buffer").on_hover_text("Flush/drain audio ring buffer").clicked() {
-                                                        self.playback_state.reset(self.current_frame as f64 / self.video_fps);
+                                                        self.seek_internal(self.current_frame, false, true);
                                                         println!("HUD: Manual flush of audio buffer triggered");
                                                     }
                                                     if ui.button("Force Resync").on_hover_text("Force resync clocks").clicked() {
                                                         let current = self.current_frame;
-                                                        self.seek_to_frame(current, false);
+                                                        self.seek_internal(current, false, true);
                                                         println!("HUD: Manual resync triggered to frame {}", current);
                                                     }
                                                 });
@@ -1794,13 +1603,15 @@ impl eframe::App for MainApp {
                     ui.add_space(10.0);
 
                     // Sleek progress slider
-                    if self.progress_bar(ui) {
+                    let progress_response = self.progress_bar(ui);
+                    if progress_response.dragged() || progress_response.clicked() {
                         self.set_playing(false);
-                        let target_kf = self.nearest_keyframe(self.current_frame);
-                        self.last_seek_time = Some(std::time::Instant::now());
-                        if self.target_seek_frame != Some(target_kf) {
-                            self.seek_to_frame(target_kf, true);
-                        }
+                        self.seek_internal(self.current_frame, true, false);
+                    }
+                    // Precise settle: when the drag gesture ends, snap to the keyframe
+                    // we were already displaying — no intra-GOP precise seek.
+                    if progress_response.drag_stopped() {
+                        self.seek_internal(self.current_frame, true, false);
                     }
 
                     ui.add_space(10.0);
@@ -1821,7 +1632,7 @@ impl eframe::App for MainApp {
                                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
                                 if playback_control_button(ui, PlaybackIcon::Start, false, "Go to start of video").clicked() {
-                                    self.seek_to_frame(0, false);
+                                    self.seek_internal(0, false, true);
                                 }
                                 let prev_resp = playback_control_button(ui, PlaybackIcon::PrevFrame, false, "Step backward one frame");
                                 if prev_resp.clicked() {
@@ -1852,7 +1663,7 @@ impl eframe::App for MainApp {
                                     next_down = true;
                                 }
                                 if playback_control_button(ui, PlaybackIcon::End, false, "Go to end of video").clicked() {
-                                    self.seek_to_frame(self.total_frames, false);
+                                    self.seek_internal(self.total_frames, false, true);
                                 }
                             },
                         );
@@ -1884,17 +1695,22 @@ impl eframe::App for MainApp {
                 });
             });
 
-        // Hold-to-repeat frame stepping
+        // Frame stepping: single tap → direct precise seek, no debounce.
+        // Hold → 250ms entrance guard, then response-driven precise seeks with no timer involvement.
+        // Setting self.is_playing = false here is critical: it prevents the AV sync block from
+        // running next tick and clobbering current_frame from the master clock.
         if prev_pressed {
+            self.is_playing = false;
             self.current_frame = self.current_frame.saturating_sub(1);
-            self.seek_to_frame(self.current_frame, false);
             self.left_arrow_held_since = Some(std::time::Instant::now());
             self.right_arrow_held_since = None;
+            self.seek_internal(self.current_frame, false, false);
         } else if next_pressed {
+            self.is_playing = false;
             self.current_frame = (self.current_frame + 1).min(self.total_frames);
-            self.seek_to_frame(self.current_frame, false);
             self.right_arrow_held_since = Some(std::time::Instant::now());
             self.left_arrow_held_since = None;
+            self.seek_internal(self.current_frame, false, false);
         } else {
             if prev_down {
                 self.right_arrow_held_since = None;
@@ -1903,11 +1719,11 @@ impl eframe::App for MainApp {
                 }
                 if let Some(held_since) = self.left_arrow_held_since {
                     if held_since.elapsed() >= std::time::Duration::from_millis(250) {
-                        let seek_in_flight = self.latest_frame.as_ref()
-                            .map_or(true, |f| f.sequence_id() < self.latest_sequence_id);
-                        if !seek_in_flight {
+                        // Hold path: only send next seek when the previous frame has arrived.
+                        if !self.playback_controller.is_seek_in_flight() {
+                            self.is_playing = false;
                             self.current_frame = self.current_frame.saturating_sub(1);
-                            self.seek_to_frame(self.current_frame, false);
+                            self.seek_internal(self.current_frame, false, false);
                         }
                         ctx.request_repaint();
                     }
@@ -1919,11 +1735,11 @@ impl eframe::App for MainApp {
                 }
                 if let Some(held_since) = self.right_arrow_held_since {
                     if held_since.elapsed() >= std::time::Duration::from_millis(250) {
-                        let seek_in_flight = self.latest_frame.as_ref()
-                            .map_or(true, |f| f.sequence_id() < self.latest_sequence_id);
-                        if !seek_in_flight {
+                        // Hold path: only send next seek when the previous frame has arrived.
+                        if !self.playback_controller.is_seek_in_flight() {
+                            self.is_playing = false;
                             self.current_frame = (self.current_frame + 1).min(self.total_frames);
-                            self.seek_to_frame(self.current_frame, false);
+                            self.seek_internal(self.current_frame, false, false);
                         }
                         ctx.request_repaint();
                     }
@@ -1932,10 +1748,6 @@ impl eframe::App for MainApp {
                 self.left_arrow_held_since = None;
                 self.right_arrow_held_since = None;
             }
-        }
-
-        if self.current_frame != previous_frame && !self.is_playing {
-            self.playback_state.reset(self.current_frame as f64 / self.video_fps);
         }
     }
 }

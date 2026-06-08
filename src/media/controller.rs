@@ -168,6 +168,10 @@ impl PlaybackController {
         self.audio_backend.current_time()
     }
 
+    pub fn sample_rate(&self) -> u32 {
+        self.audio_backend.sample_rate()
+    }
+
     fn nearest_keyframe(&self, target: usize, keyframes: &[usize]) -> usize {
         if keyframes.is_empty() {
             return target;
@@ -179,7 +183,7 @@ impl PlaybackController {
         }
     }
 
-    fn is_seek_in_flight(&self) -> bool {
+    pub fn is_seek_in_flight(&self) -> bool {
         if self.latest_sequence_id == 0 {
             return false;
         }
