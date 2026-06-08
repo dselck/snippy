@@ -71,7 +71,7 @@ fn main() -> Result<(), anyhow::Error> {
         Err(i) => metadata.keyframes[i - 1],
     };
     println!("\n--- Test Scrubbing Seek: target_frame={}, nearest_keyframe={} ---", test_frame, nearest_kf);
-    me.tx.send(MediaCommand::Seek { frame_index: nearest_kf, keyframe_only: true, sequence_id: 1 })?;
+    me.tx.send(MediaCommand::Seek { frame_index: nearest_kf, keyframe_only: true, sequence_id: 1, audio_enabled: false })?;
 
     // We expect to receive exactly the keyframe
     match frame_rx.recv_timeout(Duration::from_secs(3)) {
@@ -122,7 +122,7 @@ fn main() -> Result<(), anyhow::Error> {
     // 6. Test Exact Seek (Non-keyframe)
     let exact_target = 105;
     println!("\n--- Test Exact Seek: target_frame={} ---", exact_target);
-    me.tx.send(MediaCommand::Seek { frame_index: exact_target, keyframe_only: false, sequence_id: 2 })?;
+    me.tx.send(MediaCommand::Seek { frame_index: exact_target, keyframe_only: false, sequence_id: 2, audio_enabled: true })?;
 
     // Drain frame_rx (giving a short sleep to allow the video thread to process/unblock and clear the channel)
     thread::sleep(Duration::from_millis(50));
