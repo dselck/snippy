@@ -287,6 +287,9 @@ fn run_decoding_loop(
         let mut keyframe_only_mode = false;
         let mut decode_more = true;
         let mut current_sequence_id = 0;
+        let mut last_decoded_frame: Option<usize> = None;
+        let mut play_mode = false;
+        let mut seek_target_frame: Option<usize> = None;
 
         loop {
             if decode_more {
@@ -380,47 +383,71 @@ fn run_decoding_loop(
                                         recv(video_cmd_rx) -> cmd_res => {
                                             if let Ok(cmd) = cmd_res {
                                                 match cmd {
-                                                    VideoThreadCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae, resp_tx } => {
-                                                        let target_kf = get_nearest_keyframe(&keyframes, frame_index);
-                                                        if gop_cache.keyframe_idx != target_kf {
-                                                            gop_cache.frames.clear();
-                                                            gop_cache.keyframe_idx = target_kf;
-                                                        }
+                                                     VideoThreadCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae, resp_tx } => {
+                                                         let target_kf = get_nearest_keyframe(&keyframes, frame_index);
+                                                         if gop_cache.keyframe_idx != target_kf {
+                                                             gop_cache.frames.clear();
+                                                             gop_cache.keyframe_idx = target_kf;
+                                                         }
 
-                                                        let mut cache_hit = false;
-                                                        if !ae {
-                                                            if let Some(cached) = gop_cache.frames.get(&frame_index) {
-                                                                let decoded = DecodedFrame::Cpu {
-                                                                    frame_idx: frame_index,
-                                                                    planes: cached.planes.clone(),
-                                                                    sequence_id,
-                                                                    pts_sec: cached.pts_sec,
-                                                                };
-                                                                if frame_tx_clone.send(decoded).is_ok() {
-                                                                    let _ = resp_tx.send(true);
-                                                                    fallback_frame_idx = frame_index;
-                                                                    keyframe_only_mode = keyframe_only;
-                                                                    current_sequence_id = sequence_id;
-                                                                    decode_more = false;
-                                                                    cache_hit = true;
-                                                                }
-                                                            }
-                                                        }
+                                                         let mut handled = false;
+                                                         if !ae {
+                                                             // 1. Check GOP cache first
+                                                             if let Some(cached) = gop_cache.frames.get(&frame_index) {
+                                                                 let decoded = DecodedFrame::Cpu {
+                                                                     frame_idx: frame_index,
+                                                                     planes: cached.planes.clone(),
+                                                                     sequence_id,
+                                                                     pts_sec: cached.pts_sec,
+                                                                 };
+                                                                 if frame_tx_clone.send(decoded).is_ok() {
+                                                                     let _ = resp_tx.send(true);
+                                                                     fallback_frame_idx = frame_index;
+                                                                     keyframe_only_mode = keyframe_only;
+                                                                     current_sequence_id = sequence_id;
+                                                                     decode_more = false;
+                                                                     play_mode = false;
+                                                                     seek_target_frame = None;
+                                                                     last_decoded_frame = None;
+                                                                     handled = true;
+                                                                 }
+                                                             }
+                                                             // 2. Check sequential fast path
+                                                             if !handled {
+                                                                 if let Some(last) = last_decoded_frame {
+                                                                     if frame_index >= last + 1 && frame_index <= last + 5 {
+                                                                         let _ = resp_tx.send(true);
+                                                                         fallback_frame_idx = frame_index;
+                                                                         keyframe_only_mode = keyframe_only;
+                                                                         current_sequence_id = sequence_id;
+                                                                         decode_more = true;
+                                                                         play_mode = false;
+                                                                         seek_target_frame = Some(frame_index);
+                                                                         handled = true;
+                                                                     }
+                                                                 }
+                                                             }
+                                                         }
 
-                                                        if !cache_hit {
-                                                            fallback_frame_idx = frame_index;
-                                                            keyframe_only_mode = keyframe_only;
-                                                            current_sequence_id = sequence_id;
-                                                            while video_packet_rx.try_recv().is_ok() {}
-                                                            video_decoder.flush();
-                                                            let _ = resp_tx.send(false);
-                                                            decode_more = true;
-                                                        }
-                                                    }
-                                                    VideoThreadCommand::Play => {
-                                                        keyframe_only_mode = false;
-                                                        decode_more = true;
-                                                    }
+                                                         if !handled {
+                                                             fallback_frame_idx = frame_index;
+                                                             keyframe_only_mode = keyframe_only;
+                                                             current_sequence_id = sequence_id;
+                                                             play_mode = false;
+                                                             seek_target_frame = Some(frame_index);
+                                                             while video_packet_rx.try_recv().is_ok() {}
+                                                             video_decoder.flush();
+                                                             let _ = resp_tx.send(false);
+                                                             decode_more = true;
+                                                             last_decoded_frame = None;
+                                                         }
+                                                     }
+                                                     VideoThreadCommand::Play => {
+                                                         play_mode = true;
+                                                         seek_target_frame = None;
+                                                         keyframe_only_mode = false;
+                                                         decode_more = true;
+                                                     }
                                                 }
                                                 break; // break the receive_frame loop
                                             } else {
@@ -431,6 +458,18 @@ fn run_decoding_loop(
 
                                     if !sent {
                                         break; // abort further decoding for the current packet
+                                    }
+
+                                    last_decoded_frame = Some(frame_idx);
+
+                                    if !play_mode {
+                                        if let Some(target) = seek_target_frame {
+                                            if frame_idx >= target {
+                                                decode_more = false;
+                                                seek_target_frame = None;
+                                                break;
+                                            }
+                                        }
                                     }
 
                                     if keyframe_only_mode {
@@ -452,8 +491,9 @@ fn run_decoding_loop(
                                     gop_cache.keyframe_idx = target_kf;
                                 }
 
-                                let mut cache_hit = false;
+                                let mut handled = false;
                                 if !ae {
+                                    // 1. Check GOP cache first
                                     if let Some(cached) = gop_cache.frames.get(&frame_index) {
                                         let decoded = DecodedFrame::Cpu {
                                             frame_idx: frame_index,
@@ -467,22 +507,45 @@ fn run_decoding_loop(
                                             keyframe_only_mode = keyframe_only;
                                             current_sequence_id = sequence_id;
                                             decode_more = false;
-                                            cache_hit = true;
+                                            play_mode = false;
+                                            seek_target_frame = None;
+                                            last_decoded_frame = None;
+                                            handled = true;
+                                        }
+                                    }
+                                    // 2. Check sequential fast path
+                                    if !handled {
+                                        if let Some(last) = last_decoded_frame {
+                                            if frame_index >= last + 1 && frame_index <= last + 5 {
+                                                let _ = resp_tx.send(true);
+                                                fallback_frame_idx = frame_index;
+                                                keyframe_only_mode = keyframe_only;
+                                                current_sequence_id = sequence_id;
+                                                decode_more = true;
+                                                play_mode = false;
+                                                seek_target_frame = Some(frame_index);
+                                                handled = true;
+                                            }
                                         }
                                     }
                                 }
 
-                                if !cache_hit {
+                                if !handled {
                                     fallback_frame_idx = frame_index;
                                     keyframe_only_mode = keyframe_only;
                                     current_sequence_id = sequence_id;
+                                    play_mode = false;
+                                    seek_target_frame = Some(frame_index);
                                     while video_packet_rx.try_recv().is_ok() {}
                                     video_decoder.flush();
                                     let _ = resp_tx.send(false);
                                     decode_more = true;
+                                    last_decoded_frame = None;
                                 }
                             }
                             Ok(VideoThreadCommand::Play) => {
+                                play_mode = true;
+                                seek_target_frame = None;
                                 keyframe_only_mode = false;
                                 decode_more = true;
                             }
@@ -499,8 +562,9 @@ fn run_decoding_loop(
                             gop_cache.keyframe_idx = target_kf;
                         }
 
-                        let mut cache_hit = false;
+                        let mut handled = false;
                         if !ae {
+                            // 1. Check GOP cache first
                             if let Some(cached) = gop_cache.frames.get(&frame_index) {
                                 let decoded = DecodedFrame::Cpu {
                                     frame_idx: frame_index,
@@ -514,22 +578,45 @@ fn run_decoding_loop(
                                     keyframe_only_mode = keyframe_only;
                                     current_sequence_id = sequence_id;
                                     decode_more = false;
-                                    cache_hit = true;
+                                    play_mode = false;
+                                    seek_target_frame = None;
+                                    last_decoded_frame = None;
+                                    handled = true;
+                                }
+                            }
+                            // 2. Check sequential fast path
+                            if !handled {
+                                if let Some(last) = last_decoded_frame {
+                                    if frame_index >= last + 1 && frame_index <= last + 5 {
+                                        let _ = resp_tx.send(true);
+                                        fallback_frame_idx = frame_index;
+                                        keyframe_only_mode = keyframe_only;
+                                        current_sequence_id = sequence_id;
+                                        decode_more = true;
+                                        play_mode = false;
+                                        seek_target_frame = Some(frame_index);
+                                        handled = true;
+                                    }
                                 }
                             }
                         }
 
-                        if !cache_hit {
+                        if !handled {
                             fallback_frame_idx = frame_index;
                             keyframe_only_mode = keyframe_only;
                             current_sequence_id = sequence_id;
+                            play_mode = false;
+                            seek_target_frame = Some(frame_index);
                             while video_packet_rx.try_recv().is_ok() {}
                             video_decoder.flush();
                             let _ = resp_tx.send(false);
                             decode_more = true;
+                            last_decoded_frame = None;
                         }
                     }
                     Ok(VideoThreadCommand::Play) => {
+                        play_mode = true;
+                        seek_target_frame = None;
                         keyframe_only_mode = false;
                         decode_more = true;
                     }

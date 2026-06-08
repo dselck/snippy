@@ -835,28 +835,41 @@ impl eframe::App for MainApp {
         if let Some(ref rx) = self.frame_rx {
             let master_time = self.playback_state.current_time();
             
-            // Promote future frame if it's now ready and not stale
-            if let Some(ref f) = self.future_frame {
-                if f.sequence_id() < self.latest_sequence_id {
-                    self.stale_discards_count += 1;
-                    self.future_frame = None;
-                } else if f.pts_sec() <= master_time {
-                    self.latest_frame = self.future_frame.take();
-                }
-            }
-
-            // Receive new frames from channel
-            if self.future_frame.is_none() {
+            if !self.is_playing {
                 while let Ok(frame) = rx.try_recv() {
                     if frame.sequence_id() < self.latest_sequence_id {
                         self.stale_discards_count += 1;
-                        continue; // Discard stale frame!
+                        continue;
                     }
-                    if frame.pts_sec() <= master_time {
+                    if frame.sequence_id() == self.latest_sequence_id {
                         self.latest_frame = Some(frame);
-                    } else {
-                        self.future_frame = Some(frame);
-                        break;
+                        self.future_frame = None;
+                    }
+                }
+            } else {
+                // Promote future frame if it's now ready and not stale
+                if let Some(ref f) = self.future_frame {
+                    if f.sequence_id() < self.latest_sequence_id {
+                        self.stale_discards_count += 1;
+                        self.future_frame = None;
+                    } else if f.pts_sec() <= master_time {
+                        self.latest_frame = self.future_frame.take();
+                    }
+                }
+
+                // Receive new frames from channel
+                if self.future_frame.is_none() {
+                    while let Ok(frame) = rx.try_recv() {
+                        if frame.sequence_id() < self.latest_sequence_id {
+                            self.stale_discards_count += 1;
+                            continue; // Discard stale frame!
+                        }
+                        if frame.pts_sec() <= master_time {
+                            self.latest_frame = Some(frame);
+                        } else {
+                            self.future_frame = Some(frame);
+                            break;
+                        }
                     }
                 }
             }
@@ -1891,8 +1904,12 @@ impl eframe::App for MainApp {
                 }
                 if let Some(held_since) = self.left_arrow_held_since {
                     if held_since.elapsed() >= std::time::Duration::from_millis(250) {
-                        self.current_frame = self.current_frame.saturating_sub(1);
-                        self.seek_to_frame(self.current_frame, false);
+                        let seek_in_flight = self.latest_frame.as_ref()
+                            .map_or(true, |f| f.sequence_id() < self.latest_sequence_id);
+                        if !seek_in_flight {
+                            self.current_frame = self.current_frame.saturating_sub(1);
+                            self.seek_to_frame(self.current_frame, false);
+                        }
                         ctx.request_repaint();
                     }
                 }
@@ -1903,8 +1920,12 @@ impl eframe::App for MainApp {
                 }
                 if let Some(held_since) = self.right_arrow_held_since {
                     if held_since.elapsed() >= std::time::Duration::from_millis(250) {
-                        self.current_frame = (self.current_frame + 1).min(self.total_frames);
-                        self.seek_to_frame(self.current_frame, false);
+                        let seek_in_flight = self.latest_frame.as_ref()
+                            .map_or(true, |f| f.sequence_id() < self.latest_sequence_id);
+                        if !seek_in_flight {
+                            self.current_frame = (self.current_frame + 1).min(self.total_frames);
+                            self.seek_to_frame(self.current_frame, false);
+                        }
                         ctx.request_repaint();
                     }
                 }
