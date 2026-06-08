@@ -1,0 +1,3 @@
+# 6. FFmpeg Timestamps as the Single Source of Truth for Synchronization
+
+To ensure absolute audio-video synchronization and prevent timing drift or visual jitter, we decided that all playback, timeline, and rendering decisions must be based strictly on the ground-truth presentation timestamps (PTS) defined by the FFmpeg container and streams. We explicitly reject the use of nominal calculations (such as average frame rate, calculated frame indices, or uniform sample distribution approximations) for timing synchronization. Instead, we propagate precise FFmpeg PTS values through tags in the audio playback queue and the `pts_sec` fields of decoded video frames, matching them directly to the master clock to drive frame rendering, catch-up, and timeline updates.
