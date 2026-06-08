@@ -804,7 +804,11 @@ impl eframe::App for MainApp {
                 self.playback_state.stop_fallback_clock();
             }
 
-            self.current_frame = (self.playback_state.current_time() * self.video_fps) as usize;
+            let master_time = self.playback_state.current_time();
+            let calculated_frame = (master_time * self.video_fps) as usize;
+            self.current_frame = self.latest_frame.as_ref()
+                .filter(|f| f.sequence_id() == self.latest_sequence_id)
+                .map_or(calculated_frame, |f| f.frame_idx());
             if self.current_frame >= self.total_frames {
                 self.current_frame = self.total_frames;
                 self.set_playing(false);
@@ -816,14 +820,14 @@ impl eframe::App for MainApp {
 
         // 1. Process background frames
         if let Some(ref rx) = self.frame_rx {
-            let target_frame = (self.playback_state.current_time() * self.video_fps) as usize;
+            let master_time = self.playback_state.current_time();
             
             // Promote future frame if it's now ready and not stale
             if let Some(ref f) = self.future_frame {
                 if f.sequence_id() < self.latest_sequence_id {
                     self.stale_discards_count += 1;
                     self.future_frame = None;
-                } else if f.frame_idx() <= target_frame {
+                } else if f.pts_sec() <= master_time {
                     self.latest_frame = self.future_frame.take();
                 }
             }
@@ -835,8 +839,7 @@ impl eframe::App for MainApp {
                         self.stale_discards_count += 1;
                         continue; // Discard stale frame!
                     }
-                    let idx = frame.frame_idx();
-                    if idx <= target_frame {
+                    if frame.pts_sec() <= master_time {
                         self.latest_frame = Some(frame);
                     } else {
                         self.future_frame = Some(frame);
@@ -852,7 +855,7 @@ impl eframe::App for MainApp {
                         if self.ui_state == PlaybackState::Seeking {
                             caught_up = false; // Ignore catch-up in seeking state
                         } else {
-                            if f.frame_idx() >= target_frame || f.frame_idx() >= self.total_frames.saturating_sub(1) {
+                            if f.pts_sec() >= master_time || f.frame_idx() >= self.total_frames.saturating_sub(1) {
                                 caught_up = true;
                             }
                         }
