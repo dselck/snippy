@@ -112,6 +112,7 @@ impl MediaEngine {
         target_channels: usize,
         frame_tx: Sender<DecodedFrame>,
         audio_tx: CachingProd<Arc<SharedRb<Heap<f32>>>>,
+        tags_tx: CachingProd<Arc<SharedRb<Heap<(u64, u64)>>>>,
         cmd_rx: Receiver<MediaCommand>,
         playback_state: Arc<crate::audio::AudioPlaybackState>,
     ) -> Result<(Self, VideoMetadata), anyhow::Error> {
@@ -184,6 +185,7 @@ impl MediaEngine {
                 target_channels,
                 frame_tx,
                 audio_tx,
+                tags_tx,
                 background_rx,
                 cmd_rx,
                 fps_clone,
@@ -209,6 +211,7 @@ fn run_decoding_loop(
     target_channels: usize,
     frame_tx: Sender<DecodedFrame>,
     mut audio_tx: CachingProd<Arc<SharedRb<Heap<f32>>>>,
+    mut tags_tx: CachingProd<Arc<SharedRb<Heap<(u64, u64)>>>>,
     background_rx: Receiver<MediaCommand>,
     _cmd_rx: Receiver<MediaCommand>,
     fps: f64,
@@ -415,6 +418,7 @@ fn run_decoding_loop(
             let mut skip_until_time = 0.0;
             let mut is_first_audio_frame = true;
             let mut current_audio_time = 0.0;
+            let mut frames_written_total = 0u64;
 
             loop {
                 if let Ok(AudioThreadCommand::Seek { target_time, resp_tx }) = audio_cmd_rx.try_recv() {
@@ -424,6 +428,7 @@ fn run_decoding_loop(
                     skip_until_time = target_time;
                     is_first_audio_frame = true;
                     current_audio_time = video_start_time + target_time;
+                    frames_written_total = 0;
                     playback_state.should_flush.store(true, std::sync::atomic::Ordering::SeqCst);
                     let _ = resp_tx.send(());
                     continue;
@@ -448,6 +453,7 @@ fn run_decoding_loop(
                                              skip_until_time = target_time;
                                              is_first_audio_frame = true;
                                              current_audio_time = video_start_time + target_time;
+                                             frames_written_total = 0;
                                              playback_state.should_flush.store(true, std::sync::atomic::Ordering::SeqCst);
                                              let _ = resp_tx.send(());
                                              break;
@@ -467,7 +473,7 @@ fn run_decoding_loop(
                                              }
                                              is_first_audio_frame = false;
                                              let stream_time = pts_sec - video_start_time;
-                                             playback_state.samples_played.store((stream_time * playback_state.sample_rate as f64) as u64, std::sync::atomic::Ordering::SeqCst);
+                                             playback_state.current_position_us.store((stream_time * 1_000_000.0) as u64, std::sync::atomic::Ordering::SeqCst);
                                          }
 
                                          let r = match resampler {
@@ -501,6 +507,9 @@ fn run_decoding_loop(
                                                  let byte_count = sample_count * target_channels * 4;
                                                  let data: &[f32] = bytemuck::cast_slice(&resampled.data(0)[..byte_count]);
                                                  
+                                                 let pts_us = (pts_sec * 1_000_000.0) as u64;
+                                                 let _ = tags_tx.try_push((frames_written_total, pts_us));
+
                                                  for &sample in data {
                                                      while audio_tx.try_push(sample).is_err() {
                                                          if let Ok(cmd) = audio_cmd_rx.try_recv() {
@@ -512,6 +521,7 @@ fn run_decoding_loop(
                                                                      skip_until_time = target_time;
                                                                      is_first_audio_frame = true;
                                                                      current_audio_time = video_start_time + target_time;
+                                                                     frames_written_total = 0;
                                                                      playback_state.should_flush.store(true, std::sync::atomic::Ordering::SeqCst);
                                                                      let _ = resp_tx.send(());
                                                                      seek_aborted = true;
@@ -524,6 +534,9 @@ fn run_decoding_loop(
                                                      if seek_aborted {
                                                          break;
                                                      }
+                                                 }
+                                                 if !seek_aborted {
+                                                     frames_written_total += sample_count as u64;
                                                  }
                                              }
                                          }
@@ -546,6 +559,7 @@ fn run_decoding_loop(
                                 skip_until_time = target_time;
                                 is_first_audio_frame = true;
                                 current_audio_time = video_start_time + target_time;
+                                frames_written_total = 0;
                                 playback_state.should_flush.store(true, std::sync::atomic::Ordering::SeqCst);
                                 let _ = resp_tx.send(());
                             }
