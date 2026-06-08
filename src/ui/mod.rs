@@ -77,6 +77,8 @@ pub struct MainApp {
     pub ui_state: PlaybackState,
     pub last_seek_time: Option<std::time::Instant>,
     pub target_seek_frame: Option<usize>,
+    pub left_arrow_held_since: Option<std::time::Instant>,
+    pub right_arrow_held_since: Option<std::time::Instant>,
 }
 
 impl MainApp {
@@ -148,6 +150,8 @@ impl MainApp {
             ui_state: PlaybackState::Paused,
             last_seek_time: None,
             target_seek_frame: None,
+            left_arrow_held_since: None,
+            right_arrow_held_since: None,
         }
     }
 
@@ -585,7 +589,7 @@ fn playback_control_button(
     icon: PlaybackIcon,
     is_play_btn: bool,
     tooltip: &str,
-) -> bool {
+) -> egui::Response {
     let button_size = if is_play_btn { 34.0 } else { 26.0 };
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(button_size, button_size),
@@ -650,7 +654,7 @@ fn playback_control_button(
 
     draw_playback_icon(painter, rect, &icon, icon_color);
 
-    response.clicked()
+    response
 }
 
 impl MainApp {
@@ -1434,7 +1438,7 @@ impl eframe::App for MainApp {
                                     PlaybackIcon::ExportVideo,
                                     false,
                                     "export video",
-                                ) {
+                                ).clicked() {
                                     println!("Export clicked: exporting single video with {} ranges", self.ranges.len());
                                 }
                             });
@@ -1447,7 +1451,7 @@ impl eframe::App for MainApp {
                                 PlaybackIcon::LoadVideo,
                                 false,
                                 "Load video file",
-                            ) {
+                            ).clicked() {
                                 if let Some(path) = rfd::FileDialog::new()
                                     .add_filter("Video File", &["mp4", "mkv", "avi", "mov"])
                                     .pick_file()
@@ -1789,30 +1793,30 @@ impl eframe::App for MainApp {
                             |ui| {
                                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
-                                if playback_control_button(ui, PlaybackIcon::Start, false, "Go to start of video") {
+                                if playback_control_button(ui, PlaybackIcon::Start, false, "Go to start of video").clicked() {
                                     self.seek_to_frame(0, false);
                                 }
-                                if playback_control_button(ui, PlaybackIcon::PrevFrame, false, "Step backward one frame") {
+                                if playback_control_button(ui, PlaybackIcon::PrevFrame, false, "Step backward one frame").clicked() {
                                     self.seek_to_frame(self.current_frame.saturating_sub(1), false);
                                 }
-                                if playback_control_button(ui, PlaybackIcon::SetIn, false, "Set In marker at current frame [") {
+                                if playback_control_button(ui, PlaybackIcon::SetIn, false, "Set In marker at current frame [").clicked() {
                                     self.in_marker = Some(self.current_frame);
                                 }
 
                                 // Play/pause button
                                 let play_icon = if self.is_playing { PlaybackIcon::Pause } else { PlaybackIcon::Play };
                                 let play_tooltip = if self.is_playing { "Pause playback" } else { "Start playback" };
-                                if playback_control_button(ui, play_icon, true, play_tooltip) {
+                                if playback_control_button(ui, play_icon, true, play_tooltip).clicked() {
                                     self.set_playing(!self.is_playing);
                                 }
 
-                                if playback_control_button(ui, PlaybackIcon::SetOut, false, "Set Out marker at current frame ]") {
+                                if playback_control_button(ui, PlaybackIcon::SetOut, false, "Set Out marker at current frame ]").clicked() {
                                     self.out_marker = Some(self.current_frame);
                                 }
-                                if playback_control_button(ui, PlaybackIcon::NextFrame, false, "Step forward one frame") {
+                                if playback_control_button(ui, PlaybackIcon::NextFrame, false, "Step forward one frame").clicked() {
                                     self.seek_to_frame(self.current_frame + 1, false);
                                 }
-                                if playback_control_button(ui, PlaybackIcon::End, false, "Go to end of video") {
+                                if playback_control_button(ui, PlaybackIcon::End, false, "Go to end of video").clicked() {
                                     self.seek_to_frame(self.total_frames, false);
                                 }
                             },
@@ -1823,7 +1827,7 @@ impl eframe::App for MainApp {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let enabled = self.in_marker.is_some() && self.out_marker.is_some();
                             ui.add_enabled_ui(enabled, |ui| {
-                                if playback_control_button(ui, PlaybackIcon::AddSnippet, false, "Add current selection as a new snippet") {
+                                if playback_control_button(ui, PlaybackIcon::AddSnippet, false, "Add current selection as a new snippet").clicked() {
                                     clicked = true;
                                 }
                             });
