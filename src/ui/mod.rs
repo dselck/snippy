@@ -158,15 +158,52 @@ impl MainApp {
         format!("{:02}:{:02}.{:02}", minutes, seconds, centiseconds)
     }
 
+    fn seek_internal(&mut self, frame: usize, keyframe_only: bool, audio_enabled: bool) {
+        self.latest_sequence_id += 1;
+        self.seek_in_progress = true;
+        self.current_frame = frame.clamp(0, self.total_frames);
+        self.playback_state.reset(self.current_frame as f64 / self.video_fps);
+        self.playback_state.is_playing.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Some(ref me) = self.media_engine {
+            let _ = me.tx.send(crate::media::MediaCommand::Seek {
+                frame_index: self.current_frame,
+                keyframe_only,
+                sequence_id: self.latest_sequence_id,
+                audio_enabled,
+            });
+        }
+        if let Some(ref rx) = self.frame_rx {
+            while rx.try_recv().is_ok() {}
+        }
+        self.future_frame = None;
+    }
+
     fn set_playing(&mut self, play: bool) {
-        self.is_playing = play;
-        self.playback_state.is_playing.store(play, std::sync::atomic::Ordering::SeqCst);
         if play {
-            self.playback_state.start_fallback_clock();
-            if let Some(ref me) = self.media_engine {
-                let _ = me.tx.send(crate::media::MediaCommand::Play);
+            if self.ui_state == PlaybackState::Seeking {
+                // Quick Play: cancel debounce timer and prime audio synchronously
+                self.ui_state = PlaybackState::Playing;
+                self.is_playing = true;
+                self.playback_state.is_playing.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.last_seek_time = None;
+                if let Some(target_frame) = self.target_seek_frame {
+                    self.seek_internal(target_frame, false, true);
+                }
+            } else if self.ui_state == PlaybackState::Paused {
+                self.ui_state = PlaybackState::Playing;
+                self.is_playing = true;
+                self.playback_state.is_playing.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.playback_state.audio_paused_for_sync.store(false, std::sync::atomic::Ordering::SeqCst);
+                self.playback_state.start_fallback_clock();
+                if let Some(ref me) = self.media_engine {
+                    let _ = me.tx.send(crate::media::MediaCommand::Play);
+                }
             }
         } else {
+            // Pause
+            self.ui_state = PlaybackState::Paused;
+            self.is_playing = false;
+            self.playback_state.is_playing.store(false, std::sync::atomic::Ordering::SeqCst);
             self.playback_state.stop_fallback_clock();
             if let Some(ref me) = self.media_engine {
                 let _ = me.tx.send(crate::media::MediaCommand::Pause);
@@ -186,21 +223,11 @@ impl MainApp {
     }
 
     fn seek_to_frame(&mut self, frame: usize, keyframe_only: bool) {
-        self.latest_sequence_id += 1;
-        self.seek_in_progress = true;
-        self.current_frame = frame.clamp(0, self.total_frames);
-        self.playback_state.reset(self.current_frame as f64 / self.video_fps);
-        if let Some(ref me) = self.media_engine {
-            let _ = me.tx.send(crate::media::MediaCommand::Seek {
-                frame_index: self.current_frame,
-                keyframe_only,
-                sequence_id: self.latest_sequence_id,
-            });
-        }
-        if let Some(ref rx) = self.frame_rx {
-            while rx.try_recv().is_ok() {}
-        }
-        self.future_frame = None;
+        self.ui_state = PlaybackState::Seeking;
+        self.is_playing = false;
+        self.last_seek_time = Some(std::time::Instant::now());
+        self.target_seek_frame = Some(frame);
+        self.seek_internal(frame, keyframe_only, false);
     }
 }
 
