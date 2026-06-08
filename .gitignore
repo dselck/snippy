@@ -1,0 +1,31 @@
+# Rust / Cargo
+/target/
+
+# Antigravity CLI and Superpowers runtime directories
+.agents/
+.antigravitycli/
+.superpowers/
+
+# Operating System Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*~
+
+# Environment / Local Configuration
+.env
+.env.local
+.env.*.local
