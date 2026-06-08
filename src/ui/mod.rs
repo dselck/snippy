@@ -759,6 +759,19 @@ impl eframe::App for MainApp {
 
         let previous_frame = self.current_frame;
 
+        if self.ui_state == PlaybackState::Seeking {
+            if let Some(last_seek) = self.last_seek_time {
+                if last_seek.elapsed() >= std::time::Duration::from_millis(500) {
+                    self.ui_state = PlaybackState::Paused;
+                    self.last_seek_time = None;
+                    if let Some(target_frame) = self.target_seek_frame {
+                        // Debounce expired: trigger precise seek + audio priming!
+                        self.seek_internal(target_frame, false, true);
+                    }
+                }
+            }
+        }
+
         // Sync fallback clock state and correct AV drift if lagging
         if self.is_playing {
             let video_time = self.latest_frame.as_ref()
@@ -835,11 +848,9 @@ impl eframe::App for MainApp {
                 let mut caught_up = false;
                 if let Some(ref f) = self.latest_frame {
                     if f.sequence_id() == self.latest_sequence_id {
-                        if self.seek_in_progress {
-                            // Seek catch-up: we just need any frame of the new sequence
-                            caught_up = true;
+                        if self.ui_state == PlaybackState::Seeking {
+                            caught_up = false; // Ignore catch-up in seeking state
                         } else {
-                            // Playback drift catch-up: we need the frame index to catch up to target_frame
                             if f.frame_idx() >= target_frame || f.frame_idx() >= self.total_frames.saturating_sub(1) {
                                 caught_up = true;
                             }
@@ -848,8 +859,8 @@ impl eframe::App for MainApp {
                 }
                 if caught_up {
                     self.seek_in_progress = false;
-                    self.playback_state.audio_paused_for_sync.store(false, std::sync::atomic::Ordering::SeqCst);
-                    if self.is_playing {
+                    if self.ui_state == PlaybackState::Playing {
+                        self.playback_state.audio_paused_for_sync.store(false, std::sync::atomic::Ordering::SeqCst);
                         self.playback_state.start_fallback_clock();
                     }
                 }
