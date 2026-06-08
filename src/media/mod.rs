@@ -27,6 +27,17 @@ pub enum GpuFrameDescriptor {
 unsafe impl Send for GpuFrameDescriptor {}
 unsafe impl Sync for GpuFrameDescriptor {}
 
+#[derive(Debug, Clone)]
+pub struct CachedFrame {
+    pub planes: YuvPlanes,
+    pub pts_sec: f64,
+}
+
+pub struct GopCache {
+    pub keyframe_idx: usize,
+    pub frames: std::collections::HashMap<usize, CachedFrame>,
+}
+
 #[derive(Clone, Debug)]
 pub enum DecodedFrame {
     Cpu {
@@ -829,4 +840,15 @@ fn run_decoding_loop(
     }
 
     Ok(())
+}
+
+fn get_nearest_keyframe(keyframes: &[usize], target: usize) -> usize {
+    if keyframes.is_empty() {
+        return target;
+    }
+    match keyframes.binary_search(&target) {
+        Ok(i) => keyframes[i],
+        Err(0) => keyframes[0],
+        Err(i) => keyframes[i - 1],
+    }
 }
