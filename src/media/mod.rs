@@ -426,17 +426,34 @@ fn run_decoding_loop(
             let mut current_audio_time = 0.0;
             let mut frames_written_total = 0u64;
 
-            loop {
-                if let Ok(AudioThreadCommand::Seek { target_time, resp_tx }) = audio_cmd_rx.try_recv() {
+            macro_rules! handle_audio_seek {
+                ($target_time:expr, $resp_tx:expr) => {
                     while audio_packet_rx.try_recv().is_ok() {}
                     audio_decoder.flush();
                     resampler = None;
-                    skip_until_time = target_time;
+                    skip_until_time = $target_time;
                     is_first_audio_frame = true;
-                    current_audio_time = video_start_time + target_time;
+                    current_audio_time = video_start_time + $target_time;
                     frames_written_total = 0;
                     playback_state.should_flush.store(true, std::sync::atomic::Ordering::SeqCst);
-                    let _ = resp_tx.send(());
+                    if playback_state.has_audio.load(std::sync::atomic::Ordering::SeqCst) {
+                        let mut wait_count = 0;
+                        while playback_state.should_flush.load(std::sync::atomic::Ordering::SeqCst) {
+                            thread::sleep(std::time::Duration::from_millis(1));
+                            wait_count += 1;
+                            if wait_count > 100 {
+                                playback_state.should_flush.store(false, std::sync::atomic::Ordering::SeqCst);
+                                break;
+                            }
+                        }
+                    }
+                    let _ = $resp_tx.send(());
+                };
+            }
+
+            loop {
+                if let Ok(AudioThreadCommand::Seek { target_time, resp_tx }) = audio_cmd_rx.try_recv() {
+                    handle_audio_seek!(target_time, resp_tx);
                     continue;
                 }
 
@@ -451,19 +468,11 @@ fn run_decoding_loop(
                             if audio_decoder.send_packet(&packet).is_ok() {
                                     let mut seek_aborted = false;
                                     let mut frame = ffmpeg_next::util::frame::Audio::empty();
-                                    while audio_decoder.receive_frame(&mut frame).is_ok() {
-                                         if let Ok(AudioThreadCommand::Seek { target_time, resp_tx }) = audio_cmd_rx.try_recv() {
-                                             while audio_packet_rx.try_recv().is_ok() {}
-                                             audio_decoder.flush();
-                                             resampler = None;
-                                             skip_until_time = target_time;
-                                             is_first_audio_frame = true;
-                                             current_audio_time = video_start_time + target_time;
-                                             frames_written_total = 0;
-                                             playback_state.should_flush.store(true, std::sync::atomic::Ordering::SeqCst);
-                                             let _ = resp_tx.send(());
-                                             break;
-                                         }
+                                     while audio_decoder.receive_frame(&mut frame).is_ok() {
+                                          if let Ok(AudioThreadCommand::Seek { target_time, resp_tx }) = audio_cmd_rx.try_recv() {
+                                              handle_audio_seek!(target_time, resp_tx);
+                                              break;
+                                          }
 
                                          let duration_sec = frame.samples() as f64 / frame.rate() as f64;
                                          let pts_sec = match frame.pts() {
@@ -513,7 +522,7 @@ fn run_decoding_loop(
                                                  let byte_count = sample_count * target_channels * 4;
                                                  let data: &[f32] = bytemuck::cast_slice(&resampled.data(0)[..byte_count]);
                                                  
-                                                 let pts_us = (pts_sec * 1_000_000.0) as u64;
+                                                 let pts_us = ((pts_sec - video_start_time).max(0.0) * 1_000_000.0) as u64;
                                                  let _ = tags_tx.try_push((frames_written_total, pts_us));
 
                                                  for &sample in data {
@@ -521,15 +530,7 @@ fn run_decoding_loop(
                                                          if let Ok(cmd) = audio_cmd_rx.try_recv() {
                                                              match cmd {
                                                                  AudioThreadCommand::Seek { target_time, resp_tx } => {
-                                                                     while audio_packet_rx.try_recv().is_ok() {}
-                                                                     audio_decoder.flush();
-                                                                     resampler = None;
-                                                                     skip_until_time = target_time;
-                                                                     is_first_audio_frame = true;
-                                                                     current_audio_time = video_start_time + target_time;
-                                                                     frames_written_total = 0;
-                                                                     playback_state.should_flush.store(true, std::sync::atomic::Ordering::SeqCst);
-                                                                     let _ = resp_tx.send(());
+                                                                     handle_audio_seek!(target_time, resp_tx);
                                                                      seek_aborted = true;
                                                                      break;
                                                                  }
@@ -559,15 +560,7 @@ fn run_decoding_loop(
                     recv(audio_cmd_rx) -> cmd_res => {
                         match cmd_res {
                             Ok(AudioThreadCommand::Seek { target_time, resp_tx }) => {
-                                while audio_packet_rx.try_recv().is_ok() {}
-                                audio_decoder.flush();
-                                resampler = None;
-                                skip_until_time = target_time;
-                                is_first_audio_frame = true;
-                                current_audio_time = video_start_time + target_time;
-                                frames_written_total = 0;
-                                playback_state.should_flush.store(true, std::sync::atomic::Ordering::SeqCst);
-                                let _ = resp_tx.send(());
+                                handle_audio_seek!(target_time, resp_tx);
                             }
                             Err(_) => break,
                         }
