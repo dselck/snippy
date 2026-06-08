@@ -107,6 +107,7 @@ pub enum VideoThreadCommand {
         frame_index: usize,
         keyframe_only: bool,
         sequence_id: usize,
+        audio_enabled: bool,
         resp_tx: Sender<bool>,
     },
     Play,
@@ -196,7 +197,7 @@ impl MediaEngine {
             height: decoder.height(),
             fps,
             has_audio,
-            keyframes,
+            keyframes: keyframes.clone(),
         };
 
         // 2. Spawn the background Media Engine decoding loop
@@ -215,6 +216,7 @@ impl MediaEngine {
                 cmd_rx,
                 fps_clone,
                 playback_state_clone,
+                keyframes,
             );
         });
 
@@ -241,6 +243,7 @@ fn run_decoding_loop(
     _cmd_rx: Receiver<MediaCommand>,
     fps: f64,
     playback_state: Arc<crate::audio::AudioPlaybackState>,
+    keyframes: Vec<usize>,
 ) -> Result<(), anyhow::Error> {
     let mut audio_enabled = true;
     let mut input = ffmpeg_next::format::input(&path)?;
@@ -669,6 +672,7 @@ fn run_decoding_loop(
                 frame_index,
                 keyframe_only,
                 sequence_id,
+                audio_enabled,
                 resp_tx: video_resp_tx,
             });
 
@@ -729,6 +733,7 @@ fn run_decoding_loop(
                                 frame_index,
                                 keyframe_only,
                                 sequence_id,
+                                audio_enabled,
                                 resp_tx: video_resp_tx,
                             });
 
