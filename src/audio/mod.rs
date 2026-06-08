@@ -75,7 +75,7 @@ impl AudioEngine {
         let channels = config.channels() as usize;
 
         // Create a thread-safe ring buffer for sending decoded float samples to CPAL
-        let rb = SharedRb::<Heap<f32>>::new(sample_rate as usize * channels * 2);
+        let rb = SharedRb::<Heap<f32>>::new((sample_rate as usize * channels) / 5);
         let (prod, mut cons) = rb.split();
 
         let samples_played = Arc::new(AtomicU64::new(0));
