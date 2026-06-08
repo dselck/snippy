@@ -10,6 +10,8 @@ use ffmpeg_next::software::resampling::context::Context as ResamplerContext;
 use ffmpeg_next::format::Sample;
 use ffmpeg_next::ChannelLayout;
 
+pub mod controller;
+
 #[derive(Clone, Debug)]
 pub enum GpuFrameDescriptor {
     CVPixelBuffer(*const std::ffi::c_void),
@@ -124,6 +126,7 @@ pub struct VideoMetadata {
     pub fps: f64,
     pub has_audio: bool,
     pub keyframes: Vec<usize>,
+    pub keyframes_pts: Vec<i64>,
 }
 
 pub struct MediaEngine {
@@ -172,23 +175,26 @@ impl MediaEngine {
         }
 
         // Scan keyframes synchronously
-        let keyframes = {
+        let (keyframes, keyframes_pts) = {
             let mut scan = ffmpeg_next::format::input(&path_str)?;
             let video_stream_idx = stream.index();
             let mut kfs = Vec::new();
+            let mut kfs_pts = Vec::new();
             let mut frame_idx: usize = 0;
             for (stream, packet) in scan.packets() {
                 if stream.index() == video_stream_idx {
                     if packet.is_key() {
                         kfs.push(frame_idx);
+                        kfs_pts.push(packet.pts().unwrap_or(0));
                     }
                     frame_idx += 1;
                 }
             }
             if kfs.is_empty() || kfs[0] != 0 {
                 kfs.insert(0, 0);
+                kfs_pts.insert(0, 0);
             }
-            kfs
+            (kfs, kfs_pts)
         };
 
         let metadata = VideoMetadata {
@@ -198,12 +204,14 @@ impl MediaEngine {
             fps,
             has_audio,
             keyframes: keyframes.clone(),
+            keyframes_pts: keyframes_pts.clone(),
         };
 
         // 2. Spawn the background Media Engine decoding loop
         let (cmd_tx, background_rx) = crossbeam_channel::unbounded();
         let fps_clone = metadata.fps;
         let playback_state_clone = Arc::clone(&playback_state);
+        let keyframes_pts_clone = metadata.keyframes_pts.clone();
         let thread_handle = thread::spawn(move || {
             let _ = run_decoding_loop(
                 &path_str,
@@ -217,6 +225,7 @@ impl MediaEngine {
                 fps_clone,
                 playback_state_clone,
                 keyframes,
+                keyframes_pts_clone,
             );
         });
 
@@ -244,6 +253,7 @@ fn run_decoding_loop(
     fps: f64,
     playback_state: Arc<crate::audio::AudioPlaybackState>,
     keyframes: Vec<usize>,
+    keyframes_pts: Vec<i64>,
 ) -> Result<(), anyhow::Error> {
     let mut audio_enabled = true;
     let mut input = ffmpeg_next::format::input(&path)?;
@@ -275,7 +285,9 @@ fn run_decoding_loop(
         0.0
     };
     
+    let video_thread_keyframes = keyframes.clone();
     let video_thread = thread::spawn(move || {
+        let keyframes = video_thread_keyframes;
         let mut gop_cache = GopCache {
             keyframe_idx: usize::MAX,
             frames: std::collections::HashMap::new(),
@@ -886,9 +898,22 @@ fn run_decoding_loop(
                 // Drop packets_iter to release borrow on input
                 drop(packets_iter);
 
-                // Flush queues and seeking input context
-                let seek_pts = ((video_start_time + frame_index as f64 / fps) * 1_000_000.0) as i64;
-                let _ = input.seek(seek_pts, ..seek_pts + 1);
+                // Seek specifically on the video stream to avoid AV sync/interleaving landing errors
+                let target_kf = get_nearest_keyframe(&keyframes, frame_index);
+                let kf_pts = keyframes.binary_search(&target_kf)
+                    .map(|idx| keyframes_pts[idx])
+                    .unwrap_or(0);
+
+                unsafe {
+                    let _ = ffmpeg_next::ffi::avformat_seek_file(
+                        input.as_mut_ptr(),
+                        video_stream_idx as i32,
+                        i64::MIN,
+                        kf_pts,
+                        kf_pts,
+                        0,
+                    );
+                }
 
                 // Recreate packets_iter
                 packets_iter = input.packets();
@@ -943,12 +968,26 @@ fn run_decoding_loop(
                                 let _ = rx.recv();
                             }
 
-                            if !video_found {
-                                drop(packets_iter);
-                                let seek_pts = ((video_start_time + frame_index as f64 / fps) * 1_000_000.0) as i64;
-                                let _ = input.seek(seek_pts, ..seek_pts + 1);
-                                packets_iter = input.packets();
-                            }
+                             if !video_found {
+                                 drop(packets_iter);
+                                 // Seek specifically on the video stream to avoid AV sync/interleaving landing errors
+                                 let target_kf = get_nearest_keyframe(&keyframes, frame_index);
+                                 let kf_pts = keyframes.binary_search(&target_kf)
+                                     .map(|idx| keyframes_pts[idx])
+                                     .unwrap_or(0);
+
+                                 unsafe {
+                                     let _ = ffmpeg_next::ffi::avformat_seek_file(
+                                         input.as_mut_ptr(),
+                                         video_stream_idx as i32,
+                                         i64::MIN,
+                                         kf_pts,
+                                         kf_pts,
+                                         0,
+                                     );
+                                 }
+                                 packets_iter = input.packets();
+                             }
                         }
                         continue;
                     }
