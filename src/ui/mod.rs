@@ -757,6 +757,12 @@ impl MainApp {
 
 impl eframe::App for MainApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut prev_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
+        let mut next_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
+
+        let mut prev_down = ctx.input(|i| i.key_down(egui::Key::ArrowLeft));
+        let mut next_down = ctx.input(|i| i.key_down(egui::Key::ArrowRight));
+
         let ctrl_d = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::D);
         if ctx.input_mut(|i| i.consume_shortcut(&ctrl_d)) {
             self.show_debug_hud = !self.show_debug_hud;
@@ -1796,8 +1802,12 @@ impl eframe::App for MainApp {
                                 if playback_control_button(ui, PlaybackIcon::Start, false, "Go to start of video").clicked() {
                                     self.seek_to_frame(0, false);
                                 }
-                                if playback_control_button(ui, PlaybackIcon::PrevFrame, false, "Step backward one frame").clicked() {
-                                    self.seek_to_frame(self.current_frame.saturating_sub(1), false);
+                                let prev_resp = playback_control_button(ui, PlaybackIcon::PrevFrame, false, "Step backward one frame");
+                                if prev_resp.clicked() {
+                                    prev_pressed = true;
+                                }
+                                if prev_resp.is_pointer_button_down_on() {
+                                    prev_down = true;
                                 }
                                 if playback_control_button(ui, PlaybackIcon::SetIn, false, "Set In marker at current frame [").clicked() {
                                     self.in_marker = Some(self.current_frame);
@@ -1813,8 +1823,12 @@ impl eframe::App for MainApp {
                                 if playback_control_button(ui, PlaybackIcon::SetOut, false, "Set Out marker at current frame ]").clicked() {
                                     self.out_marker = Some(self.current_frame);
                                 }
-                                if playback_control_button(ui, PlaybackIcon::NextFrame, false, "Step forward one frame").clicked() {
-                                    self.seek_to_frame(self.current_frame + 1, false);
+                                let next_resp = playback_control_button(ui, PlaybackIcon::NextFrame, false, "Step forward one frame");
+                                if next_resp.clicked() {
+                                    next_pressed = true;
+                                }
+                                if next_resp.is_pointer_button_down_on() {
+                                    next_down = true;
                                 }
                                 if playback_control_button(ui, PlaybackIcon::End, false, "Go to end of video").clicked() {
                                     self.seek_to_frame(self.total_frames, false);
@@ -1848,6 +1862,48 @@ impl eframe::App for MainApp {
                     });
                 });
             });
+
+        // Hold-to-repeat frame stepping
+        if prev_pressed {
+            self.current_frame = self.current_frame.saturating_sub(1);
+            self.seek_to_frame(self.current_frame, false);
+            self.left_arrow_held_since = Some(std::time::Instant::now());
+            self.right_arrow_held_since = None;
+        } else if next_pressed {
+            self.current_frame = (self.current_frame + 1).min(self.total_frames);
+            self.seek_to_frame(self.current_frame, false);
+            self.right_arrow_held_since = Some(std::time::Instant::now());
+            self.left_arrow_held_since = None;
+        } else {
+            if prev_down {
+                self.right_arrow_held_since = None;
+                if self.left_arrow_held_since.is_none() {
+                    self.left_arrow_held_since = Some(std::time::Instant::now());
+                }
+                if let Some(held_since) = self.left_arrow_held_since {
+                    if held_since.elapsed() >= std::time::Duration::from_millis(250) {
+                        self.current_frame = self.current_frame.saturating_sub(1);
+                        self.seek_to_frame(self.current_frame, false);
+                        ctx.request_repaint();
+                    }
+                }
+            } else if next_down {
+                self.left_arrow_held_since = None;
+                if self.right_arrow_held_since.is_none() {
+                    self.right_arrow_held_since = Some(std::time::Instant::now());
+                }
+                if let Some(held_since) = self.right_arrow_held_since {
+                    if held_since.elapsed() >= std::time::Duration::from_millis(250) {
+                        self.current_frame = (self.current_frame + 1).min(self.total_frames);
+                        self.seek_to_frame(self.current_frame, false);
+                        ctx.request_repaint();
+                    }
+                }
+            } else {
+                self.left_arrow_held_since = None;
+                self.right_arrow_held_since = None;
+            }
+        }
 
         if self.current_frame != previous_frame && !self.is_playing {
             self.playback_state.reset(self.current_frame as f64 / self.video_fps);
