@@ -66,6 +66,7 @@ pub struct MainApp {
     pub drift_history: std::collections::VecDeque<f32>,
     pub stale_discards_count: usize,
     pub drift_pause_count: usize,
+    pub seek_in_progress: bool,
 }
 
 impl MainApp {
@@ -132,6 +133,7 @@ impl MainApp {
             drift_history: std::collections::VecDeque::with_capacity(60),
             stale_discards_count: 0,
             drift_pause_count: 0,
+            seek_in_progress: false,
         }
     }
 
@@ -172,6 +174,7 @@ impl MainApp {
 
     fn seek_to_frame(&mut self, frame: usize, keyframe_only: bool) {
         self.latest_sequence_id += 1;
+        self.seek_in_progress = true;
         self.current_frame = frame.clamp(0, self.total_frames);
         self.playback_state.reset(self.current_frame as f64 / self.video_fps);
         if let Some(ref me) = self.media_engine {
@@ -730,12 +733,21 @@ impl eframe::App for MainApp {
                 self.drift_history.pop_front();
             }
 
-            // Ensure playback clock is running
+            // Real-time Drift Correction: Video lag > 150ms
+            if drift > 0.15 && !self.playback_state.audio_paused_for_sync.load(std::sync::atomic::Ordering::SeqCst) {
+                self.playback_state.audio_paused_for_sync.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.drift_pause_count += 1;
+                println!("AV SYNC: Video lag detected ({:.1} ms). Pausing audio for sync.", drift * 1000.0);
+            }
+
+            // Ensure playback clock is running/stopped based on audio_paused_for_sync
             if !self.playback_state.audio_paused_for_sync.load(std::sync::atomic::Ordering::SeqCst) {
                 let running = self.playback_state.is_playing.swap(true, std::sync::atomic::Ordering::SeqCst);
                 if !running {
                     self.playback_state.start_fallback_clock();
                 }
+            } else {
+                self.playback_state.stop_fallback_clock();
             }
 
             self.current_frame = (self.playback_state.current_time() * self.video_fps) as usize;
@@ -783,10 +795,19 @@ impl eframe::App for MainApp {
                 let mut caught_up = false;
                 if let Some(ref f) = self.latest_frame {
                     if f.sequence_id() == self.latest_sequence_id {
-                        caught_up = true;
+                        if self.seek_in_progress {
+                            // Seek catch-up: we just need any frame of the new sequence
+                            caught_up = true;
+                        } else {
+                            // Playback drift catch-up: we need the frame index to catch up to target_frame
+                            if f.frame_idx() >= target_frame || f.frame_idx() >= self.total_frames.saturating_sub(1) {
+                                caught_up = true;
+                            }
+                        }
                     }
                 }
                 if caught_up {
+                    self.seek_in_progress = false;
                     self.playback_state.audio_paused_for_sync.store(false, std::sync::atomic::Ordering::SeqCst);
                     if self.is_playing {
                         self.playback_state.start_fallback_clock();
@@ -1446,7 +1467,7 @@ impl eframe::App for MainApp {
                                             self.drift_history.clear();
                                             
                                             playback_state.reset(0.0);
-                                            playback_state.has_audio.store(metadata.has_audio, std::sync::atomic::Ordering::Relaxed);
+                                            playback_state.has_audio.store(metadata.has_audio && audio_engine.is_some(), std::sync::atomic::Ordering::Relaxed);
                                             
                                             self.playback_state = playback_state;
                                             self._audio_engine = audio_engine;
