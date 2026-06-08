@@ -177,9 +177,8 @@ impl MainApp {
                 audio_enabled,
             });
         }
-        if let Some(ref rx) = self.frame_rx {
-            while rx.try_recv().is_ok() {}
-        }
+        // Do NOT flush frame_rx here — the decoder's response frame arrives asynchronously
+        // and would be lost. Stale frames are filtered by sequence_id in the consumption loop.
         self.future_frame = None;
     }
 
