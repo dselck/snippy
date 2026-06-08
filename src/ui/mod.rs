@@ -194,6 +194,7 @@ impl MainApp {
                 if let Some(target_frame) = self.target_seek_frame {
                     self.seek_internal(target_frame, false, true);
                 }
+                self.target_seek_frame = None;
             } else if self.ui_state == PlaybackState::Paused {
                 self.ui_state = PlaybackState::Playing;
                 self.is_playing = true;
@@ -203,6 +204,7 @@ impl MainApp {
                 if let Some(ref me) = self.media_engine {
                     let _ = me.tx.send(crate::media::MediaCommand::Play);
                 }
+                self.target_seek_frame = None;
             }
         } else {
             // Pause
@@ -779,6 +781,7 @@ impl eframe::App for MainApp {
                         // Debounce expired: trigger precise seek + audio priming!
                         self.seek_internal(target_frame, false, true);
                     }
+                    self.target_seek_frame = None;
                 }
             }
         }
@@ -1258,8 +1261,11 @@ impl eframe::App for MainApp {
                             let pct = rel_x / wave_rect.width();
                             let target_frame = (pct * self.total_frames as f32) as usize;
                             let target_kf = self.nearest_keyframe(target_frame);
-                            self.seek_to_frame(target_kf, true);
                             self.set_playing(false);
+                            self.last_seek_time = Some(std::time::Instant::now());
+                            if self.target_seek_frame != Some(target_kf) {
+                                self.seek_to_frame(target_kf, true);
+                            }
                         }
                     }
                 });
@@ -1779,7 +1785,10 @@ impl eframe::App for MainApp {
                     if self.progress_bar(ui) {
                         self.set_playing(false);
                         let target_kf = self.nearest_keyframe(self.current_frame);
-                        self.seek_to_frame(target_kf, true);
+                        self.last_seek_time = Some(std::time::Instant::now());
+                        if self.target_seek_frame != Some(target_kf) {
+                            self.seek_to_frame(target_kf, true);
+                        }
                     }
 
                     ui.add_space(10.0);
