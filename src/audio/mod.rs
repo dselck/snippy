@@ -158,12 +158,15 @@ impl AudioEngine {
                         let elapsed_us = (written as u64 * 1_000_000) / (sample_rate as u64);
                         current_position_us_callback.load(Ordering::Relaxed) + elapsed_us
                     };
-                    current_position_us_callback.store(current_pos_us, Ordering::Relaxed);
+                    // Only update the master/fallback clock if samples were actually popped and played!
+                    if written > 0 {
+                        current_position_us_callback.store(current_pos_us, Ordering::Relaxed);
 
-                    // Update fallback clock reference atomically
-                    fallback_base_us_callback.store(current_pos_us, Ordering::Relaxed);
-                    let now_us = fallback_epoch_callback.elapsed().as_micros() as u64;
-                    fallback_start_us_callback.store(now_us, Ordering::Relaxed);
+                        // Update fallback clock reference atomically
+                        fallback_base_us_callback.store(current_pos_us, Ordering::Relaxed);
+                        let now_us = fallback_epoch_callback.elapsed().as_micros() as u64;
+                        fallback_start_us_callback.store(now_us, Ordering::Relaxed);
+                    }
                 }
             },
             |err| eprintln!("CPAL audio stream error: {:?}", err),
