@@ -99,6 +99,7 @@ impl MainApp {
                 fallback_start_time: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 fallback_base_time: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
                 should_flush: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                is_playing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }));
 
         Self {
@@ -143,19 +144,14 @@ impl MainApp {
 
     fn set_playing(&mut self, play: bool) {
         self.is_playing = play;
+        self.playback_state.is_playing.store(play, std::sync::atomic::Ordering::SeqCst);
         if play {
             self.playback_state.start_fallback_clock();
-            if let Some(ref ae) = self._audio_engine {
-                let _ = ae.play();
-            }
             if let Some(ref me) = self.media_engine {
                 let _ = me.tx.send(crate::media::MediaCommand::Play);
             }
         } else {
             self.playback_state.stop_fallback_clock();
-            if let Some(ref ae) = self._audio_engine {
-                let _ = ae.pause();
-            }
             if let Some(ref me) = self.media_engine {
                 let _ = me.tx.send(crate::media::MediaCommand::Pause);
             }
@@ -733,30 +729,10 @@ impl eframe::App for MainApp {
                 self.drift_history.pop_front();
             }
 
-            if drift > 0.15 {
-                // Video is lagging behind audio clock by >150ms!
-                // Pause audio playback temporarily to let video catch up.
-                let mut was_running = false;
-                if let Some(ref ae) = self._audio_engine {
-                    let running = self.playback_state.fallback_start_time.lock().unwrap().is_some();
-                    if running {
-                        let _ = ae.pause();
-                        was_running = true;
-                    }
-                }
-                if was_running {
-                    self.drift_pause_count += 1;
-                }
-                self.playback_state.stop_fallback_clock();
-            } else {
-                // Video is in sync, ensure playback clock is running
-                let running = self.playback_state.fallback_start_time.lock().unwrap().is_some();
-                if !running {
-                    self.playback_state.start_fallback_clock();
-                    if let Some(ref ae) = self._audio_engine {
-                        let _ = ae.play();
-                    }
-                }
+            // Ensure playback clock is running
+            let running = self.playback_state.is_playing.swap(true, std::sync::atomic::Ordering::SeqCst);
+            if !running {
+                self.playback_state.start_fallback_clock();
             }
 
             self.current_frame = (self.playback_state.current_time() * self.video_fps) as usize;
@@ -766,9 +742,7 @@ impl eframe::App for MainApp {
             }
         } else {
             self.playback_state.stop_fallback_clock();
-            if let Some(ref ae) = self._audio_engine {
-                let _ = ae.pause();
-            }
+            self.playback_state.is_playing.store(false, std::sync::atomic::Ordering::SeqCst);
         }
 
         // 1. Process background frames
@@ -1407,6 +1381,19 @@ impl eframe::App for MainApp {
                                         prod
                                     });
 
+                                    // Resolve active playback state first
+                                    let playback_state = audio_engine.as_ref()
+                                        .map(|ae| std::sync::Arc::clone(&ae.playback_state))
+                                        .unwrap_or_else(|| std::sync::Arc::new(crate::audio::AudioPlaybackState {
+                                            samples_played: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                                            sample_rate: 44100,
+                                            has_audio: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                                            fallback_start_time: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                                            fallback_base_time: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
+                                            should_flush: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                                            is_playing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                                        }));
+
                                     // 4. Initialize MediaEngine
                                     match crate::media::MediaEngine::new(
                                         &path,
@@ -1415,6 +1402,7 @@ impl eframe::App for MainApp {
                                         frame_tx,
                                         audio_tx,
                                         cmd_rx,
+                                        std::sync::Arc::clone(&playback_state),
                                     ) {
                                         Ok((me, metadata)) => {
                                             self.total_frames = metadata.total_frames;
@@ -1427,18 +1415,6 @@ impl eframe::App for MainApp {
                                             self.stale_discards_count = 0;
                                             self.drift_pause_count = 0;
                                             self.drift_history.clear();
-                                            
-                                            // Update active playback state and audio flag
-                                            let playback_state = audio_engine.as_ref()
-                                                .map(|ae| std::sync::Arc::clone(&ae.playback_state))
-                                                .unwrap_or_else(|| std::sync::Arc::new(crate::audio::AudioPlaybackState {
-                                                    samples_played: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                                                    sample_rate: 44100,
-                                                    has_audio: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                                                    fallback_start_time: std::sync::Arc::new(std::sync::Mutex::new(None)),
-                                                    fallback_base_time: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
-                                                    should_flush: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                                                }));
                                             
                                             playback_state.reset(0.0);
                                             playback_state.has_audio.store(metadata.has_audio, std::sync::atomic::Ordering::Relaxed);

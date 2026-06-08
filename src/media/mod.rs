@@ -113,6 +113,7 @@ impl MediaEngine {
         frame_tx: Sender<DecodedFrame>,
         audio_tx: CachingProd<Arc<SharedRb<Heap<f32>>>>,
         cmd_rx: Receiver<MediaCommand>,
+        playback_state: Arc<crate::audio::AudioPlaybackState>,
     ) -> Result<(Self, VideoMetadata), anyhow::Error> {
         // Initialize FFmpeg
         ffmpeg_next::init()?;
@@ -175,6 +176,7 @@ impl MediaEngine {
         // 2. Spawn the background Media Engine decoding loop
         let (cmd_tx, background_rx) = crossbeam_channel::unbounded();
         let fps_clone = metadata.fps;
+        let playback_state_clone = Arc::clone(&playback_state);
         let thread_handle = thread::spawn(move || {
             let _ = run_decoding_loop(
                 &path_str,
@@ -185,6 +187,7 @@ impl MediaEngine {
                 background_rx,
                 cmd_rx,
                 fps_clone,
+                playback_state_clone,
             );
         });
 
@@ -198,19 +201,7 @@ impl MediaEngine {
     }
 }
 
-#[allow(dead_code)]
-struct GopCache {
-    keyframe_idx: usize,
-    frames: Vec<(usize, YuvPlanes)>,
-}
 
-impl GopCache {
-    fn find(&self, target_frame: usize) -> Option<YuvPlanes> {
-        self.frames.iter()
-            .find(|&&(idx, _)| idx == target_frame)
-            .map(|(_, planes)| planes.clone())
-    }
-}
 
 fn run_decoding_loop(
     path: &str,
@@ -221,6 +212,7 @@ fn run_decoding_loop(
     background_rx: Receiver<MediaCommand>,
     _cmd_rx: Receiver<MediaCommand>,
     fps: f64,
+    playback_state: Arc<crate::audio::AudioPlaybackState>,
 ) -> Result<(), anyhow::Error> {
     let mut input = ffmpeg_next::format::input(&path)?;
 
@@ -235,7 +227,7 @@ fn run_decoding_loop(
 
     // Channels for routing raw packets to decoder threads
     let (video_packet_tx, video_packet_rx) = crossbeam_channel::bounded::<ffmpeg_next::Packet>(32);
-    let (audio_packet_tx, audio_packet_rx) = crossbeam_channel::bounded::<ffmpeg_next::Packet>(64);
+    let (audio_packet_tx, audio_packet_rx) = crossbeam_channel::unbounded::<ffmpeg_next::Packet>();
     let (video_cmd_tx, video_cmd_rx) = crossbeam_channel::bounded::<VideoThreadCommand>(1);
     let (audio_cmd_tx, audio_cmd_rx) = crossbeam_channel::bounded::<AudioThreadCommand>(1);
 
@@ -245,12 +237,14 @@ fn run_decoding_loop(
     let frame_tx_clone = frame_tx.clone();
     let time_base = video_stream.time_base();
     let time_base_f64 = time_base.numerator() as f64 / time_base.denominator() as f64;
+    let video_start_time = if video_stream.start_time() > -1_000_000_000_000 {
+        video_stream.start_time() as f64 * time_base_f64
+    } else {
+        0.0
+    };
     
     let video_thread = thread::spawn(move || {
-        let mut gop_cache = GopCache {
-            keyframe_idx: usize::MAX,
-            frames: Vec::new(),
-        };
+
         let mut fallback_frame_idx = 0;
         let mut scaler: Option<ffmpeg_next::software::scaling::context::Context> = None;
 
@@ -308,7 +302,7 @@ fn run_decoding_loop(
 
                                     let frame_idx = match frame.pts() {
                                         Some(pts_val) => {
-                                            let time_sec = pts_val as f64 * time_base_f64;
+                                            let time_sec = pts_val as f64 * time_base_f64 - video_start_time;
                                             (time_sec * fps).round() as usize
                                         }
                                         None => fallback_frame_idx,
@@ -321,10 +315,7 @@ fn run_decoding_loop(
                                         sequence_id: current_sequence_id,
                                     };
                                     
-                                    gop_cache.frames.push((frame_idx, planes));
-                                    if gop_cache.frames.len() > 128 {
-                                        gop_cache.frames.remove(0);
-                                    }
+
                                     
                                     let mut sent = false;
                                     crossbeam_channel::select! {
@@ -340,14 +331,6 @@ fn run_decoding_loop(
                                                         fallback_frame_idx = frame_index;
                                                         keyframe_only_mode = keyframe_only;
                                                         current_sequence_id = sequence_id;
-                                                        if let Some(planes) = gop_cache.find(frame_index) {
-                                                            let decoded = DecodedFrame::Cpu {
-                                                                frame_idx: frame_index,
-                                                                planes,
-                                                                sequence_id,
-                                                            };
-                                                            let _ = frame_tx_clone.send(decoded);
-                                                        }
                                                         while video_packet_rx.try_recv().is_ok() {}
                                                         video_decoder.flush();
                                                         let _ = resp_tx.send(false); // Always force demuxer seek to sync audio
@@ -385,14 +368,7 @@ fn run_decoding_loop(
                                 fallback_frame_idx = frame_index;
                                 keyframe_only_mode = keyframe_only;
                                 current_sequence_id = sequence_id;
-                                if let Some(planes) = gop_cache.find(frame_index) {
-                                    let decoded = DecodedFrame::Cpu {
-                                        frame_idx: frame_index,
-                                        planes,
-                                        sequence_id,
-                                    };
-                                    let _ = frame_tx_clone.send(decoded);
-                                }
+
                                 while video_packet_rx.try_recv().is_ok() {}
                                 video_decoder.flush();
                                 let _ = resp_tx.send(false); // Always force demuxer seek to sync audio
@@ -412,14 +388,6 @@ fn run_decoding_loop(
                         fallback_frame_idx = frame_index;
                         keyframe_only_mode = keyframe_only;
                         current_sequence_id = sequence_id;
-                        if let Some(planes) = gop_cache.find(frame_index) {
-                            let decoded = DecodedFrame::Cpu {
-                                frame_idx: frame_index,
-                                planes,
-                                sequence_id,
-                            };
-                            let _ = frame_tx_clone.send(decoded);
-                        }
                         while video_packet_rx.try_recv().is_ok() {}
                         video_decoder.flush();
                         let _ = resp_tx.send(false); // Always force demuxer seek to sync audio
@@ -458,101 +426,69 @@ fn run_decoding_loop(
                                 }
                             }
                             if audio_decoder.send_packet(&packet).is_ok() {
-                                let mut seek_aborted = false;
-                                let mut frame = ffmpeg_next::util::frame::Audio::empty();
-                                while audio_decoder.receive_frame(&mut frame).is_ok() {
-                                    let mut start_idx = 0;
-                                    let mut silence_padding_samples = 0;
+                                    let mut seek_aborted = false;
+                                    let mut frame = ffmpeg_next::util::frame::Audio::empty();
+                                    while audio_decoder.receive_frame(&mut frame).is_ok() {
+                                        let duration_sec = frame.samples() as f64 / frame.rate() as f64;
+                                        let pts_sec = match frame.pts() {
+                                            Some(pts) => pts as f64 * audio_tb_f64,
+                                            None => current_audio_time,
+                                        };
+                                        current_audio_time = pts_sec + duration_sec;
 
-                                    let duration_sec = frame.samples() as f64 / frame.rate() as f64;
-                                    let pts_sec = current_audio_time;
-                                    let frame_end_sec = pts_sec + duration_sec;
-                                    current_audio_time += duration_sec;
-
-                                    if is_first_audio_frame {
-                                        if frame_end_sec < skip_until_time {
-                                            continue;
-                                        }
-
-                                        if pts_sec <= skip_until_time {
-                                            let discard_sec = skip_until_time - pts_sec;
-                                            start_idx = (discard_sec * target_sample_rate as f64).round() as usize * target_channels;
-                                        } else {
-                                            let gap_sec = pts_sec - skip_until_time;
-                                            silence_padding_samples = (gap_sec * target_sample_rate as f64).round() as usize * target_channels;
-                                        }
-                                        is_first_audio_frame = false;
-                                    }
-
-                                    let r = match resampler {
-                                        Some(ref mut r) if r.input().format == frame.format()
-                                            && r.input().channel_layout == frame.channel_layout()
-                                            && r.input().rate == frame.rate() => r,
-                                        _ => {
-                                            let target_layout = if target_channels == 1 {
-                                                ChannelLayout::MONO
-                                            } else {
-                                                ChannelLayout::STEREO
-                                            };
-                                            
-                                            let new_r = ResamplerContext::get(
-                                                frame.format(),
-                                                frame.channel_layout(),
-                                                frame.rate(),
-                                                Sample::F32(ffmpeg_next::format::sample::Type::Packed),
-                                                target_layout,
-                                                target_sample_rate,
-                                            ).unwrap();
-                                            resampler = Some(new_r);
-                                            resampler.as_mut().unwrap()
-                                        }
-                                    };
-
-                                    let mut resampled = ffmpeg_next::util::frame::Audio::empty();
-                                    if r.run(&frame, &mut resampled).is_ok() {
-                                        let sample_count = resampled.samples();
-                                        if sample_count > 0 {
-                                            let byte_count = sample_count * target_channels * 4;
-                                            let data: &[f32] = bytemuck::cast_slice(&resampled.data(0)[..byte_count]);
-                                            
-                                            // 1. Push silence padding if any
-                                            if silence_padding_samples > 0 {
-                                                for _ in 0..silence_padding_samples {
-                                                    while audio_tx.try_push(0.0).is_err() {
-                                                        if let Ok(cmd) = audio_cmd_rx.try_recv() {
-                                                            match cmd {
-                                                                AudioThreadCommand::Seek { target_time } => {
-                                                                    while audio_packet_rx.try_recv().is_ok() {}
-                                                                    audio_decoder.flush();
-                                                                    skip_until_time = target_time;
-                                                                    is_first_audio_frame = true;
-                                                                    current_audio_time = target_time;
-                                                                    seek_aborted = true;
-                                                                    break;
-                                                                }
-                                                            }
-                                                        }
-                                                        thread::sleep(std::time::Duration::from_millis(5));
-                                                    }
-                                                    if seek_aborted {
-                                                        break;
-                                                    }
-                                                }
+                                        if is_first_audio_frame {
+                                            let target_container_time = video_start_time + skip_until_time;
+                                            if pts_sec < target_container_time {
+                                                continue; // Discard whole frame before seek target
                                             }
+                                            is_first_audio_frame = false;
+                                            let stream_time = pts_sec - video_start_time;
+                                            playback_state.samples_played.store((stream_time * playback_state.sample_rate as f64) as u64, std::sync::atomic::Ordering::SeqCst);
+                                        }
 
-                                            // 2. Push actual samples starting from start_idx
-                                            if !seek_aborted {
-                                                let start_idx = start_idx.min(data.len());
-                                                for &sample in &data[start_idx..] {
+                                        let r = match resampler {
+                                            Some(ref mut r) if r.input().format == frame.format()
+                                                && r.input().channel_layout == frame.channel_layout()
+                                                && r.input().rate == frame.rate() => r,
+                                            _ => {
+                                                let target_layout = if target_channels == 1 {
+                                                    ChannelLayout::MONO
+                                                } else {
+                                                    ChannelLayout::STEREO
+                                                };
+                                                
+                                                let new_r = ResamplerContext::get(
+                                                    frame.format(),
+                                                    frame.channel_layout(),
+                                                    frame.rate(),
+                                                    Sample::F32(ffmpeg_next::format::sample::Type::Packed),
+                                                    target_layout,
+                                                    target_sample_rate,
+                                                ).unwrap();
+                                                resampler = Some(new_r);
+                                                resampler.as_mut().unwrap()
+                                            }
+                                        };
+
+                                        let mut resampled = ffmpeg_next::util::frame::Audio::empty();
+                                        if r.run(&frame, &mut resampled).is_ok() {
+                                            let sample_count = resampled.samples();
+                                            if sample_count > 0 {
+                                                let byte_count = sample_count * target_channels * 4;
+                                                let data: &[f32] = bytemuck::cast_slice(&resampled.data(0)[..byte_count]);
+                                                
+                                                for &sample in data {
                                                     while audio_tx.try_push(sample).is_err() {
                                                         if let Ok(cmd) = audio_cmd_rx.try_recv() {
                                                             match cmd {
                                                                 AudioThreadCommand::Seek { target_time } => {
                                                                     while audio_packet_rx.try_recv().is_ok() {}
                                                                     audio_decoder.flush();
+                                                                    resampler = None;
                                                                     skip_until_time = target_time;
                                                                     is_first_audio_frame = true;
-                                                                    current_audio_time = target_time;
+                                                                    current_audio_time = video_start_time + target_time;
+                                                                    playback_state.should_flush.store(true, std::sync::atomic::Ordering::SeqCst);
                                                                     seek_aborted = true;
                                                                     break;
                                                                 }
@@ -566,25 +502,26 @@ fn run_decoding_loop(
                                                 }
                                             }
                                         }
-                                    }
 
-                                    if seek_aborted {
-                                        break;
+                                        if seek_aborted {
+                                            break;
+                                        }
                                     }
                                 }
+                            } else {
+                                break;
                             }
-                        } else {
-                            break;
-                        }
                     }
                     recv(audio_cmd_rx) -> cmd_res => {
                         match cmd_res {
                             Ok(AudioThreadCommand::Seek { target_time }) => {
                                 while audio_packet_rx.try_recv().is_ok() {}
                                 audio_decoder.flush();
+                                resampler = None;
                                 skip_until_time = target_time;
                                 is_first_audio_frame = true;
-                                current_audio_time = target_time;
+                                current_audio_time = video_start_time + target_time;
+                                playback_state.should_flush.store(true, std::sync::atomic::Ordering::SeqCst);
                             }
                             Err(_) => break,
                         }
@@ -626,7 +563,7 @@ fn run_decoding_loop(
                     drop(packets_iter);
 
                     // Flush queues and seeking input context
-                    let seek_pts = (frame_index as f64 * 1_000_000.0 / fps) as i64;
+                    let seek_pts = ((video_start_time + frame_index as f64 / fps) * 1_000_000.0) as i64;
                     let _ = input.seek(seek_pts, ..seek_pts + 1);
 
                     // Notify audio thread to flush
@@ -666,7 +603,7 @@ fn run_decoding_loop(
                             if let Ok(found) = resp_rx.recv() {
                                 if !found {
                                     drop(packets_iter);
-                                    let seek_pts = (frame_index as f64 * 1_000_000.0 / fps) as i64;
+                                    let seek_pts = ((video_start_time + frame_index as f64 / fps) * 1_000_000.0) as i64;
                                     let _ = input.seek(seek_pts, ..seek_pts + 1);
                                     let target_time = frame_index as f64 / fps;
                                     let _ = audio_cmd_tx.send(AudioThreadCommand::Seek { target_time });
