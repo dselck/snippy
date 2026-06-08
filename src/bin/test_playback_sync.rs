@@ -39,11 +39,12 @@ fn main() -> Result<(), anyhow::Error> {
         current_position_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         sample_rate: 48000,
         has_audio: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        fallback_start_time: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        fallback_base_time: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
         should_flush: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         is_playing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         audio_paused_for_sync: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        fallback_epoch: std::time::Instant::now(),
+        fallback_start_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        fallback_base_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
 
     // 2. Initialize Media Engine

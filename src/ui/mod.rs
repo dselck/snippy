@@ -107,11 +107,12 @@ impl MainApp {
                 current_position_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 sample_rate: 44100,
                 has_audio: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                fallback_start_time: std::sync::Arc::new(std::sync::Mutex::new(None)),
-                fallback_base_time: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
                 should_flush: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 is_playing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 audio_paused_for_sync: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                fallback_epoch: std::time::Instant::now(),
+                fallback_start_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                fallback_base_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             }));
 
         Self {
@@ -776,7 +777,7 @@ impl eframe::App for MainApp {
         if self.is_playing {
             let video_time = self.latest_frame.as_ref()
                 .filter(|f| f.sequence_id() == self.latest_sequence_id)
-                .map_or(self.current_frame as f64 / self.video_fps, |f| f.frame_idx() as f64 / self.video_fps);
+                .map_or(self.current_frame as f64 / self.video_fps, |f| f.pts_sec());
             let current_time = self.playback_state.current_time();
             let drift = current_time - video_time;
 
@@ -1487,11 +1488,12 @@ impl eframe::App for MainApp {
                                             current_position_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                                             sample_rate: 44100,
                                             has_audio: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                                            fallback_start_time: std::sync::Arc::new(std::sync::Mutex::new(None)),
-                                            fallback_base_time: std::sync::Arc::new(std::sync::Mutex::new(0.0)),
                                             should_flush: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                                             is_playing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                                             audio_paused_for_sync: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                                            fallback_epoch: std::time::Instant::now(),
+                                            fallback_start_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                                            fallback_base_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                                         }));
 
                                     // 4. Initialize MediaEngine
@@ -1644,7 +1646,7 @@ impl eframe::App for MainApp {
                                                 let master_time = self.playback_state.current_time();
                                                 let video_time = self.latest_frame.as_ref()
                                                     .filter(|f| f.sequence_id() == self.latest_sequence_id)
-                                                    .map_or(self.current_frame as f64 / self.video_fps, |f| f.frame_idx() as f64 / self.video_fps);
+                                                    .map_or(self.current_frame as f64 / self.video_fps, |f| f.pts_sec());
                                                 let drift = master_time - video_time;
                                                 
                                                 ui.horizontal(|ui| {

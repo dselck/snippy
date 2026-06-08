@@ -33,11 +33,13 @@ pub enum DecodedFrame {
         frame_idx: usize,
         planes: YuvPlanes,
         sequence_id: usize,
+        pts_sec: f64,
     },
     Gpu {
         frame_idx: usize,
         descriptor: GpuFrameDescriptor,
         sequence_id: usize,
+        pts_sec: f64,
     },
 }
 
@@ -53,6 +55,13 @@ impl DecodedFrame {
         match self {
             DecodedFrame::Cpu { sequence_id, .. } => *sequence_id,
             DecodedFrame::Gpu { sequence_id, .. } => *sequence_id,
+        }
+    }
+
+    pub fn pts_sec(&self) -> f64 {
+        match self {
+            DecodedFrame::Cpu { pts_sec, .. } => *pts_sec,
+            DecodedFrame::Gpu { pts_sec, .. } => *pts_sec,
         }
     }
 }
@@ -309,19 +318,20 @@ fn run_decoding_loop(
                                         v_stride: video_frame.stride(2) as u32,
                                     };
 
-                                    let frame_idx = match frame.pts() {
+                                    let pts_sec = match frame.pts() {
                                         Some(pts_val) => {
-                                            let time_sec = pts_val as f64 * time_base_f64 - video_start_time;
-                                            (time_sec * fps).round() as usize
+                                            pts_val as f64 * time_base_f64 - video_start_time
                                         }
-                                        None => fallback_frame_idx,
+                                        None => fallback_frame_idx as f64 / fps,
                                     };
+                                    let frame_idx = (pts_sec * fps).round() as usize;
                                     fallback_frame_idx = frame_idx + 1;
 
                                     let decoded = DecodedFrame::Cpu {
                                         frame_idx,
                                         planes: planes.clone(),
                                         sequence_id: current_sequence_id,
+                                        pts_sec,
                                     };
                                     
 

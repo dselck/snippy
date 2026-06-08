@@ -10,48 +10,46 @@ pub struct AudioPlaybackState {
     /// Sample rate of the output device (e.g., 48000).
     pub sample_rate: u32,
     pub has_audio: Arc<AtomicBool>,
-    pub fallback_start_time: Arc<std::sync::Mutex<Option<Instant>>>,
-    pub fallback_base_time: Arc<std::sync::Mutex<f64>>,
     pub should_flush: Arc<AtomicBool>,
     pub is_playing: Arc<AtomicBool>,
     pub audio_paused_for_sync: Arc<AtomicBool>,
+
+    // Lock-free hybrid clock
+    pub fallback_epoch: Instant,
+    pub fallback_start_us: Arc<AtomicU64>, // us since fallback_epoch, 0 means None/paused
+    pub fallback_base_us: Arc<AtomicU64>,  // base time in us
 }
 
 impl AudioPlaybackState {
     /// Returns the current master clock position in seconds.
     pub fn current_time(&self) -> f64 {
-        if self.has_audio.load(Ordering::Relaxed) {
-            let us = self.current_position_us.load(Ordering::Relaxed) as f64;
-            us / 1_000_000.0
+        let start_us = self.fallback_start_us.load(Ordering::Relaxed);
+        let base_us = self.fallback_base_us.load(Ordering::Relaxed) as f64;
+        if start_us > 0 {
+            let elapsed_us = self.fallback_epoch.elapsed().as_micros() as u64 - start_us;
+            (base_us + elapsed_us as f64) / 1_000_000.0
         } else {
-            let lock = self.fallback_start_time.lock().unwrap();
-            let base = *self.fallback_base_time.lock().unwrap();
-            if let Some(start) = *lock {
-                base + start.elapsed().as_secs_f64()
-            } else {
-                base
-            }
+            base_us / 1_000_000.0
         }
     }
 
     pub fn start_fallback_clock(&self) {
-        let mut lock = self.fallback_start_time.lock().unwrap();
-        if lock.is_none() {
-            *lock = Some(Instant::now());
+        let start_us = self.fallback_start_us.load(Ordering::Relaxed);
+        if start_us == 0 {
+            let now_us = self.fallback_epoch.elapsed().as_micros() as u64;
+            self.fallback_start_us.store(now_us, Ordering::Relaxed);
         }
     }
 
     pub fn stop_fallback_clock(&self) {
-        let mut lock = self.fallback_start_time.lock().unwrap();
-        *lock = None;
+        self.fallback_start_us.store(0, Ordering::Relaxed);
     }
 
     pub fn reset(&self, time_seconds: f64) {
-        self.current_position_us.store((time_seconds * 1_000_000.0) as u64, Ordering::Relaxed);
-        let mut base = self.fallback_base_time.lock().unwrap();
-        *base = time_seconds;
-        let mut lock = self.fallback_start_time.lock().unwrap();
-        *lock = None; // Always pause fallback clock on seek/reset
+        let time_us = (time_seconds * 1_000_000.0) as u64;
+        self.current_position_us.store(time_us, Ordering::Relaxed);
+        self.fallback_base_us.store(time_us, Ordering::Relaxed);
+        self.fallback_start_us.store(0, Ordering::Relaxed);
         self.audio_paused_for_sync.store(true, Ordering::SeqCst);
         self.should_flush.store(true, Ordering::SeqCst);
     }
@@ -91,6 +89,13 @@ impl AudioEngine {
         let is_playing_callback = Arc::clone(&is_playing);
         let audio_paused_for_sync = Arc::new(AtomicBool::new(false));
         let audio_paused_for_sync_callback = Arc::clone(&audio_paused_for_sync);
+
+        let fallback_epoch = Instant::now();
+        let fallback_epoch_callback = fallback_epoch;
+        let fallback_start_us = Arc::new(AtomicU64::new(0));
+        let fallback_start_us_callback = Arc::clone(&fallback_start_us);
+        let fallback_base_us = Arc::new(AtomicU64::new(0));
+        let fallback_base_us_callback = Arc::clone(&fallback_base_us);
 
         let mut samples_read_total = 0u64; // In frames
         let mut last_tag: Option<(u64, u64)> = None;
@@ -145,15 +150,20 @@ impl AudioEngine {
                     }
                 }
                 if active {
-                    if let Some((tag_idx, tag_pts_us)) = last_tag {
+                    let current_pos_us = if let Some((tag_idx, tag_pts_us)) = last_tag {
                         let elapsed_samples = samples_read_total.saturating_sub(tag_idx);
                         let elapsed_us = (elapsed_samples * 1_000_000) / (sample_rate as u64);
-                        let current_pos_us = tag_pts_us + elapsed_us;
-                        current_position_us_callback.store(current_pos_us, Ordering::Relaxed);
+                        tag_pts_us + elapsed_us
                     } else {
                         let elapsed_us = (written as u64 * 1_000_000) / (sample_rate as u64);
-                        current_position_us_callback.fetch_add(elapsed_us, Ordering::Relaxed);
-                    }
+                        current_position_us_callback.load(Ordering::Relaxed) + elapsed_us
+                    };
+                    current_position_us_callback.store(current_pos_us, Ordering::Relaxed);
+
+                    // Update fallback clock reference atomically
+                    fallback_base_us_callback.store(current_pos_us, Ordering::Relaxed);
+                    let now_us = fallback_epoch_callback.elapsed().as_micros() as u64;
+                    fallback_start_us_callback.store(now_us, Ordering::Relaxed);
                 }
             },
             |err| eprintln!("CPAL audio stream error: {:?}", err),
@@ -163,8 +173,6 @@ impl AudioEngine {
         stream.play()?;
 
         let has_audio = Arc::new(AtomicBool::new(false));
-        let fallback_start_time = Arc::new(std::sync::Mutex::new(None));
-        let fallback_base_time = Arc::new(std::sync::Mutex::new(0.0));
 
         Ok(Self {
             stream,
@@ -174,11 +182,12 @@ impl AudioEngine {
                 current_position_us,
                 sample_rate,
                 has_audio,
-                fallback_start_time,
-                fallback_base_time,
                 should_flush,
                 is_playing,
                 audio_paused_for_sync,
+                fallback_epoch,
+                fallback_start_us,
+                fallback_base_us,
             }),
         })
     }
