@@ -493,12 +493,9 @@ fn run_decoding_loop(
 
                                          if is_first_audio_frame {
                                              let target_container_time = video_start_time + skip_until_time;
-                                             if pts_sec < target_container_time {
+                                             if pts_sec + duration_sec <= target_container_time {
                                                  continue; // Discard whole frame before seek target
                                              }
-                                             is_first_audio_frame = false;
-                                             let stream_time = pts_sec - video_start_time;
-                                             playback_state.current_position_us.store((stream_time * 1_000_000.0) as u64, std::sync::atomic::Ordering::SeqCst);
                                          }
 
                                          let r = match resampler {
@@ -530,10 +527,61 @@ fn run_decoding_loop(
                                              let sample_count = resampled.samples();
                                              if sample_count > 0 {
                                                  let byte_count = sample_count * target_channels * 4;
-                                                 let data: &[f32] = bytemuck::cast_slice(&resampled.data(0)[..byte_count]);
+                                                 let mut data: &[f32] = bytemuck::cast_slice(&resampled.data(0)[..byte_count]);
                                                  
-                                                 let pts_us = ((pts_sec - video_start_time).max(0.0) * 1_000_000.0) as u64;
-                                                 let _ = tags_tx.try_push((frames_written_total, pts_us));
+                                                 if is_first_audio_frame {
+                                                     let target_container_time = video_start_time + skip_until_time;
+                                                     if pts_sec < target_container_time {
+                                                         // Trim overlap
+                                                         let overlap_sec = target_container_time - pts_sec;
+                                                         let discard_samples = (overlap_sec * target_sample_rate as f64).round() as usize;
+                                                         if discard_samples < data.len() {
+                                                             data = &data[discard_samples..];
+                                                             let pts_us = (skip_until_time.max(0.0) * 1_000_000.0) as u64;
+                                                             let _ = tags_tx.try_push((frames_written_total, pts_us));
+                                                         } else {
+                                                             continue;
+                                                         }
+                                                     } else {
+                                                         // Gap: Pad with silence or handle large gap
+                                                         let gap_sec = pts_sec - target_container_time;
+                                                         if gap_sec <= 0.15 {
+                                                             let pad_samples = (gap_sec * target_sample_rate as f64).round() as usize;
+                                                             let pts_us = (skip_until_time.max(0.0) * 1_000_000.0) as u64;
+                                                             let _ = tags_tx.try_push((frames_written_total, pts_us));
+                                                             
+                                                             for _ in 0..pad_samples {
+                                                                 while audio_tx.try_push(0.0).is_err() {
+                                                                     if let Ok(cmd) = audio_cmd_rx.try_recv() {
+                                                                         match cmd {
+                                                                             AudioThreadCommand::Seek { target_time, resp_tx } => {
+                                                                                 handle_audio_seek!(target_time, resp_tx);
+                                                                                 seek_aborted = true;
+                                                                                 break;
+                                                                             }
+                                                                         }
+                                                                     }
+                                                                     thread::sleep(std::time::Duration::from_millis(5));
+                                                                 }
+                                                                 if seek_aborted {
+                                                                     break;
+                                                                 }
+                                                             }
+                                                             if seek_aborted {
+                                                                 break;
+                                                             }
+                                                             frames_written_total += pad_samples as u64;
+                                                         } else {
+                                                             // Large Gap: No padding, tag at actual PTS
+                                                             let pts_us = ((pts_sec - video_start_time).max(0.0) * 1_000_000.0) as u64;
+                                                             let _ = tags_tx.try_push((frames_written_total, pts_us));
+                                                         }
+                                                     }
+                                                     is_first_audio_frame = false;
+                                                 } else {
+                                                     let pts_us = ((pts_sec - video_start_time).max(0.0) * 1_000_000.0) as u64;
+                                                     let _ = tags_tx.try_push((frames_written_total, pts_us));
+                                                 }
 
                                                  for &sample in data {
                                                      while audio_tx.try_push(sample).is_err() {
@@ -553,7 +601,7 @@ fn run_decoding_loop(
                                                      }
                                                  }
                                                  if !seek_aborted {
-                                                     frames_written_total += sample_count as u64;
+                                                     frames_written_total += data.len() as u64;
                                                  }
                                              }
                                          }
