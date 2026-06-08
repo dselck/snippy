@@ -276,6 +276,10 @@ fn run_decoding_loop(
     };
     
     let video_thread = thread::spawn(move || {
+        let mut gop_cache = GopCache {
+            keyframe_idx: usize::MAX,
+            frames: std::collections::HashMap::new(),
+        };
 
         let mut fallback_frame_idx = 0;
         let mut scaler: Option<ffmpeg_next::software::scaling::context::Context> = None;
@@ -341,6 +345,22 @@ fn run_decoding_loop(
                                     let frame_idx = (pts_sec * fps).round() as usize;
                                     fallback_frame_idx = frame_idx + 1;
 
+                                    if keyframes.binary_search(&frame_idx).is_ok() {
+                                        if gop_cache.keyframe_idx != frame_idx {
+                                            gop_cache.frames.clear();
+                                            gop_cache.keyframe_idx = frame_idx;
+                                        }
+                                    }
+                                    if gop_cache.keyframe_idx == usize::MAX {
+                                        gop_cache.keyframe_idx = get_nearest_keyframe(&keyframes, frame_idx);
+                                    }
+                                    if frame_idx >= gop_cache.keyframe_idx {
+                                        gop_cache.frames.insert(frame_idx, CachedFrame {
+                                            planes: planes.clone(),
+                                            pts_sec,
+                                        });
+                                    }
+
                                     let decoded = DecodedFrame::Cpu {
                                         frame_idx,
                                         planes: planes.clone(),
@@ -360,14 +380,42 @@ fn run_decoding_loop(
                                         recv(video_cmd_rx) -> cmd_res => {
                                             if let Ok(cmd) = cmd_res {
                                                 match cmd {
-                                                    VideoThreadCommand::Seek { frame_index, keyframe_only, sequence_id, resp_tx } => {
-                                                        fallback_frame_idx = frame_index;
-                                                        keyframe_only_mode = keyframe_only;
-                                                        current_sequence_id = sequence_id;
-                                                        while video_packet_rx.try_recv().is_ok() {}
-                                                        video_decoder.flush();
-                                                        let _ = resp_tx.send(false); // Always force demuxer seek to sync audio
-                                                        decode_more = true;
+                                                    VideoThreadCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae, resp_tx } => {
+                                                        let target_kf = get_nearest_keyframe(&keyframes, frame_index);
+                                                        if gop_cache.keyframe_idx != target_kf {
+                                                            gop_cache.frames.clear();
+                                                            gop_cache.keyframe_idx = target_kf;
+                                                        }
+
+                                                        let mut cache_hit = false;
+                                                        if !ae {
+                                                            if let Some(cached) = gop_cache.frames.get(&frame_index) {
+                                                                let decoded = DecodedFrame::Cpu {
+                                                                    frame_idx: frame_index,
+                                                                    planes: cached.planes.clone(),
+                                                                    sequence_id,
+                                                                    pts_sec: cached.pts_sec,
+                                                                };
+                                                                if frame_tx_clone.send(decoded).is_ok() {
+                                                                    let _ = resp_tx.send(true);
+                                                                    fallback_frame_idx = frame_index;
+                                                                    keyframe_only_mode = keyframe_only;
+                                                                    current_sequence_id = sequence_id;
+                                                                    decode_more = false;
+                                                                    cache_hit = true;
+                                                                }
+                                                            }
+                                                        }
+
+                                                        if !cache_hit {
+                                                            fallback_frame_idx = frame_index;
+                                                            keyframe_only_mode = keyframe_only;
+                                                            current_sequence_id = sequence_id;
+                                                            while video_packet_rx.try_recv().is_ok() {}
+                                                            video_decoder.flush();
+                                                            let _ = resp_tx.send(false);
+                                                            decode_more = true;
+                                                        }
                                                     }
                                                     VideoThreadCommand::Play => {
                                                         keyframe_only_mode = false;
@@ -397,15 +445,42 @@ fn run_decoding_loop(
                     }
                     recv(video_cmd_rx) -> cmd_res => {
                         match cmd_res {
-                            Ok(VideoThreadCommand::Seek { frame_index, keyframe_only, sequence_id, resp_tx }) => {
-                                fallback_frame_idx = frame_index;
-                                keyframe_only_mode = keyframe_only;
-                                current_sequence_id = sequence_id;
+                            Ok(VideoThreadCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae, resp_tx }) => {
+                                let target_kf = get_nearest_keyframe(&keyframes, frame_index);
+                                if gop_cache.keyframe_idx != target_kf {
+                                    gop_cache.frames.clear();
+                                    gop_cache.keyframe_idx = target_kf;
+                                }
 
-                                while video_packet_rx.try_recv().is_ok() {}
-                                video_decoder.flush();
-                                let _ = resp_tx.send(false); // Always force demuxer seek to sync audio
-                                decode_more = true;
+                                let mut cache_hit = false;
+                                if !ae {
+                                    if let Some(cached) = gop_cache.frames.get(&frame_index) {
+                                        let decoded = DecodedFrame::Cpu {
+                                            frame_idx: frame_index,
+                                            planes: cached.planes.clone(),
+                                            sequence_id,
+                                            pts_sec: cached.pts_sec,
+                                        };
+                                        if frame_tx_clone.send(decoded).is_ok() {
+                                            let _ = resp_tx.send(true);
+                                            fallback_frame_idx = frame_index;
+                                            keyframe_only_mode = keyframe_only;
+                                            current_sequence_id = sequence_id;
+                                            decode_more = false;
+                                            cache_hit = true;
+                                        }
+                                    }
+                                }
+
+                                if !cache_hit {
+                                    fallback_frame_idx = frame_index;
+                                    keyframe_only_mode = keyframe_only;
+                                    current_sequence_id = sequence_id;
+                                    while video_packet_rx.try_recv().is_ok() {}
+                                    video_decoder.flush();
+                                    let _ = resp_tx.send(false);
+                                    decode_more = true;
+                                }
                             }
                             Ok(VideoThreadCommand::Play) => {
                                 keyframe_only_mode = false;
@@ -417,14 +492,42 @@ fn run_decoding_loop(
                 }
             } else {
                 match video_cmd_rx.recv() {
-                    Ok(VideoThreadCommand::Seek { frame_index, keyframe_only, sequence_id, resp_tx }) => {
-                        fallback_frame_idx = frame_index;
-                        keyframe_only_mode = keyframe_only;
-                        current_sequence_id = sequence_id;
-                        while video_packet_rx.try_recv().is_ok() {}
-                        video_decoder.flush();
-                        let _ = resp_tx.send(false); // Always force demuxer seek to sync audio
-                        decode_more = true;
+                    Ok(VideoThreadCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae, resp_tx }) => {
+                        let target_kf = get_nearest_keyframe(&keyframes, frame_index);
+                        if gop_cache.keyframe_idx != target_kf {
+                            gop_cache.frames.clear();
+                            gop_cache.keyframe_idx = target_kf;
+                        }
+
+                        let mut cache_hit = false;
+                        if !ae {
+                            if let Some(cached) = gop_cache.frames.get(&frame_index) {
+                                let decoded = DecodedFrame::Cpu {
+                                    frame_idx: frame_index,
+                                    planes: cached.planes.clone(),
+                                    sequence_id,
+                                    pts_sec: cached.pts_sec,
+                                };
+                                if frame_tx_clone.send(decoded).is_ok() {
+                                    let _ = resp_tx.send(true);
+                                    fallback_frame_idx = frame_index;
+                                    keyframe_only_mode = keyframe_only;
+                                    current_sequence_id = sequence_id;
+                                    decode_more = false;
+                                    cache_hit = true;
+                                }
+                            }
+                        }
+
+                        if !cache_hit {
+                            fallback_frame_idx = frame_index;
+                            keyframe_only_mode = keyframe_only;
+                            current_sequence_id = sequence_id;
+                            while video_packet_rx.try_recv().is_ok() {}
+                            video_decoder.flush();
+                            let _ = resp_tx.send(false);
+                            decode_more = true;
+                        }
                     }
                     Ok(VideoThreadCommand::Play) => {
                         keyframe_only_mode = false;
