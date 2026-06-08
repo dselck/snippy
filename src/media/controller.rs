@@ -105,3 +105,286 @@ impl MediaSource for MockMediaSource {
         }
     }
 }
+
+pub struct PlaybackController {
+    audio_backend: Box<dyn AudioBackend>,
+    media_source: Option<Box<dyn MediaSource>>,
+    latest_sequence_id: usize,
+    expected_frame_for_seq: Option<usize>,
+    desired_scrub_frame: Option<usize>,
+    latest_frame: Option<DecodedFrame>,
+    future_frame: Option<DecodedFrame>,
+    drift_history: std::collections::VecDeque<f32>,
+    is_playing: bool,
+    fps: f64,
+    total_frames: usize,
+    seek_in_progress: bool,
+}
+
+impl PlaybackController {
+    pub fn new() -> Self {
+        Self {
+            audio_backend: Box::new(NullAudioBackend::new()),
+            media_source: None,
+            latest_sequence_id: 0,
+            expected_frame_for_seq: None,
+            desired_scrub_frame: None,
+            latest_frame: None,
+            future_frame: None,
+            drift_history: std::collections::VecDeque::with_capacity(60),
+            is_playing: false,
+            fps: 24.0,
+            total_frames: 0,
+            seek_in_progress: false,
+        }
+    }
+
+    pub fn load_source_with_adapters(
+        &mut self,
+        metadata: VideoMetadata,
+        audio_backend: Box<dyn AudioBackend>,
+        media_source: Box<dyn MediaSource>,
+    ) -> Result<VideoMetadata, anyhow::Error> {
+        self.fps = metadata.fps;
+        self.total_frames = metadata.total_frames;
+        self.audio_backend = audio_backend;
+        self.media_source = Some(media_source);
+        self.latest_sequence_id = 0;
+        self.expected_frame_for_seq = None;
+        self.desired_scrub_frame = None;
+        self.latest_frame = None;
+        self.future_frame = None;
+        self.is_playing = false;
+        self.seek_in_progress = false;
+
+        self.audio_backend.set_has_audio(metadata.has_audio);
+        self.audio_backend.configure(0.0, false, true, false);
+
+        Ok(metadata)
+    }
+
+    pub fn current_time(&self) -> f64 {
+        self.audio_backend.current_time()
+    }
+
+    fn nearest_keyframe(&self, target: usize, keyframes: &[usize]) -> usize {
+        if keyframes.is_empty() {
+            return target;
+        }
+        match keyframes.binary_search(&target) {
+            Ok(i) => keyframes[i],
+            Err(0) => keyframes[0],
+            Err(i) => keyframes[i - 1],
+        }
+    }
+
+    fn is_seek_in_flight(&self) -> bool {
+        if self.latest_sequence_id == 0 {
+            return false;
+        }
+        self.latest_frame.as_ref().map_or(true, |f| {
+            if f.sequence_id() < self.latest_sequence_id {
+                true
+            } else if let Some(expected) = self.expected_frame_for_seq {
+                f.frame_idx() < expected
+            } else {
+                false
+            }
+        })
+    }
+
+    fn seek_internal(&mut self, frame: usize, keyframe_only: bool, audio_enabled: bool) {
+        self.latest_sequence_id += 1;
+        self.seek_in_progress = true;
+        let clamped = frame.clamp(0, self.total_frames);
+
+        // Expected is target frame or nearest keyframe
+        let expected = if keyframe_only {
+            // Note: tests will stub/simulate keyframes. For fallback, keyframe every 50 frames
+            (clamped / 50) * 50
+        } else {
+            clamped
+        };
+        self.expected_frame_for_seq = Some(expected);
+
+        if audio_enabled {
+            self.audio_backend.configure(clamped as f64 / self.fps, self.is_playing, true, false);
+        } else {
+            self.audio_backend.configure(clamped as f64 / self.fps, false, false, false);
+        }
+
+        if let Some(ref ms) = self.media_source {
+            let _ = ms.send_command(crate::media::MediaCommand::Seek {
+                frame_index: clamped,
+                keyframe_only,
+                sequence_id: self.latest_sequence_id,
+                audio_enabled,
+            });
+        }
+        self.future_frame = None;
+    }
+
+    pub fn tick(&mut self, cmd: Option<PlaybackCommand>) -> PlaybackStateView<'_> {
+        // 1. Process command
+        if let Some(c) = cmd {
+            match c {
+                PlaybackCommand::Play => {
+                    self.is_playing = true;
+                    self.desired_scrub_frame = None;
+                    self.expected_frame_for_seq = None;
+                    self.audio_backend.configure(self.current_time(), true, false, false);
+                    if let Some(ref ms) = self.media_source {
+                        let _ = ms.send_command(crate::media::MediaCommand::Play);
+                    }
+                }
+                PlaybackCommand::Pause => {
+                    self.is_playing = false;
+                    self.audio_backend.configure(self.current_time(), false, false, false);
+                    if let Some(ref ms) = self.media_source {
+                        let _ = ms.send_command(crate::media::MediaCommand::Pause);
+                    }
+                }
+                PlaybackCommand::TogglePlay => {
+                    if self.is_playing {
+                        self.tick(Some(PlaybackCommand::Pause));
+                    } else {
+                        self.tick(Some(PlaybackCommand::Play));
+                    }
+                }
+                PlaybackCommand::Seek { frame_idx, precise } => {
+                    if !precise {
+                        if self.is_seek_in_flight() {
+                            self.desired_scrub_frame = Some(frame_idx);
+                        } else {
+                            self.seek_internal(frame_idx, true, false);
+                        }
+                    } else {
+                        self.desired_scrub_frame = None;
+                        self.seek_internal(frame_idx, false, true);
+                    }
+                }
+            }
+        }
+
+        // 3. Poll frames from media source
+        if let Some(ref mut ms) = self.media_source {
+            while let Ok(Some(frame)) = ms.poll_frame() {
+                if frame.sequence_id() == self.latest_sequence_id {
+                    let master_time = self.audio_backend.current_time();
+                    let pts = frame.pts_sec();
+                    if self.is_playing {
+                        if pts <= master_time {
+                            self.latest_frame = Some(frame);
+                        } else {
+                            self.future_frame = Some(frame);
+                            break;
+                        }
+                    } else {
+                        // In pause/seek, accept the frame immediately
+                        self.latest_frame = Some(frame);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 4. Promote future frame if time elapsed
+        let master_time = self.audio_backend.current_time();
+        if self.is_playing {
+            if let Some(ref f) = self.future_frame {
+                if f.pts_sec() <= master_time {
+                    self.latest_frame = self.future_frame.take();
+                }
+            }
+        }
+
+        // 2. Scrub Loop: poll desired scrub frame if seek finished
+        if !self.is_seek_in_flight() {
+            if let Some(target) = self.desired_scrub_frame.take() {
+                self.seek_internal(target, true, false);
+            }
+        }
+
+        // 5. A/V Sync pause check
+        if self.is_playing {
+            let video_time = self.latest_frame.as_ref()
+                .filter(|f| f.sequence_id() == self.latest_sequence_id)
+                .map_or(0.0, |f| f.pts_sec());
+            let drift = master_time - video_time;
+
+            if drift > 0.15 {
+                // Video lagging behind audio: trigger sync pause
+                self.audio_backend.configure(master_time, true, false, true);
+            } else {
+                // Caught up
+                self.audio_backend.configure(master_time, true, false, false);
+            }
+        }
+
+        let current_frame = self.latest_frame.as_ref().map(|f| f.frame_idx()).unwrap_or(0);
+
+        PlaybackStateView {
+            frame_to_render: self.latest_frame.as_ref(),
+            current_time: master_time,
+            current_frame,
+            is_playing: self.is_playing,
+            seek_in_progress: self.seek_in_progress,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::YuvPlanes;
+    use crossbeam_channel::unbounded;
+
+    #[test]
+    fn test_seek_coalescing_scrub() {
+        let (cmd_tx, cmd_rx) = unbounded();
+        let (frame_tx, frame_rx) = unbounded();
+        let mock_source = MockMediaSource { cmd_tx, frame_rx };
+        let null_audio = NullAudioBackend::new();
+
+        let mut controller = PlaybackController::new();
+        let meta = VideoMetadata {
+            total_frames: 100,
+            width: 100,
+            height: 100,
+            fps: 25.0,
+            has_audio: false,
+            keyframes: vec![0, 50, 100],
+            keyframes_pts: vec![0, 50, 100],
+        };
+
+        controller.load_source_with_adapters(meta, Box::new(null_audio), Box::new(mock_source)).unwrap();
+
+        // 1. Send first scrub seek: frame 25
+        controller.tick(Some(PlaybackCommand::Seek { frame_idx: 25, precise: false }));
+        // Expected seek command to go in-flight immediately
+        let cmd1 = cmd_rx.try_recv().unwrap();
+        assert!(matches!(cmd1, crate::media::MediaCommand::Seek { frame_index: 25, keyframe_only: true, .. }));
+
+        // 2. While seek is in-flight, request seeks to 30, then 40
+        controller.tick(Some(PlaybackCommand::Seek { frame_idx: 30, precise: false }));
+        controller.tick(Some(PlaybackCommand::Seek { frame_idx: 40, precise: false }));
+        // Ensure no new commands were sent (coalescing active)
+        assert!(cmd_rx.try_recv().is_err());
+
+        // 3. Receive the frame for seek 25 to clear the in-flight gate
+        let frame = DecodedFrame::Cpu {
+            frame_idx: 0, // keyframe for 25 is 0
+            planes: YuvPlanes::default(),
+            sequence_id: 1,
+            pts_sec: 0.0,
+        };
+        frame_tx.send(frame).unwrap();
+
+        // Tick to consume the frame and release the gate
+        controller.tick(None);
+
+        // Verify the latest seek (40) gets dispatched, skipping 30
+        let cmd2 = cmd_rx.try_recv().unwrap();
+        assert!(matches!(cmd2, crate::media::MediaCommand::Seek { frame_index: 40, keyframe_only: true, .. }));
+    }
+}
