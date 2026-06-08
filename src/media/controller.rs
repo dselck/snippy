@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use crate::media::{DecodedFrame, VideoMetadata};
 use crossbeam_channel::Receiver;
+use ringbuf::{SharedRb, storage::Heap, traits::*};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlaybackCommand {
@@ -331,7 +332,73 @@ impl PlaybackController {
             seek_in_progress: self.seek_in_progress,
         }
     }
+
+    pub fn load_source(&mut self, path: &str) -> Result<VideoMetadata, anyhow::Error> {
+        // Teardown previous media source
+        self.media_source = None;
+
+        // Initialize CPAL audio engine
+        let mut audio_engine = crate::audio::AudioEngine::new().ok();
+        let playback_state = audio_engine.as_ref()
+            .map(|ae| Arc::clone(&ae.playback_state))
+            .unwrap_or_else(|| Arc::new(crate::audio::AudioPlaybackState {
+                current_position_us: Arc::new(AtomicU64::new(0)),
+                sample_rate: 44100,
+                has_audio: Arc::new(AtomicBool::new(false)),
+                should_flush: Arc::new(AtomicBool::new(false)),
+                is_playing: Arc::new(AtomicBool::new(false)),
+                audio_paused_for_sync: Arc::new(AtomicBool::new(false)),
+                fallback_epoch: std::time::Instant::now(),
+                fallback_start_us: Arc::new(AtomicU64::new(0)),
+                fallback_base_us: Arc::new(AtomicU64::new(0)),
+            }));
+
+        let (frame_tx, frame_rx) = crossbeam_channel::bounded(4);
+        let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+
+        let (engine, metadata) = if let Some(ref mut ae) = audio_engine {
+            let audio_tx = ae.tx.take().unwrap();
+            let tags_tx = ae.tags_tx.take().unwrap();
+            crate::media::MediaEngine::new(
+                path,
+                ae.playback_state.sample_rate,
+                2, // stereo
+                frame_tx,
+                audio_tx,
+                tags_tx,
+                cmd_rx,
+                Arc::clone(&playback_state),
+            )?
+        } else {
+            // Null playback configuration: dummy channels
+            let rb = SharedRb::<Heap<f32>>::new(48000 * 2);
+            let (prod, _) = rb.split();
+            let tags_rb = SharedRb::<Heap<(u64, u64)>>::new(256);
+            let (tags_prod, _) = tags_rb.split();
+            crate::media::MediaEngine::new(
+                path,
+                44100,
+                2,
+                frame_tx,
+                prod,
+                tags_prod,
+                cmd_rx,
+                Arc::clone(&playback_state),
+            )?
+        };
+
+        let audio_backend = Box::new(CpalAudioBackend::new(playback_state));
+        let media_source = Box::new(FfmpegMediaSource::new(engine, frame_rx));
+
+        self.load_source_with_adapters(metadata.clone(), audio_backend, media_source)?;
+        
+        // Prevent compiler warnings about unused audio engine
+        let _ = audio_engine;
+
+        Ok(metadata)
+    }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -388,3 +455,69 @@ mod tests {
         assert!(matches!(cmd2, crate::media::MediaCommand::Seek { frame_index: 40, keyframe_only: true, .. }));
     }
 }
+
+pub struct CpalAudioBackend {
+    state: Arc<crate::audio::AudioPlaybackState>,
+}
+
+impl CpalAudioBackend {
+    pub fn new(state: Arc<crate::audio::AudioPlaybackState>) -> Self {
+        Self { state }
+    }
+}
+
+impl AudioBackend for CpalAudioBackend {
+    fn configure(&self, time_seconds: f64, playing: bool, flush: bool, paused_for_sync: bool) {
+        if flush {
+            self.state.reset(time_seconds);
+        } else {
+            self.state.set_position(time_seconds);
+        }
+        self.state.is_playing.store(playing, Ordering::SeqCst);
+        self.state.audio_paused_for_sync.store(paused_for_sync, Ordering::SeqCst);
+        if playing && !paused_for_sync {
+            self.state.start_fallback_clock();
+        } else {
+            self.state.stop_fallback_clock();
+        }
+    }
+
+    fn current_time(&self) -> f64 {
+        self.state.current_time()
+    }
+
+    fn set_has_audio(&self, has_audio: bool) {
+        self.state.has_audio.store(has_audio, Ordering::Relaxed);
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.state.sample_rate
+    }
+}
+
+pub struct FfmpegMediaSource {
+    engine: crate::media::MediaEngine,
+    frame_rx: Receiver<DecodedFrame>,
+}
+
+impl FfmpegMediaSource {
+    pub fn new(engine: crate::media::MediaEngine, frame_rx: Receiver<DecodedFrame>) -> Self {
+        Self { engine, frame_rx }
+    }
+}
+
+impl MediaSource for FfmpegMediaSource {
+    fn send_command(&self, cmd: crate::media::MediaCommand) -> Result<(), anyhow::Error> {
+        self.engine.tx.send(cmd)?;
+        Ok(())
+    }
+
+    fn poll_frame(&mut self) -> Result<Option<DecodedFrame>, anyhow::Error> {
+        match self.frame_rx.try_recv() {
+            Ok(frame) => Ok(Some(frame)),
+            Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
+            Err(e) => Err(anyhow::Error::from(e)),
+        }
+    }
+}
+

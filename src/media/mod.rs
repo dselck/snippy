@@ -119,6 +119,7 @@ pub enum AudioThreadCommand {
     Seek { target_time: f64, resp_tx: Sender<()> },
 }
 
+#[derive(Clone, Debug)]
 pub struct VideoMetadata {
     pub total_frames: usize,
     pub width: u32,
