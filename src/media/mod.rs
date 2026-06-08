@@ -73,7 +73,12 @@ pub struct YuvPlanes {
 pub enum MediaCommand {
     Play,
     Pause,
-    Seek { frame_index: usize, keyframe_only: bool, sequence_id: usize },
+    Seek {
+        frame_index: usize,
+        keyframe_only: bool,
+        sequence_id: usize,
+        audio_enabled: bool,
+    },
     Shutdown,
 }
 
@@ -217,6 +222,7 @@ fn run_decoding_loop(
     fps: f64,
     playback_state: Arc<crate::audio::AudioPlaybackState>,
 ) -> Result<(), anyhow::Error> {
+    let mut audio_enabled = true;
     let mut input = ffmpeg_next::format::input(&path)?;
 
     let video_stream = input
@@ -588,7 +594,8 @@ fn run_decoding_loop(
                     let _ = video_cmd_tx.send(VideoThreadCommand::Play);
                 }
                 MediaCommand::Pause => {}
-                MediaCommand::Seek { frame_index, keyframe_only, sequence_id } => {
+                MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae } => {
+                    audio_enabled = ae;
                     seek_requested = Some((frame_index, keyframe_only, sequence_id));
                 }
             }
@@ -604,7 +611,7 @@ fn run_decoding_loop(
             });
 
             let mut audio_resp_rx = None;
-            if audio_stream_idx_opt.is_some() {
+            if audio_stream_idx_opt.is_some() && audio_enabled {
                 let (audio_resp_tx, rx) = crossbeam_channel::bounded::<()>(1);
                 let target_time = frame_index as f64 / fps;
                 let _ = audio_cmd_tx.send(AudioThreadCommand::Seek {
@@ -649,7 +656,8 @@ fn run_decoding_loop(
                                 let _ = video_cmd_tx.send(VideoThreadCommand::Play);
                             }
                             MediaCommand::Pause => {}
-                            MediaCommand::Seek { frame_index, keyframe_only, sequence_id } => {
+                            MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae } => {
+                                audio_enabled = ae;
                                 seek_requested = Some((frame_index, keyframe_only, sequence_id));
                             }
                         }
@@ -663,7 +671,7 @@ fn run_decoding_loop(
                             });
 
                             let mut audio_resp_rx = None;
-                            if audio_stream_idx_opt.is_some() {
+                            if audio_stream_idx_opt.is_some() && audio_enabled {
                                 let (audio_resp_tx, rx) = crossbeam_channel::bounded::<()>(1);
                                 let target_time = frame_index as f64 / fps;
                                 let _ = audio_cmd_tx.send(AudioThreadCommand::Seek {
@@ -709,7 +717,8 @@ fn run_decoding_loop(
                                     let _ = video_cmd_tx.send(VideoThreadCommand::Play);
                                 }
                                 MediaCommand::Pause => {}
-                                MediaCommand::Seek { frame_index, keyframe_only, sequence_id } => {
+                                MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae } => {
+                                    audio_enabled = ae;
                                     seek_requested = Some((frame_index, keyframe_only, sequence_id));
                                 }
                             }
@@ -723,30 +732,33 @@ fn run_decoding_loop(
                     }
                 }
             } else if Some(stream_idx) == audio_stream_idx_opt {
-                crossbeam_channel::select! {
-                    send(audio_packet_tx, packet) -> res => {
-                        if res.is_err() {
-                            break;
+                if audio_enabled {
+                    crossbeam_channel::select! {
+                        send(audio_packet_tx, packet) -> res => {
+                            if res.is_err() {
+                                break;
+                            }
                         }
-                    }
-                    recv(background_rx) -> cmd_res => {
-                        if let Ok(cmd) = cmd_res {
-                            match cmd {
-                                MediaCommand::Shutdown => return Ok(()),
-                                MediaCommand::Play => {
-                                    let _ = video_cmd_tx.send(VideoThreadCommand::Play);
+                        recv(background_rx) -> cmd_res => {
+                            if let Ok(cmd) = cmd_res {
+                                match cmd {
+                                    MediaCommand::Shutdown => return Ok(()),
+                                    MediaCommand::Play => {
+                                        let _ = video_cmd_tx.send(VideoThreadCommand::Play);
+                                    }
+                                    MediaCommand::Pause => {}
+                                    MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae } => {
+                                        audio_enabled = ae;
+                                        seek_requested = Some((frame_index, keyframe_only, sequence_id));
+                                    }
                                 }
-                                MediaCommand::Pause => {}
-                                MediaCommand::Seek { frame_index, keyframe_only, sequence_id } => {
-                                    seek_requested = Some((frame_index, keyframe_only, sequence_id));
+                                pending_packet = Some((stream_idx, packet));
+                                if seek_requested.is_some() {
+                                    pending_packet = None;
                                 }
+                            } else {
+                                break;
                             }
-                            pending_packet = Some((stream_idx, packet));
-                            if seek_requested.is_some() {
-                                pending_packet = None;
-                            }
-                        } else {
-                            break;
                         }
                     }
                 }
