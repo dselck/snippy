@@ -33,6 +33,7 @@ pub struct MainApp {
     pub is_playing: bool,
     pub video_path: Option<String>,
     pub video_fps: f64,
+    pub is_scrubbing: bool,
 
     // Range Selection Markers
     pub in_marker: Option<usize>,
@@ -106,6 +107,7 @@ impl MainApp {
             is_playing: false,
             video_path: Some(demo_path.to_string()),
             video_fps: metadata.as_ref().map_or(24.0, |m| m.fps),
+            is_scrubbing: false,
             in_marker: None,
             out_marker: None,
             ranges: vec![],
@@ -683,6 +685,9 @@ impl MainApp {
 
 impl eframe::App for MainApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut progress_dragged = false;
+        let mut wave_dragged = false;
+
         let previous_is_playing = self.is_playing;
         let mut prev_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
         let mut next_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
@@ -730,7 +735,9 @@ impl eframe::App for MainApp {
 
         // 3. Map status view properties to UI state
         self.is_playing = view_is_playing;
-        self.current_frame = view_current_frame;
+        if !self.is_scrubbing {
+            self.current_frame = view_current_frame;
+        }
         
         if let Some(ref frame) = frame_to_render {
             self.latest_frame = Some(frame.clone());
@@ -958,6 +965,7 @@ impl eframe::App for MainApp {
                         egui::Sense::click_and_drag(),
                     );
                     let wave_response = wave_response.on_hover_text("Waveform Viewport: Drag or click to scrub");
+                    wave_dragged = wave_response.dragged();
 
                     let painter = ui.painter_at(wave_rect);
                     painter.rect(
@@ -1593,6 +1601,7 @@ impl eframe::App for MainApp {
 
                     // Sleek progress slider
                     let progress_response = self.progress_bar(ui);
+                    progress_dragged = progress_response.dragged();
                     if progress_response.dragged() || progress_response.clicked() {
                         self.set_playing(false);
                         self.seek_internal(self.current_frame, true, false);
@@ -1738,6 +1747,7 @@ impl eframe::App for MainApp {
                 self.right_arrow_held_since = None;
             }
         }
+        self.is_scrubbing = progress_dragged || wave_dragged;
     }
 }
 

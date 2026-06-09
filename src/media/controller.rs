@@ -119,6 +119,8 @@ pub struct PlaybackController {
     fps: f64,
     total_frames: usize,
     seek_in_progress: bool,
+    _audio_engine: Option<crate::audio::AudioEngine>,
+    keyframes: Vec<usize>,
 }
 
 impl PlaybackController {
@@ -135,6 +137,8 @@ impl PlaybackController {
             fps: 24.0,
             total_frames: 0,
             seek_in_progress: false,
+            _audio_engine: None,
+            keyframes: Vec::new(),
         }
     }
 
@@ -155,11 +159,29 @@ impl PlaybackController {
         self.future_frame = None;
         self.is_playing = false;
         self.seek_in_progress = false;
+        self.keyframes = metadata.keyframes.clone();
+        self._audio_engine = None;
 
         self.audio_backend.set_has_audio(metadata.has_audio);
         self.audio_backend.configure(0.0, false, true, false);
 
         Ok(metadata)
+    }
+
+    fn nearest_keyframe(&self, target: usize) -> usize {
+        if self.keyframes.is_empty() {
+            return (target / 50) * 50;
+        }
+        match self.keyframes.binary_search(&target) {
+            Ok(idx) => self.keyframes[idx],
+            Err(idx) => {
+                if idx == 0 {
+                    self.keyframes[0]
+                } else {
+                    self.keyframes[idx - 1]
+                }
+            }
+        }
     }
 
     pub fn current_time(&self) -> f64 {
@@ -193,8 +215,7 @@ impl PlaybackController {
 
         // Expected is target frame or nearest keyframe
         let expected = if keyframe_only {
-            // Note: tests will stub/simulate keyframes. For fallback, keyframe every 50 frames
-            (clamped / 50) * 50
+            self.nearest_keyframe(clamped)
         } else {
             clamped
         };
@@ -314,7 +335,11 @@ impl PlaybackController {
             }
         }
 
-        let current_frame = self.latest_frame.as_ref().map(|f| f.frame_idx()).unwrap_or(0);
+        let current_frame = if self.is_playing {
+            (master_time * self.fps) as usize
+        } else {
+            self.latest_frame.as_ref().map(|f| f.frame_idx()).unwrap_or(0)
+        };
 
         PlaybackStateView {
             frame_to_render: self.latest_frame.as_ref(),
@@ -383,9 +408,7 @@ impl PlaybackController {
         let media_source = Box::new(FfmpegMediaSource::new(engine, frame_rx));
 
         self.load_source_with_adapters(metadata.clone(), audio_backend, media_source)?;
-        
-        // Prevent compiler warnings about unused audio engine
-        let _ = audio_engine;
+        self._audio_engine = audio_engine;
 
         Ok(metadata)
     }
@@ -445,6 +468,24 @@ mod tests {
         // Verify the latest seek (40) gets dispatched, skipping 30
         let cmd2 = cmd_rx.try_recv().unwrap();
         assert!(matches!(cmd2, crate::media::MediaCommand::Seek { frame_index: 40, keyframe_only: true, .. }));
+    }
+
+    #[test]
+    fn test_nearest_keyframe() {
+        let mut controller = PlaybackController::new();
+        
+        // Test with empty keyframes list
+        assert_eq!(controller.nearest_keyframe(25), 0);
+        assert_eq!(controller.nearest_keyframe(75), 50);
+
+        // Test with populated keyframes list
+        controller.keyframes = vec![0, 50, 100];
+        assert_eq!(controller.nearest_keyframe(0), 0);
+        assert_eq!(controller.nearest_keyframe(25), 0);
+        assert_eq!(controller.nearest_keyframe(50), 50);
+        assert_eq!(controller.nearest_keyframe(75), 50);
+        assert_eq!(controller.nearest_keyframe(100), 100);
+        assert_eq!(controller.nearest_keyframe(120), 100);
     }
 }
 
