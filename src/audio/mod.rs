@@ -53,6 +53,16 @@ impl AudioPlaybackState {
         self.audio_paused_for_sync.store(true, Ordering::SeqCst);
         self.should_flush.store(true, Ordering::SeqCst);
     }
+
+    /// Update the clock position without flushing audio or touching sync flags.
+    /// Use during scrubbing (audio_enabled = false) to avoid draining the CPAL ring buffer
+    /// on every frame step.
+    pub fn set_position(&self, time_seconds: f64) {
+        let time_us = (time_seconds * 1_000_000.0) as u64;
+        self.current_position_us.store(time_us, Ordering::Relaxed);
+        self.fallback_base_us.store(time_us, Ordering::Relaxed);
+        self.fallback_start_us.store(0, Ordering::Relaxed); // ensure fallback clock is stopped
+    }
 }
 
 pub struct AudioEngine {

@@ -52,3 +52,16 @@ _Avoid_: GPU cache, texture cache
 The data structure passed from the Media Engine to the UI Thread representing a decoded video frame. It contains either CPU-resident YUV Planes or a platform-specific GPU frame descriptor.
 _Avoid_: Video frame payload, raw texture handle
 
+**Scrub Loop**:
+The request-driven cycle that governs seek dispatch during timeline scrubbing. One keyframe seek is outstanding at a time; the next seek is only issued once a DecodedFrame carrying the current sequence ID arrives. On drag end, a single precise seek with audio priming settles the final position.
+_Avoid_: Repaint-driven scrubbing, debounced scrubbing
+
+**Desired Scrub Frame**:
+The most recent scrubber position recorded by the UI Thread while a seek is in flight. When the in-flight seek completes, the Scrub Loop compares this value against the last-sent frame index to decide whether to issue another seek.
+_Avoid_: Pending seek target, buffered scrub position
+
+**PlaybackController**:
+The deep module that coordinates video loading, playback state, request-driven timeline scrubbing, and real-time audio-video synchronization.
+_Avoid_: Playback manager, sync service
+
+

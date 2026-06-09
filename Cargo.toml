@@ -22,3 +22,10 @@ debug-assertions = false
 
 [profile.dev.package.icrate]
 debug-assertions = false
+
+# Optimize all dependencies in dev mode for smooth real-time video playback and scrubbing
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
