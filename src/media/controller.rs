@@ -115,7 +115,6 @@ pub struct PlaybackController {
     desired_scrub_frame: Option<usize>,
     latest_frame: Option<DecodedFrame>,
     future_frame: Option<DecodedFrame>,
-    drift_history: std::collections::VecDeque<f32>,
     is_playing: bool,
     fps: f64,
     total_frames: usize,
@@ -132,7 +131,6 @@ impl PlaybackController {
             desired_scrub_frame: None,
             latest_frame: None,
             future_frame: None,
-            drift_history: std::collections::VecDeque::with_capacity(60),
             is_playing: false,
             fps: 24.0,
             total_frames: 0,
@@ -172,16 +170,6 @@ impl PlaybackController {
         self.audio_backend.sample_rate()
     }
 
-    fn nearest_keyframe(&self, target: usize, keyframes: &[usize]) -> usize {
-        if keyframes.is_empty() {
-            return target;
-        }
-        match keyframes.binary_search(&target) {
-            Ok(i) => keyframes[i],
-            Err(0) => keyframes[0],
-            Err(i) => keyframes[i - 1],
-        }
-    }
 
     pub fn is_seek_in_flight(&self) -> bool {
         if self.latest_sequence_id == 0 {

@@ -2,7 +2,6 @@ pub mod yuv_renderer;
 
 use crate::media;
 use crossbeam_channel::Receiver;
-use ringbuf::traits::Split;
 use eframe::egui;
 use eframe::egui::Color32;
 
@@ -160,21 +159,6 @@ impl MainApp {
         self.current_frame = view.current_frame;
         if let Some(frame) = view.frame_to_render {
             self.latest_frame = Some(frame.clone());
-        }
-    }
-
-    fn nearest_keyframe(&self, target: usize) -> usize {
-        if let Some(ref meta) = self.metadata {
-            if meta.keyframes.is_empty() {
-                return target;
-            }
-            match meta.keyframes.binary_search(&target) {
-                Ok(i) => meta.keyframes[i],
-                Err(0) => meta.keyframes[0],
-                Err(i) => meta.keyframes[i - 1],
-            }
-        } else {
-            target
         }
     }
 }
@@ -711,7 +695,6 @@ impl eframe::App for MainApp {
             self.show_debug_hud = !self.show_debug_hud;
         }
 
-        let previous_frame = self.current_frame;
 
         // 1. Gather play/seek commands from UI events
         let mut cmd = None;
@@ -739,11 +722,17 @@ impl eframe::App for MainApp {
         // 2. Tick the controller facade
         let view = self.playback_controller.tick(cmd);
 
+        // Extract/clone required values to end borrow of self.playback_controller immediately
+        let view_is_playing = view.is_playing;
+        let view_current_frame = view.current_frame;
+        let view_current_time = view.current_time;
+        let frame_to_render = view.frame_to_render.cloned();
+
         // 3. Map status view properties to UI state
-        self.is_playing = view.is_playing;
-        self.current_frame = view.current_frame;
+        self.is_playing = view_is_playing;
+        self.current_frame = view_current_frame;
         
-        if let Some(frame) = view.frame_to_render {
+        if let Some(ref frame) = frame_to_render {
             self.latest_frame = Some(frame.clone());
         }
 
@@ -753,8 +742,8 @@ impl eframe::App for MainApp {
         }
 
         // Calculate drift and populate drift_history for diagnostic HUD
-        let video_time = view.frame_to_render.map_or(view.current_frame as f64 / self.video_fps, |f| f.pts_sec());
-        let drift = view.current_time - video_time;
+        let video_time = frame_to_render.as_ref().map_or(view_current_frame as f64 / self.video_fps, |f| f.pts_sec());
+        let drift = view_current_time - video_time;
         self.drift_history.push_back(drift as f32);
         if self.drift_history.len() > 60 {
             self.drift_history.pop_front();
