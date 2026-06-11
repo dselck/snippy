@@ -1782,7 +1782,7 @@ impl eframe::App for MainApp {
 }
 
 struct YuvCallback {
-    planes: media::YuvPlanes,
+    planes: std::sync::Arc<media::YuvPlanes>,
 }
 
 impl eframe::egui_wgpu::CallbackTrait for YuvCallback {
