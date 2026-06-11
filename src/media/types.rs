@@ -31,7 +31,7 @@ pub struct YuvPlanes {
 pub enum DecodedFrame {
     Cpu {
         frame_idx: usize,
-        planes: YuvPlanes,
+        planes: std::sync::Arc<YuvPlanes>,
         sequence_id: usize,
         pts_sec: f64,
     },
