@@ -6,129 +6,21 @@ use ringbuf::wrap::CachingProd;
 use ringbuf::storage::Heap;
 use ringbuf::SharedRb;
 use ringbuf::traits::*;
-use ffmpeg_next::software::resampling::context::Context as ResamplerContext;
-use ffmpeg_next::format::Sample;
-use ffmpeg_next::ChannelLayout;
 
-pub mod controller;
+pub mod types;
+pub mod cache;
 
-#[derive(Clone, Debug)]
-pub enum GpuFrameDescriptor {
-    CVPixelBuffer(*const std::ffi::c_void),
-    D3D11Texture(*const std::ffi::c_void),
-    Dmabuf {
-        fd: std::os::fd::RawFd,
-        width: u32,
-        height: u32,
-        format: u32,
-    },
-}
+pub mod decoder_pipeline;
+pub mod ffmpeg_adapter;
+pub mod audio_pipeline;
+pub mod sync;
 
-// SAFETY: GpuFrameDescriptor transfers raw GPU resource handles across threads.
-// The pointers are only used as handles to bind to graphics contexts.
-unsafe impl Send for GpuFrameDescriptor {}
-unsafe impl Sync for GpuFrameDescriptor {}
-
-#[derive(Debug, Clone)]
-pub struct CachedFrame {
-    pub planes: YuvPlanes,
-    pub pts_sec: f64,
-}
-
-pub struct GopCache {
-    pub keyframe_idx: usize,
-    pub frames: std::collections::HashMap<usize, CachedFrame>,
-}
-
-#[derive(Clone, Debug)]
-pub enum DecodedFrame {
-    Cpu {
-        frame_idx: usize,
-        planes: YuvPlanes,
-        sequence_id: usize,
-        pts_sec: f64,
-    },
-    Gpu {
-        frame_idx: usize,
-        descriptor: GpuFrameDescriptor,
-        sequence_id: usize,
-        pts_sec: f64,
-    },
-}
-
-impl DecodedFrame {
-    pub fn frame_idx(&self) -> usize {
-        match self {
-            DecodedFrame::Cpu { frame_idx, .. } => *frame_idx,
-            DecodedFrame::Gpu { frame_idx, .. } => *frame_idx,
-        }
-    }
-
-    pub fn sequence_id(&self) -> usize {
-        match self {
-            DecodedFrame::Cpu { sequence_id, .. } => *sequence_id,
-            DecodedFrame::Gpu { sequence_id, .. } => *sequence_id,
-        }
-    }
-
-    pub fn pts_sec(&self) -> f64 {
-        match self {
-            DecodedFrame::Cpu { pts_sec, .. } => *pts_sec,
-            DecodedFrame::Gpu { pts_sec, .. } => *pts_sec,
-        }
-    }
-}
-
-#[derive(Clone, Default, Debug)]
-
-pub struct YuvPlanes {
-    pub y: Vec<u8>,
-    pub u: Vec<u8>,
-    pub v: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-    pub y_stride: u32,
-    pub u_stride: u32,
-    pub v_stride: u32,
-}
-
-pub enum MediaCommand {
-    Play,
-    Pause,
-    Seek {
-        frame_index: usize,
-        keyframe_only: bool,
-        sequence_id: usize,
-        audio_enabled: bool,
-    },
-    Shutdown,
-}
-
-pub enum VideoThreadCommand {
-    Seek {
-        frame_index: usize,
-        keyframe_only: bool,
-        sequence_id: usize,
-        audio_enabled: bool,
-        resp_tx: Sender<bool>,
-    },
-    Play,
-}
-
-pub enum AudioThreadCommand {
-    Seek { target_time: f64, resp_tx: Sender<()> },
-}
-
-#[derive(Clone, Debug)]
-pub struct VideoMetadata {
-    pub total_frames: usize,
-    pub width: u32,
-    pub height: u32,
-    pub fps: f64,
-    pub has_audio: bool,
-    pub keyframes: Vec<usize>,
-    pub keyframes_pts: Vec<i64>,
-}
+pub use crate::media::types::*;
+pub use crate::media::cache::*;
+pub use crate::media::decoder_pipeline::*;
+pub use crate::media::ffmpeg_adapter::*;
+pub use crate::media::audio_pipeline::*;
+pub use crate::media::sync::*;
 
 pub struct MediaEngine {
     pub tx: Sender<MediaCommand>,
@@ -141,17 +33,15 @@ impl MediaEngine {
         target_sample_rate: u32,
         target_channels: usize,
         frame_tx: Sender<DecodedFrame>,
-        audio_tx: CachingProd<Arc<SharedRb<Heap<f32>>>>,
+        audio_tx: CachingProd<Arc<SharedRb<Heap<(f32, u64)>>>>,
         tags_tx: CachingProd<Arc<SharedRb<Heap<(u64, u64)>>>>,
         cmd_rx: Receiver<MediaCommand>,
-        playback_state: Arc<crate::audio::AudioPlaybackState>,
+        master_clock: crate::audio::clock::MasterClock,
     ) -> Result<(Self, VideoMetadata), anyhow::Error> {
-        // Initialize FFmpeg
         ffmpeg_next::init()?;
 
         let path_str = path.as_ref().to_string_lossy().to_string();
 
-        // 1. Read metadata synchronously first to confirm the file is valid
         let input = ffmpeg_next::format::input(&path_str)?;
         let stream = input
             .streams()
@@ -175,7 +65,6 @@ impl MediaEngine {
             total_frames = (duration_secs * fps).round() as usize;
         }
 
-        // Scan keyframes synchronously
         let (keyframes, keyframes_pts) = {
             let mut scan = ffmpeg_next::format::input(&path_str)?;
             let video_stream_idx = stream.index();
@@ -208,11 +97,11 @@ impl MediaEngine {
             keyframes_pts: keyframes_pts.clone(),
         };
 
-        // 2. Spawn the background Media Engine decoding loop
         let (cmd_tx, background_rx) = crossbeam_channel::unbounded();
         let fps_clone = metadata.fps;
-        let playback_state_clone = Arc::clone(&playback_state);
+        let master_clock_clone = master_clock.clone();
         let keyframes_pts_clone = metadata.keyframes_pts.clone();
+        
         let thread_handle = thread::spawn(move || {
             let _ = run_decoding_loop(
                 &path_str,
@@ -224,7 +113,7 @@ impl MediaEngine {
                 background_rx,
                 cmd_rx,
                 fps_clone,
-                playback_state_clone,
+                master_clock_clone,
                 keyframes,
                 keyframes_pts_clone,
             );
@@ -240,23 +129,31 @@ impl MediaEngine {
     }
 }
 
-
+fn get_nearest_keyframe(keyframes: &[usize], target: usize) -> usize {
+    if keyframes.is_empty() {
+        return target;
+    }
+    match keyframes.binary_search(&target) {
+        Ok(i) => keyframes[i],
+        Err(0) => keyframes[0],
+        Err(i) => keyframes[i - 1],
+    }
+}
 
 fn run_decoding_loop(
     path: &str,
     target_sample_rate: u32,
     target_channels: usize,
     frame_tx: Sender<DecodedFrame>,
-    mut audio_tx: CachingProd<Arc<SharedRb<Heap<f32>>>>,
+    mut audio_tx: CachingProd<Arc<SharedRb<Heap<(f32, u64)>>>>,
     mut tags_tx: CachingProd<Arc<SharedRb<Heap<(u64, u64)>>>>,
     background_rx: Receiver<MediaCommand>,
     _cmd_rx: Receiver<MediaCommand>,
     fps: f64,
-    playback_state: Arc<crate::audio::AudioPlaybackState>,
+    master_clock: crate::audio::clock::MasterClock,
     keyframes: Vec<usize>,
     keyframes_pts: Vec<i64>,
 ) -> Result<(), anyhow::Error> {
-    let mut audio_enabled = true;
     let mut input = ffmpeg_next::format::input(&path)?;
 
     let video_stream = input
@@ -268,822 +165,220 @@ fn run_decoding_loop(
     let audio_stream_opt = input.streams().best(ffmpeg_next::media::Type::Audio);
     let audio_stream_idx_opt = audio_stream_opt.as_ref().map(|s| s.index());
 
-    // Channels for routing raw packets to decoder threads
-    let (video_packet_tx, video_packet_rx) = crossbeam_channel::bounded::<ffmpeg_next::Packet>(32);
-    let (audio_packet_tx, audio_packet_rx) = crossbeam_channel::unbounded::<ffmpeg_next::Packet>();
-    let (video_cmd_tx, video_cmd_rx) = crossbeam_channel::bounded::<VideoThreadCommand>(1);
-    let (audio_cmd_tx, audio_cmd_rx) = crossbeam_channel::bounded::<AudioThreadCommand>(1);
-
-    // Spawn Video Decoder Thread
-    let video_codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(video_stream.parameters())?;
-    let mut video_decoder = video_codec_ctx.decoder().video()?;
-    let frame_tx_clone = frame_tx.clone();
-    let time_base = video_stream.time_base();
-    let time_base_f64 = time_base.numerator() as f64 / time_base.denominator() as f64;
-    let video_start_time = if video_stream.start_time() > -1_000_000_000_000 {
-        video_stream.start_time() as f64 * time_base_f64
-    } else {
-        0.0
-    };
-    
-    let video_thread_keyframes = keyframes.clone();
-    let video_thread = thread::spawn(move || {
-        let keyframes = video_thread_keyframes;
-        let mut gop_cache = GopCache {
-            keyframe_idx: usize::MAX,
-            frames: std::collections::HashMap::new(),
+    let mut video_pipeline = {
+        let video_codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(video_stream.parameters())?;
+        let video_decoder = video_codec_ctx.decoder().video()?;
+        let time_base = video_stream.time_base();
+        let time_base_f64 = time_base.numerator() as f64 / time_base.denominator() as f64;
+        let video_start_time = if video_stream.start_time() > -1_000_000_000_000 {
+            video_stream.start_time() as f64 * time_base_f64
+        } else {
+            0.0
         };
+        let adapter = Box::new(crate::media::ffmpeg_adapter::FfmpegDecoderAdapter::new(
+            video_decoder,
+            time_base_f64,
+            video_start_time,
+            fps,
+        ));
+        crate::media::decoder_pipeline::VideoDecoderPipeline::new(adapter, keyframes.clone())
+    };
 
-        let mut fallback_frame_idx = 0;
-        let mut scaler: Option<ffmpeg_next::software::scaling::context::Context> = None;
-
-        let mut keyframe_only_mode = false;
-        let mut decode_more = true;
-        let mut current_sequence_id = 0;
-        let mut last_decoded_frame: Option<usize> = None;
-        let mut play_mode = false;
-        let mut seek_target_frame: Option<usize> = None;
-
-        loop {
-            if decode_more {
-                crossbeam_channel::select! {
-                    recv(video_packet_rx) -> packet_res => {
-                        if let Ok(packet) = packet_res {
-                            if video_decoder.send_packet(&packet).is_ok() {
-                                let mut frame = ffmpeg_next::util::frame::Video::empty();
-                                while video_decoder.receive_frame(&mut frame).is_ok() {
-                                    let mut scaled_frame = ffmpeg_next::util::frame::Video::empty();
-                                    let video_frame = if frame.format() != ffmpeg_next::format::Pixel::YUV420P {
-                                        let s = match scaler {
-                                            Some(ref mut s) if s.input().format == frame.format()
-                                                && s.input().width == frame.width()
-                                                && s.input().height == frame.height() => s,
-                                            _ => {
-                                                let new_s = ffmpeg_next::software::scaling::context::Context::get(
-                                                    frame.format(),
-                                                    frame.width(),
-                                                    frame.height(),
-                                                    ffmpeg_next::format::Pixel::YUV420P,
-                                                    frame.width(),
-                                                    frame.height(),
-                                                    ffmpeg_next::software::scaling::flag::Flags::BILINEAR,
-                                                ).unwrap();
-                                                scaler = Some(new_s);
-                                                scaler.as_mut().unwrap()
-                                            }
-                                        };
-                                        s.run(&frame, &mut scaled_frame).unwrap();
-                                        &scaled_frame
-                                    } else {
-                                        &frame
-                                    };
-
-                                    let w = video_frame.width();
-                                    let h = video_frame.height();
-                                    
-                                    let planes = YuvPlanes {
-                                        y: video_frame.data(0).to_vec(),
-                                        u: video_frame.data(1).to_vec(),
-                                        v: video_frame.data(2).to_vec(),
-                                        width: w,
-                                        height: h,
-                                        y_stride: video_frame.stride(0) as u32,
-                                        u_stride: video_frame.stride(1) as u32,
-                                        v_stride: video_frame.stride(2) as u32,
-                                    };
-
-                                    let pts_sec = match frame.pts() {
-                                        Some(pts_val) => {
-                                            pts_val as f64 * time_base_f64 - video_start_time
-                                        }
-                                        None => fallback_frame_idx as f64 / fps,
-                                    };
-                                    let frame_idx = (pts_sec * fps).round() as usize;
-                                    fallback_frame_idx = frame_idx + 1;
-
-                                    if keyframes.binary_search(&frame_idx).is_ok() {
-                                        if gop_cache.keyframe_idx != frame_idx {
-                                            gop_cache.frames.clear();
-                                            gop_cache.keyframe_idx = frame_idx;
-                                        }
-                                    }
-                                    if gop_cache.keyframe_idx == usize::MAX {
-                                        gop_cache.keyframe_idx = get_nearest_keyframe(&keyframes, frame_idx);
-                                    }
-                                    if frame_idx >= gop_cache.keyframe_idx {
-                                        gop_cache.frames.insert(frame_idx, CachedFrame {
-                                            planes: planes.clone(),
-                                            pts_sec,
-                                        });
-                                    }
-
-                                    let decoded = DecodedFrame::Cpu {
-                                        frame_idx,
-                                        planes: planes.clone(),
-                                        sequence_id: current_sequence_id,
-                                        pts_sec,
-                                    };
-                                    
-
-                                    
-                                    let mut sent = false;
-                                    crossbeam_channel::select! {
-                                        send(frame_tx_clone, decoded) -> res => {
-                                            if res.is_ok() {
-                                                sent = true;
-                                            }
-                                        }
-                                        recv(video_cmd_rx) -> cmd_res => {
-                                            if let Ok(cmd) = cmd_res {
-                                                match cmd {
-                                                     VideoThreadCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae, resp_tx } => {
-                                                         let target_kf = get_nearest_keyframe(&keyframes, frame_index);
-                                                         if gop_cache.keyframe_idx != target_kf {
-                                                             gop_cache.frames.clear();
-                                                             gop_cache.keyframe_idx = target_kf;
-                                                         }
-
-                                                         let mut handled = false;
-                                                         if !ae {
-                                                             // 1. Check GOP cache first
-                                                             if let Some(cached) = gop_cache.frames.get(&frame_index) {
-                                                                 let decoded = DecodedFrame::Cpu {
-                                                                     frame_idx: frame_index,
-                                                                     planes: cached.planes.clone(),
-                                                                     sequence_id,
-                                                                     pts_sec: cached.pts_sec,
-                                                                 };
-                                                                 if frame_tx_clone.send(decoded).is_ok() {
-                                                                     let _ = resp_tx.send(true);
-                                                                     fallback_frame_idx = frame_index;
-                                                                     keyframe_only_mode = keyframe_only;
-                                                                     current_sequence_id = sequence_id;
-                                                                     decode_more = false;
-                                                                     play_mode = false;
-                                                                     seek_target_frame = None;
-                                                                     last_decoded_frame = None;
-                                                                     handled = true;
-                                                                 }
-                                                             }
-                                                             // 2. Check sequential fast path
-                                                             if !handled {
-                                                                 if let Some(last) = last_decoded_frame {
-                                                                     if frame_index >= last + 1 && frame_index <= last + 5 {
-                                                                         let _ = resp_tx.send(true);
-                                                                         fallback_frame_idx = frame_index;
-                                                                         keyframe_only_mode = keyframe_only;
-                                                                         current_sequence_id = sequence_id;
-                                                                         decode_more = true;
-                                                                         play_mode = false;
-                                                                         seek_target_frame = Some(frame_index);
-                                                                         handled = true;
-                                                                     }
-                                                                 }
-                                                             }
-                                                         }
-
-                                                         if !handled {
-                                                             fallback_frame_idx = frame_index;
-                                                             keyframe_only_mode = keyframe_only;
-                                                             current_sequence_id = sequence_id;
-                                                             play_mode = false;
-                                                             seek_target_frame = Some(frame_index);
-                                                             while video_packet_rx.try_recv().is_ok() {}
-                                                             video_decoder.flush();
-                                                             let _ = resp_tx.send(false);
-                                                             decode_more = true;
-                                                             last_decoded_frame = None;
-                                                         }
-                                                     }
-                                                     VideoThreadCommand::Play => {
-                                                         play_mode = true;
-                                                         seek_target_frame = None;
-                                                         keyframe_only_mode = false;
-                                                         decode_more = true;
-                                                     }
-                                                }
-                                                break; // break the receive_frame loop
-                                            } else {
-                                                return;
-                                            }
-                                        }
-                                    }
-
-                                    if !sent {
-                                        break; // abort further decoding for the current packet
-                                    }
-
-                                    last_decoded_frame = Some(frame_idx);
-
-                                    if !play_mode {
-                                        if let Some(target) = seek_target_frame {
-                                            if frame_idx >= target {
-                                                decode_more = false;
-                                                seek_target_frame = None;
-                                                break;
-                                            }
-                                        }
-                                    }
-
-                                    if keyframe_only_mode {
-                                        decode_more = false;
-                                        break;
-                                    }
-                                }
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    recv(video_cmd_rx) -> cmd_res => {
-                        match cmd_res {
-                            Ok(VideoThreadCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae, resp_tx }) => {
-                                let target_kf = get_nearest_keyframe(&keyframes, frame_index);
-                                if gop_cache.keyframe_idx != target_kf {
-                                    gop_cache.frames.clear();
-                                    gop_cache.keyframe_idx = target_kf;
-                                }
-
-                                let mut handled = false;
-                                if !ae {
-                                    // 1. Check GOP cache first
-                                    if let Some(cached) = gop_cache.frames.get(&frame_index) {
-                                        let decoded = DecodedFrame::Cpu {
-                                            frame_idx: frame_index,
-                                            planes: cached.planes.clone(),
-                                            sequence_id,
-                                            pts_sec: cached.pts_sec,
-                                        };
-                                        if frame_tx_clone.send(decoded).is_ok() {
-                                            let _ = resp_tx.send(true);
-                                            fallback_frame_idx = frame_index;
-                                            keyframe_only_mode = keyframe_only;
-                                            current_sequence_id = sequence_id;
-                                            decode_more = false;
-                                            play_mode = false;
-                                            seek_target_frame = None;
-                                            last_decoded_frame = None;
-                                            handled = true;
-                                        }
-                                    }
-                                    // 2. Check sequential fast path
-                                    if !handled {
-                                        if let Some(last) = last_decoded_frame {
-                                            if frame_index >= last + 1 && frame_index <= last + 5 {
-                                                let _ = resp_tx.send(true);
-                                                fallback_frame_idx = frame_index;
-                                                keyframe_only_mode = keyframe_only;
-                                                current_sequence_id = sequence_id;
-                                                decode_more = true;
-                                                play_mode = false;
-                                                seek_target_frame = Some(frame_index);
-                                                handled = true;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if !handled {
-                                    fallback_frame_idx = frame_index;
-                                    keyframe_only_mode = keyframe_only;
-                                    current_sequence_id = sequence_id;
-                                    play_mode = false;
-                                    seek_target_frame = Some(frame_index);
-                                    while video_packet_rx.try_recv().is_ok() {}
-                                    video_decoder.flush();
-                                    let _ = resp_tx.send(false);
-                                    decode_more = true;
-                                    last_decoded_frame = None;
-                                }
-                            }
-                            Ok(VideoThreadCommand::Play) => {
-                                play_mode = true;
-                                seek_target_frame = None;
-                                keyframe_only_mode = false;
-                                decode_more = true;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                }
-            } else {
-                match video_cmd_rx.recv() {
-                    Ok(VideoThreadCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae, resp_tx }) => {
-                        let target_kf = get_nearest_keyframe(&keyframes, frame_index);
-                        if gop_cache.keyframe_idx != target_kf {
-                            gop_cache.frames.clear();
-                            gop_cache.keyframe_idx = target_kf;
-                        }
-
-                        let mut handled = false;
-                        if !ae {
-                            // 1. Check GOP cache first
-                            if let Some(cached) = gop_cache.frames.get(&frame_index) {
-                                let decoded = DecodedFrame::Cpu {
-                                    frame_idx: frame_index,
-                                    planes: cached.planes.clone(),
-                                    sequence_id,
-                                    pts_sec: cached.pts_sec,
-                                };
-                                if frame_tx_clone.send(decoded).is_ok() {
-                                    let _ = resp_tx.send(true);
-                                    fallback_frame_idx = frame_index;
-                                    keyframe_only_mode = keyframe_only;
-                                    current_sequence_id = sequence_id;
-                                    decode_more = false;
-                                    play_mode = false;
-                                    seek_target_frame = None;
-                                    last_decoded_frame = None;
-                                    handled = true;
-                                }
-                            }
-                            // 2. Check sequential fast path
-                            if !handled {
-                                if let Some(last) = last_decoded_frame {
-                                    if frame_index >= last + 1 && frame_index <= last + 5 {
-                                        let _ = resp_tx.send(true);
-                                        fallback_frame_idx = frame_index;
-                                        keyframe_only_mode = keyframe_only;
-                                        current_sequence_id = sequence_id;
-                                        decode_more = true;
-                                        play_mode = false;
-                                        seek_target_frame = Some(frame_index);
-                                        handled = true;
-                                    }
-                                }
-                            }
-                        }
-
-                        if !handled {
-                            fallback_frame_idx = frame_index;
-                            keyframe_only_mode = keyframe_only;
-                            current_sequence_id = sequence_id;
-                            play_mode = false;
-                            seek_target_frame = Some(frame_index);
-                            while video_packet_rx.try_recv().is_ok() {}
-                            video_decoder.flush();
-                            let _ = resp_tx.send(false);
-                            decode_more = true;
-                            last_decoded_frame = None;
-                        }
-                    }
-                    Ok(VideoThreadCommand::Play) => {
-                        play_mode = true;
-                        seek_target_frame = None;
-                        keyframe_only_mode = false;
-                        decode_more = true;
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-    });
-
-    // Spawn Audio Decoder Thread
-    let audio_thread_opt = if let Some(ref stream) = audio_stream_opt {
+    let mut audio_pipeline_opt = if let Some(ref stream) = audio_stream_opt {
         let audio_codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())?;
-        let mut audio_decoder = audio_codec_ctx.decoder().audio()?;
+        let audio_decoder = audio_codec_ctx.decoder().audio()?;
         let audio_time_base = stream.time_base();
         let audio_tb_f64 = audio_time_base.numerator() as f64 / audio_time_base.denominator() as f64;
-        
-        let audio_thread = thread::spawn(move || {
-            let mut resampler: Option<ResamplerContext> = None;
-            let mut skip_until_time = 0.0;
-            let mut is_first_audio_frame = true;
-            let mut current_audio_time = 0.0;
-            let mut frames_written_total = 0u64;
-
-            macro_rules! handle_audio_seek {
-                ($target_time:expr, $resp_tx:expr) => {
-                    while audio_packet_rx.try_recv().is_ok() {}
-                    audio_decoder.flush();
-                    resampler = None;
-                    skip_until_time = $target_time;
-                    is_first_audio_frame = true;
-                    current_audio_time = video_start_time + $target_time;
-                    frames_written_total = 0;
-                    playback_state.should_flush.store(true, std::sync::atomic::Ordering::SeqCst);
-                    if playback_state.has_audio.load(std::sync::atomic::Ordering::SeqCst) {
-                        let mut wait_count = 0;
-                        while playback_state.should_flush.load(std::sync::atomic::Ordering::SeqCst) {
-                            thread::sleep(std::time::Duration::from_millis(1));
-                            wait_count += 1;
-                            if wait_count > 100 {
-                                playback_state.should_flush.store(false, std::sync::atomic::Ordering::SeqCst);
-                                break;
-                            }
-                        }
-                    }
-                    let _ = $resp_tx.send(());
-                };
-            }
-
-            loop {
-                if let Ok(AudioThreadCommand::Seek { target_time, resp_tx }) = audio_cmd_rx.try_recv() {
-                    handle_audio_seek!(target_time, resp_tx);
-                    continue;
-                }
-
-                crossbeam_channel::select! {
-                    recv(audio_packet_rx) -> packet_res => {
-                        if let Ok(packet) = packet_res {
-                            if is_first_audio_frame {
-                                if let Some(pts) = packet.pts() {
-                                    current_audio_time = pts as f64 * audio_tb_f64;
-                                }
-                            }
-                            if audio_decoder.send_packet(&packet).is_ok() {
-                                    let mut seek_aborted = false;
-                                    let mut frame = ffmpeg_next::util::frame::Audio::empty();
-                                     while audio_decoder.receive_frame(&mut frame).is_ok() {
-                                          if let Ok(AudioThreadCommand::Seek { target_time, resp_tx }) = audio_cmd_rx.try_recv() {
-                                              handle_audio_seek!(target_time, resp_tx);
-                                              break;
-                                          }
-
-                                         let duration_sec = frame.samples() as f64 / frame.rate() as f64;
-                                         let pts_sec = match frame.pts() {
-                                             Some(pts) => pts as f64 * audio_tb_f64,
-                                             None => current_audio_time,
-                                         };
-                                         current_audio_time = pts_sec + duration_sec;
-
-                                         if is_first_audio_frame {
-                                             let target_container_time = video_start_time + skip_until_time;
-                                             if pts_sec + duration_sec <= target_container_time {
-                                                 continue; // Discard whole frame before seek target
-                                             }
-                                         }
-
-                                         let r = match resampler {
-                                             Some(ref mut r) if r.input().format == frame.format()
-                                                 && r.input().channel_layout == frame.channel_layout()
-                                                 && r.input().rate == frame.rate() => r,
-                                             _ => {
-                                                 let target_layout = if target_channels == 1 {
-                                                     ChannelLayout::MONO
-                                                 } else {
-                                                     ChannelLayout::STEREO
-                                                 };
-                                                 
-                                                 let new_r = ResamplerContext::get(
-                                                     frame.format(),
-                                                     frame.channel_layout(),
-                                                     frame.rate(),
-                                                     Sample::F32(ffmpeg_next::format::sample::Type::Packed),
-                                                     target_layout,
-                                                     target_sample_rate,
-                                                 ).unwrap();
-                                                 resampler = Some(new_r);
-                                                 resampler.as_mut().unwrap()
-                                             }
-                                         };
-
-                                         let mut resampled = ffmpeg_next::util::frame::Audio::empty();
-                                         if r.run(&frame, &mut resampled).is_ok() {
-                                             let sample_count = resampled.samples();
-                                             if sample_count > 0 {
-                                                 let byte_count = sample_count * target_channels * 4;
-                                                 let mut data: &[f32] = bytemuck::cast_slice(&resampled.data(0)[..byte_count]);
-                                                 
-                                                 if is_first_audio_frame {
-                                                     let target_container_time = video_start_time + skip_until_time;
-                                                     if pts_sec < target_container_time {
-                                                         // Trim overlap
-                                                         let overlap_sec = target_container_time - pts_sec;
-                                                         let discard_samples = (overlap_sec * target_sample_rate as f64).round() as usize;
-                                                         if discard_samples < data.len() {
-                                                             data = &data[discard_samples..];
-                                                             let pts_us = (skip_until_time.max(0.0) * 1_000_000.0) as u64;
-                                                             let _ = tags_tx.try_push((frames_written_total, pts_us));
-                                                         } else {
-                                                             continue;
-                                                         }
-                                                     } else {
-                                                         // Gap: Pad with silence or handle large gap
-                                                         let gap_sec = pts_sec - target_container_time;
-                                                         if gap_sec <= 0.15 {
-                                                             let pad_samples = (gap_sec * target_sample_rate as f64).round() as usize;
-                                                             let pts_us = (skip_until_time.max(0.0) * 1_000_000.0) as u64;
-                                                             let _ = tags_tx.try_push((frames_written_total, pts_us));
-                                                             
-                                                             for _ in 0..pad_samples {
-                                                                 while audio_tx.try_push(0.0).is_err() {
-                                                                     if let Ok(cmd) = audio_cmd_rx.try_recv() {
-                                                                         match cmd {
-                                                                             AudioThreadCommand::Seek { target_time, resp_tx } => {
-                                                                                 handle_audio_seek!(target_time, resp_tx);
-                                                                                 seek_aborted = true;
-                                                                                 break;
-                                                                             }
-                                                                         }
-                                                                     }
-                                                                     thread::sleep(std::time::Duration::from_millis(5));
-                                                                 }
-                                                                 if seek_aborted {
-                                                                     break;
-                                                                 }
-                                                             }
-                                                             if seek_aborted {
-                                                                 break;
-                                                             }
-                                                             frames_written_total += pad_samples as u64;
-                                                         } else {
-                                                             // Large Gap: No padding, tag at actual PTS
-                                                             let pts_us = ((pts_sec - video_start_time).max(0.0) * 1_000_000.0) as u64;
-                                                             let _ = tags_tx.try_push((frames_written_total, pts_us));
-                                                         }
-                                                     }
-                                                     is_first_audio_frame = false;
-                                                 } else {
-                                                     let pts_us = ((pts_sec - video_start_time).max(0.0) * 1_000_000.0) as u64;
-                                                     let _ = tags_tx.try_push((frames_written_total, pts_us));
-                                                 }
-
-                                                 for &sample in data {
-                                                     while audio_tx.try_push(sample).is_err() {
-                                                         if let Ok(cmd) = audio_cmd_rx.try_recv() {
-                                                             match cmd {
-                                                                 AudioThreadCommand::Seek { target_time, resp_tx } => {
-                                                                     handle_audio_seek!(target_time, resp_tx);
-                                                                     seek_aborted = true;
-                                                                     break;
-                                                                 }
-                                                             }
-                                                         }
-                                                         thread::sleep(std::time::Duration::from_millis(5));
-                                                     }
-                                                     if seek_aborted {
-                                                         break;
-                                                     }
-                                                 }
-                                                 if !seek_aborted {
-                                                     frames_written_total += data.len() as u64;
-                                                 }
-                                             }
-                                         }
-
-                                         if seek_aborted {
-                                             break;
-                                         }
-                                     }
-                                }
-                            } else {
-                                break;
-                            }
-                    }
-                    recv(audio_cmd_rx) -> cmd_res => {
-                        match cmd_res {
-                            Ok(AudioThreadCommand::Seek { target_time, resp_tx }) => {
-                                handle_audio_seek!(target_time, resp_tx);
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                }
-            }
-        });
-        Some(audio_thread)
+        let video_start_time = if video_stream.start_time() > -1_000_000_000_000 {
+            video_stream.start_time() as f64 * (video_stream.time_base().numerator() as f64 / video_stream.time_base().denominator() as f64)
+        } else {
+            0.0
+        };
+        Some(crate::media::audio_pipeline::AudioDecoderPipeline::new(
+            audio_decoder,
+            target_sample_rate,
+            target_channels,
+            audio_tb_f64,
+            video_start_time,
+        ))
     } else {
         None
     };
 
-    // Main demuxer loop using manually advanced packets iterator
+    let mut sync_engine = crate::media::sync::VideoSyncEngine::new(Box::new(master_clock.clone()));
+    let mut audio_enabled = true;
     let mut packets_iter = input.packets();
-    let mut pending_packet = None;
-    let mut seek_requested = None;
 
     loop {
-        // 1. Handle incoming command overrides
-        while let Ok(cmd) = background_rx.try_recv() {
+        // 1. Process incoming commands
+        if let Ok(cmd) = background_rx.try_recv() {
             match cmd {
                 MediaCommand::Shutdown => return Ok(()),
                 MediaCommand::Play => {
-                    let _ = video_cmd_tx.send(VideoThreadCommand::Play);
+                    video_pipeline.play();
+                    sync_engine.reset();
                 }
                 MediaCommand::Pause => {}
                 MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae } => {
                     audio_enabled = ae;
-                    seek_requested = Some((frame_index, keyframe_only, sequence_id));
+                    let handled = video_pipeline.seek(frame_index, keyframe_only, sequence_id, audio_enabled);
+
+                    if let Some(mut audio_pipeline) = audio_pipeline_opt.as_mut() {
+                        if audio_enabled {
+                            audio_pipeline.handle_seek(frame_index as f64 / fps);
+                            master_clock.inc_playback_generation();
+                        }
+                    }
+
+                    if handled {
+                        if let Some(frame) = video_pipeline.get_cached_frame(frame_index) {
+                            let _ = frame_tx.send(frame);
+                        }
+                    } else {
+                        // Drop packets iterator to free mutable borrow
+                        drop(packets_iter);
+
+                        let target_kf = get_nearest_keyframe(&keyframes, frame_index);
+                        let kf_pts = keyframes.binary_search(&target_kf)
+                            .map(|idx| keyframes_pts[idx])
+                            .unwrap_or(0);
+
+                        unsafe {
+                            let _ = ffmpeg_next::ffi::avformat_seek_file(
+                                input.as_mut_ptr(),
+                                video_stream_idx as i32,
+                                i64::MIN,
+                                kf_pts,
+                                kf_pts,
+                                0,
+                            );
+                        }
+
+                        // Recreate the iterator
+                        packets_iter = input.packets();
+                    }
+                    continue;
                 }
             }
         }
 
-        if let Some((frame_index, keyframe_only, sequence_id)) = seek_requested.take() {
-            let (video_resp_tx, video_resp_rx) = crossbeam_channel::bounded::<bool>(1);
-            let _ = video_cmd_tx.send(VideoThreadCommand::Seek {
-                frame_index,
-                keyframe_only,
-                sequence_id,
-                audio_enabled,
-                resp_tx: video_resp_tx,
-            });
-
-            let mut audio_resp_rx = None;
-            if audio_stream_idx_opt.is_some() && audio_enabled {
-                let (audio_resp_tx, rx) = crossbeam_channel::bounded::<()>(1);
-                let target_time = frame_index as f64 / fps;
-                let _ = audio_cmd_tx.send(AudioThreadCommand::Seek {
-                    target_time,
-                    resp_tx: audio_resp_tx,
-                });
-                audio_resp_rx = Some(rx);
-            }
-
-            let video_found = video_resp_rx.recv().unwrap_or(false);
-            if let Some(rx) = audio_resp_rx {
-                let _ = rx.recv();
-            }
-
-            if !video_found {
-                // Drop packets_iter to release borrow on input
-                drop(packets_iter);
-
-                // Seek specifically on the video stream to avoid AV sync/interleaving landing errors
-                let target_kf = get_nearest_keyframe(&keyframes, frame_index);
-                let kf_pts = keyframes.binary_search(&target_kf)
-                    .map(|idx| keyframes_pts[idx])
-                    .unwrap_or(0);
-
-                unsafe {
-                    let _ = ffmpeg_next::ffi::avformat_seek_file(
-                        input.as_mut_ptr(),
-                        video_stream_idx as i32,
-                        i64::MIN,
-                        kf_pts,
-                        kf_pts,
-                        0,
-                    );
-                }
-
-                // Recreate packets_iter
-                packets_iter = input.packets();
-            }
-            pending_packet = None; // Clear any pending packet on seek
+        // Rate limit Demuxer if audio ringbuffer is too full (avoid blocking)
+        if audio_tx.is_full() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
             continue;
         }
 
-        // 2. Demux next packet if we don't have one pending
-        if pending_packet.is_none() {
-            if let Some(packet_res) = packets_iter.next() {
-                let (stream, packet) = packet_res;
-                pending_packet = Some((stream.index(), packet));
-            } else {
-                // End of stream - wait for further commands (e.g. seek)
-                match background_rx.recv() {
-                    Ok(cmd) => {
-                        match cmd {
-                            MediaCommand::Shutdown => return Ok(()),
-                            MediaCommand::Play => {
-                                let _ = video_cmd_tx.send(VideoThreadCommand::Play);
-                            }
-                            MediaCommand::Pause => {}
-                            MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae } => {
-                                audio_enabled = ae;
-                                seek_requested = Some((frame_index, keyframe_only, sequence_id));
-                            }
-                        }
-                        if let Some((frame_index, keyframe_only, sequence_id)) = seek_requested.take() {
-                            let (video_resp_tx, video_resp_rx) = crossbeam_channel::bounded::<bool>(1);
-                            let _ = video_cmd_tx.send(VideoThreadCommand::Seek {
-                                frame_index,
-                                keyframe_only,
-                                sequence_id,
-                                audio_enabled,
-                                resp_tx: video_resp_tx,
-                            });
+        // 2. Demux next packet
+        if let Some(packet_res) = packets_iter.next() {
+            let (stream, packet) = packet_res;
+            let stream_idx = stream.index();
 
-                            let mut audio_resp_rx = None;
-                            if audio_stream_idx_opt.is_some() && audio_enabled {
-                                let (audio_resp_tx, rx) = crossbeam_channel::bounded::<()>(1);
-                                let target_time = frame_index as f64 / fps;
-                                let _ = audio_cmd_tx.send(AudioThreadCommand::Seek {
-                                    target_time,
-                                    resp_tx: audio_resp_tx,
-                                });
-                                audio_resp_rx = Some(rx);
-                            }
-
-                            let video_found = video_resp_rx.recv().unwrap_or(false);
-                            if let Some(rx) = audio_resp_rx {
-                                let _ = rx.recv();
-                            }
-
-                             if !video_found {
-                                 drop(packets_iter);
-                                 // Seek specifically on the video stream to avoid AV sync/interleaving landing errors
-                                 let target_kf = get_nearest_keyframe(&keyframes, frame_index);
-                                 let kf_pts = keyframes.binary_search(&target_kf)
-                                     .map(|idx| keyframes_pts[idx])
-                                     .unwrap_or(0);
-
-                                 unsafe {
-                                     let _ = ffmpeg_next::ffi::avformat_seek_file(
-                                         input.as_mut_ptr(),
-                                         video_stream_idx as i32,
-                                         i64::MIN,
-                                         kf_pts,
-                                         kf_pts,
-                                         0,
-                                     );
-                                 }
-                                 packets_iter = input.packets();
-                             }
-                        }
-                        continue;
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-
-        // 3. Send the pending packet, non-blocking on command channel
-        if let Some((stream_idx, packet)) = pending_packet.take() {
             if stream_idx == video_stream_idx {
-                crossbeam_channel::select! {
-                    send(video_packet_tx, packet) -> res => {
-                        if res.is_err() {
-                            break;
-                        }
-                    }
-                    recv(background_rx) -> cmd_res => {
-                        if let Ok(cmd) = cmd_res {
-                            match cmd {
-                                MediaCommand::Shutdown => return Ok(()),
-                                MediaCommand::Play => {
-                                    let _ = video_cmd_tx.send(VideoThreadCommand::Play);
+                if let Ok(frames) = video_pipeline.process_packet(&packet) {
+                    for frame in frames {
+                        let pts_sec = match &frame {
+                            DecodedFrame::Cpu { pts_sec, .. } => *pts_sec,
+                            DecodedFrame::Gpu { pts_sec, .. } => *pts_sec,
+                        };
+
+                        loop {
+                            let action = if master_clock.is_playing() {
+                                sync_engine.evaluate_frame(pts_sec)
+                            } else {
+                                Ok(SyncAction::Present)
+                            };
+
+                            match action {
+                                Ok(SyncAction::Present) => {
+                                    let _ = frame_tx.send(frame);
+                                    break;
                                 }
-                                MediaCommand::Pause => {}
-                                MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae } => {
-                                    audio_enabled = ae;
-                                    seek_requested = Some((frame_index, keyframe_only, sequence_id));
+                                Ok(SyncAction::Wait(dur)) => {
+                                    // Process commands while waiting to avoid lagging UI on seek
+                                    if let Ok(cmd) = background_rx.try_recv() {
+                                        // If we get a seek command while waiting, we abort current presentation
+                                        match cmd {
+                                            MediaCommand::Shutdown => return Ok(()),
+                                            MediaCommand::Play => {
+                                                video_pipeline.play();
+                                                sync_engine.reset();
+                                            }
+                                            MediaCommand::Pause => {}
+                                            MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae } => {
+                                                audio_enabled = ae;
+                                                let handled = video_pipeline.seek(frame_index, keyframe_only, sequence_id, audio_enabled);
+                            
+                                                if let Some(mut audio_pipeline) = audio_pipeline_opt.as_mut() {
+                                                    if audio_enabled {
+                                                        audio_pipeline.handle_seek(frame_index as f64 / fps);
+                                                        master_clock.inc_playback_generation();
+                                                    }
+                                                }
+                            
+                                                if handled {
+                                                    if let Some(frame) = video_pipeline.get_cached_frame(frame_index) {
+                                                        let _ = frame_tx.send(frame);
+                                                    }
+                                                } else {
+                                                    drop(packets_iter);
+                            
+                                                    let target_kf = get_nearest_keyframe(&keyframes, frame_index);
+                                                    let kf_pts = keyframes.binary_search(&target_kf)
+                                                        .map(|idx| keyframes_pts[idx])
+                                                        .unwrap_or(0);
+                            
+                                                    unsafe {
+                                                        let _ = ffmpeg_next::ffi::avformat_seek_file(
+                                                            input.as_mut_ptr(),
+                                                            video_stream_idx as i32,
+                                                            i64::MIN,
+                                                            kf_pts,
+                                                            kf_pts,
+                                                            0,
+                                                        );
+                                                    }
+                                                    packets_iter = input.packets();
+                                                }
+                                                // Break the wait loop entirely
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(2));
+                                }
+                                Err(_) => {
+                                    let _ = frame_tx.send(frame);
+                                    break;
                                 }
                             }
-                            pending_packet = Some((stream_idx, packet));
-                            if seek_requested.is_some() {
-                                pending_packet = None;
-                            }
-                        } else {
-                            break;
                         }
                     }
                 }
-            } else if Some(stream_idx) == audio_stream_idx_opt {
-                if audio_enabled {
-                    crossbeam_channel::select! {
-                        send(audio_packet_tx, packet) -> res => {
-                            if res.is_err() {
-                                break;
-                            }
-                        }
-                        recv(background_rx) -> cmd_res => {
-                            if let Ok(cmd) = cmd_res {
-                                match cmd {
-                                    MediaCommand::Shutdown => return Ok(()),
-                                    MediaCommand::Play => {
-                                        let _ = video_cmd_tx.send(VideoThreadCommand::Play);
-                                    }
-                                    MediaCommand::Pause => {}
-                                    MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae } => {
-                                        audio_enabled = ae;
-                                        seek_requested = Some((frame_index, keyframe_only, sequence_id));
+            } else if Some(stream_idx) == audio_stream_idx_opt && audio_enabled {
+                if let Some(mut audio_pipeline) = audio_pipeline_opt.as_mut() {
+                    if let Some(pts) = packet.pts() {
+                        audio_pipeline.update_current_time_from_pts(pts);
+                    }
+                    if audio_pipeline.send_packet(&packet).is_ok() {
+                        if let Ok(chunks) = audio_pipeline.receive_samples() {
+                            let generation = master_clock.playback_generation();
+                            for chunk in chunks {
+                                if let Some(tag) = chunk.tag {
+                                    let _ = tags_tx.try_push(tag);
+                                }
+                                for &sample in &chunk.data {
+                                    while audio_tx.try_push((sample, generation)).is_err() {
+                                        std::thread::sleep(std::time::Duration::from_millis(1));
                                     }
                                 }
-                                pending_packet = Some((stream_idx, packet));
-                                if seek_requested.is_some() {
-                                    pending_packet = None;
-                                }
-                            } else {
-                                break;
                             }
                         }
                     }
                 }
             }
+        } else {
+            // EOF, sleep a bit to avoid hotloop
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
-    }
-
-    // Explicitly drop transmitters to notify receiver threads
-    drop(video_packet_tx);
-    drop(video_cmd_tx);
-    drop(audio_packet_tx);
-    drop(audio_cmd_tx);
-
-    let _ = video_thread.join();
-    if let Some(ath) = audio_thread_opt {
-        let _ = ath.join();
-    }
-
-    Ok(())
-}
-
-fn get_nearest_keyframe(keyframes: &[usize], target: usize) -> usize {
-    if keyframes.is_empty() {
-        return target;
-    }
-    match keyframes.binary_search(&target) {
-        Ok(i) => keyframes[i],
-        Err(0) => keyframes[0],
-        Err(i) => keyframes[i - 1],
     }
 }
