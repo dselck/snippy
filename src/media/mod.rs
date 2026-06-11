@@ -210,7 +210,7 @@ fn run_decoding_loop(
     let mut audio_enabled = true;
     let mut packets_iter = input.packets();
 
-    let mut play_queue: VecDeque<DecodedFrame> = VecDeque::new();
+    let mut play_queue: std::collections::VecDeque<DecodedFrame> = std::collections::VecDeque::new();
     const MAX_LOOKAHEAD_FRAMES: usize = 15;
 
     loop {
