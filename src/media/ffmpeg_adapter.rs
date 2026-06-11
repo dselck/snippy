@@ -64,7 +64,7 @@ impl DecoderAdapter for FfmpegDecoderAdapter {
                     &frame
                 };
 
-                let planes = YuvPlanes {
+                let planes = std::sync::Arc::new(YuvPlanes {
                     y: video_frame.data(0).to_vec(),
                     u: video_frame.data(1).to_vec(),
                     v: video_frame.data(2).to_vec(),
@@ -73,7 +73,7 @@ impl DecoderAdapter for FfmpegDecoderAdapter {
                     y_stride: video_frame.stride(0) as u32,
                     u_stride: video_frame.stride(1) as u32,
                     v_stride: video_frame.stride(2) as u32,
-                };
+                });
 
                 let pts_sec = match frame.pts() {
                     Some(pts_val) => pts_val as f64 * self.time_base_f64 - self.video_start_time,
