@@ -210,7 +210,7 @@ fn run_decoding_loop(
     let mut audio_enabled = true;
     let mut packets_iter = input.packets();
 
-    let mut play_queue: std::collections::VecDeque<DecodedFrame> = std::collections::VecDeque::new();
+    let mut play_queue: VecDeque<DecodedFrame> = VecDeque::new();
     const MAX_LOOKAHEAD_FRAMES: usize = 15;
 
     loop {
@@ -267,123 +267,86 @@ fn run_decoding_loop(
             }
         }
 
-        // Rate limit Demuxer if audio ringbuffer is too full (avoid blocking)
-        if audio_tx.is_full() {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            continue;
-        }
+        // 2. Present due frames from the front of the queue
+        if master_clock.is_playing() {
+            if let Some(front_frame) = play_queue.front() {
+                let pts_sec = match front_frame {
+                    DecodedFrame::Cpu { pts_sec, .. } => *pts_sec,
+                    DecodedFrame::Gpu { pts_sec, .. } => *pts_sec,
+                };
 
-        // 2. Demux next packet
-        if let Some(packet_res) = packets_iter.next() {
-            let (stream, packet) = packet_res;
-            let stream_idx = stream.index();
-
-            if stream_idx == video_stream_idx {
-                if let Ok(frames) = video_pipeline.process_packet(&packet) {
-                    for frame in frames {
-                        let pts_sec = match &frame {
-                            DecodedFrame::Cpu { pts_sec, .. } => *pts_sec,
-                            DecodedFrame::Gpu { pts_sec, .. } => *pts_sec,
-                        };
-
-                        loop {
-                            let action = if master_clock.is_playing() {
-                                sync_engine.evaluate_frame(pts_sec)
-                            } else {
-                                Ok(SyncAction::Present)
-                            };
-
-                            match action {
-                                Ok(SyncAction::Present) => {
-                                    let _ = frame_tx.send(frame);
-                                    break;
-                                }
-                                Ok(SyncAction::Wait(dur)) => {
-                                    // Process commands while waiting to avoid lagging UI on seek
-                                    if let Ok(cmd) = background_rx.try_recv() {
-                                        // If we get a seek command while waiting, we abort current presentation
-                                        match cmd {
-                                            MediaCommand::Shutdown => return Ok(()),
-                                            MediaCommand::Play => {
-                                                video_pipeline.play();
-                                                sync_engine.reset();
-                                            }
-                                            MediaCommand::Pause => {}
-                                            MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae } => {
-                                                audio_enabled = ae;
-                                                let handled = video_pipeline.seek(frame_index, keyframe_only, sequence_id, audio_enabled);
-                            
-                                                if let Some(mut audio_pipeline) = audio_pipeline_opt.as_mut() {
-                                                    if audio_enabled {
-                                                        audio_pipeline.handle_seek(frame_index as f64 / fps);
-                                                        master_clock.inc_playback_generation();
-                                                    }
-                                                }
-                            
-                                                if handled {
-                                                    if let Some(frame) = video_pipeline.get_cached_frame(frame_index) {
-                                                        let _ = frame_tx.send(frame);
-                                                    }
-                                                } else {
-                                                    drop(packets_iter);
-                            
-                                                    let target_kf = get_nearest_keyframe(&keyframes, frame_index);
-                                                    let kf_pts = keyframes.binary_search(&target_kf)
-                                                        .map(|idx| keyframes_pts[idx])
-                                                        .unwrap_or(0);
-                            
-                                                    unsafe {
-                                                        let _ = ffmpeg_next::ffi::avformat_seek_file(
-                                                            input.as_mut_ptr(),
-                                                            video_stream_idx as i32,
-                                                            i64::MIN,
-                                                            kf_pts,
-                                                            kf_pts,
-                                                            0,
-                                                        );
-                                                    }
-                                                    packets_iter = input.packets();
-                                                }
-                                                // Break the wait loop entirely
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    std::thread::sleep(std::time::Duration::from_millis(2));
-                                }
-                                Err(_) => {
-                                    let _ = frame_tx.send(frame);
-                                    break;
-                                }
-                            }
-                        }
+                let action = sync_engine.evaluate_frame(pts_sec);
+                match action {
+                    Ok(SyncAction::Present) => {
+                        let frame = play_queue.pop_front().unwrap();
+                        let _ = frame_tx.send(frame);
                     }
-                }
-            } else if Some(stream_idx) == audio_stream_idx_opt && audio_enabled {
-                if let Some(mut audio_pipeline) = audio_pipeline_opt.as_mut() {
-                    if let Some(pts) = packet.pts() {
-                        audio_pipeline.update_current_time_from_pts(pts);
+                    Ok(SyncAction::Wait(_)) => {
+                        // Frame is not due yet, don't block. We can decode more or sleep.
                     }
-                    if audio_pipeline.send_packet(&packet).is_ok() {
-                        if let Ok(chunks) = audio_pipeline.receive_samples() {
-                            let generation = master_clock.playback_generation();
-                            for chunk in chunks {
-                                if let Some(tag) = chunk.tag {
-                                    let _ = tags_tx.try_push(tag);
-                                }
-                                for &sample in &chunk.data {
-                                    while audio_tx.try_push((sample, generation)).is_err() {
-                                        std::thread::sleep(std::time::Duration::from_millis(1));
-                                    }
-                                }
-                            }
-                        }
+                    Err(_) => {
+                        let frame = play_queue.pop_front().unwrap();
+                        let _ = frame_tx.send(frame);
                     }
                 }
             }
         } else {
-            // EOF, sleep a bit to avoid hotloop
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // Paused/seek mode: drain queue and send immediately
+            while let Some(frame) = play_queue.pop_front() {
+                let _ = frame_tx.send(frame);
+            }
+        }
+
+        // 3. Decode ahead if queue has space and decoder is active
+        let queue_needs_frames = play_queue.len() < MAX_LOOKAHEAD_FRAMES;
+        let is_decoding_active = video_pipeline.is_active();
+
+        if queue_needs_frames && is_decoding_active {
+            // Rate limit Demuxer if audio ringbuffer is too full (avoid blocking)
+            if audio_tx.is_full() {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                continue;
+            }
+
+            if let Some(packet_res) = packets_iter.next() {
+                let (stream, packet) = packet_res;
+                let stream_idx = stream.index();
+
+                if stream_idx == video_stream_idx {
+                    if let Ok(frames) = video_pipeline.process_packet(&packet) {
+                        for frame in frames {
+                            play_queue.push_back(frame);
+                        }
+                    }
+                } else if Some(stream_idx) == audio_stream_idx_opt && audio_enabled {
+                    if let Some(mut audio_pipeline) = audio_pipeline_opt.as_mut() {
+                        if let Some(pts) = packet.pts() {
+                            audio_pipeline.update_current_time_from_pts(pts);
+                        }
+                        if audio_pipeline.send_packet(&packet).is_ok() {
+                            if let Ok(chunks) = audio_pipeline.receive_samples() {
+                                let generation = master_clock.playback_generation();
+                                for chunk in chunks {
+                                    if let Some(tag) = chunk.tag {
+                                        let _ = tags_tx.try_push(tag);
+                                    }
+                                    for &sample in &chunk.data {
+                                        while audio_tx.try_push((sample, generation)).is_err() {
+                                            std::thread::sleep(std::time::Duration::from_millis(1));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // EOF, sleep a bit to avoid hotloop
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        } else {
+            // Queue is full or paused: sleep briefly to prevent 100% CPU hot loop
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
 }
