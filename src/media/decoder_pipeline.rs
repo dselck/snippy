@@ -152,7 +152,7 @@ impl VideoDecoderPipeline {
 
         while let Some(decoded) = self.adapter.receive_frame()? {
             let (frame_idx, pts_sec, planes) = match decoded {
-                DecodedFrame::Cpu { frame_idx, pts_sec, ref planes, .. } => (frame_idx, pts_sec, planes.clone()),
+                DecodedFrame::Cpu { frame_idx, pts_sec, planes, .. } => (frame_idx, pts_sec, planes),
                 _ => unreachable!(),
             };
 
