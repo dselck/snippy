@@ -420,3 +420,63 @@ pub fn format_video_info(meta: &VideoMetadata) -> String {
         meta.keyframes.len()
     )
 }
+
+// ── Profiling Infrastructure ───────────────────────────────────────────────
+
+#[cfg(unix)]
+use pprof::ProfilerGuard;
+
+pub struct ProfilingGuard {
+    #[cfg(unix)]
+    guard: Option<ProfilerGuard<'static>>,
+    #[allow(dead_code)]
+    name: String,
+}
+
+impl ProfilingGuard {
+    pub fn new(name: &str, frequency: i32) -> Self {
+        #[cfg(unix)]
+        {
+            match ProfilerGuard::new(frequency) {
+                Ok(g) => Self {
+                    guard: Some(g),
+                    name: name.to_string(),
+                },
+                Err(e) => {
+                    eprintln!("  [profiler] Warn: Failed to start profiler: {:?}", e);
+                    Self {
+                        guard: None,
+                        name: name.to_string(),
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                name: name.to_string(),
+            }
+        }
+    }
+}
+
+impl Drop for ProfilingGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(guard) = self.guard.take() {
+            if let Ok(report) = guard.report().build() {
+                let dir = std::path::Path::new("target/profile");
+                let _ = std::fs::create_dir_all(dir);
+                let file_name = format!("{}_flamegraph.svg", self.name);
+                let file_path = dir.join(file_name);
+                if let Ok(file) = std::fs::File::create(&file_path) {
+                    if let Err(e) = report.flamegraph(file) {
+                        eprintln!("  [profiler] Warn: Failed to generate flamegraph: {:?}", e);
+                    } else {
+                        println!("  [profiler] Flamegraph saved to: {}", file_path.display());
+                    }
+                }
+            }
+        }
+    }
+}
