@@ -225,6 +225,7 @@ fn run_decoding_loop(
                 MediaCommand::Pause => {}
                 MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae } => {
                     audio_enabled = ae;
+                    play_queue.clear();
                     let handled = video_pipeline.seek(frame_index, keyframe_only, sequence_id, audio_enabled);
 
                     if let Some(mut audio_pipeline) = audio_pipeline_opt.as_mut() {
