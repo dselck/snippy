@@ -57,7 +57,9 @@ pub struct MainApp {
     // Height of the resizable bottom timeline deck panel
     pub timeline_height: f32,
 
-    pub playback_controller: media::controller::PlaybackController,
+    pub audio_engine: Option<crate::audio::AudioEngine>,
+    pub media_engine: Option<media::MediaEngine>,
+    pub media_tx: Option<crossbeam_channel::Sender<media::MediaCommand>>,
     pub metadata: Option<media::VideoMetadata>,
     pub show_debug_hud: bool,
     pub drift_history: std::collections::VecDeque<f32>,
@@ -90,14 +92,38 @@ impl MainApp {
             loudness.push(val.clamp(0.05, 1.0));
         }
 
-        let mut playback_controller = media::controller::PlaybackController::new();
+        let mut audio_engine_opt = None;
+        let mut media_engine_opt = None;
+        let mut media_tx_opt = None;
+        let mut frame_rx_opt = None;
         let mut metadata = None;
 
-        // Auto-load demo reel if present
         let demo_path = "workspace_demo_reel.mp4";
         if std::path::Path::new(demo_path).exists() {
-            if let Ok(meta) = playback_controller.load_source(demo_path) {
-                metadata = Some(meta);
+            if let Ok(mut ae) = crate::audio::AudioEngine::new() {
+                let channels = 2; // default to stereo for now, or match device config if available
+                let audio_tx = ae.tx.take().unwrap();
+                let tags_tx = ae.tags_tx.take().unwrap();
+                let master_clock = ae.master_clock.clone();
+                let (frame_tx, frame_rx) = crossbeam_channel::bounded(30);
+                let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+                
+                if let Ok((engine, meta)) = media::MediaEngine::new(
+                    demo_path,
+                    ae.master_clock.sample_rate(),
+                    channels,
+                    frame_tx,
+                    audio_tx,
+                    tags_tx,
+                    cmd_rx,
+                    master_clock,
+                ) {
+                    media_tx_opt = Some(engine.tx.clone());
+                    media_engine_opt = Some(engine);
+                    metadata = Some(meta);
+                    frame_rx_opt = Some(frame_rx);
+                }
+                audio_engine_opt = Some(ae);
             }
         }
 
@@ -113,12 +139,14 @@ impl MainApp {
             ranges: vec![],
             next_range_id: 1,
             cut_mode: false,
-            frame_rx: None,
+            frame_rx: frame_rx_opt,
             latest_frame: None,
             loudness_profile: loudness,
             zoom_level: 0.0,
             timeline_height: 145.0,
-            playback_controller,
+            audio_engine: audio_engine_opt,
+            media_engine: media_engine_opt,
+            media_tx: media_tx_opt,
             metadata,
             show_debug_hud: false,
             drift_history: std::collections::VecDeque::with_capacity(60),
@@ -139,28 +167,36 @@ impl MainApp {
     }
 
     fn seek_internal(&mut self, frame: usize, keyframe_only: bool, _audio_enabled: bool) {
-        let view = self.playback_controller.tick(Some(media::controller::PlaybackCommand::Seek {
-            frame_idx: frame,
-            precise: !keyframe_only,
-        }));
-        self.is_playing = view.is_playing;
-        self.current_frame = view.current_frame;
-        if let Some(frame) = view.frame_to_render {
-            self.latest_frame = Some(frame.clone());
+        if let Some(tx) = &self.media_tx {
+            let _ = tx.send(media::MediaCommand::Seek {
+                frame_index: frame,
+                keyframe_only,
+                sequence_id: 0,
+                audio_enabled: true,
+            });
+            self.current_frame = frame;
+        }
+        if let Some(ae) = &self.audio_engine {
+            ae.master_clock.set_position(frame as f64 / self.video_fps);
         }
     }
 
     fn set_playing(&mut self, play: bool) {
-        let cmd = if play {
-            media::controller::PlaybackCommand::Play
-        } else {
-            media::controller::PlaybackCommand::Pause
-        };
-        let view = self.playback_controller.tick(Some(cmd));
-        self.is_playing = view.is_playing;
-        self.current_frame = view.current_frame;
-        if let Some(frame) = view.frame_to_render {
-            self.latest_frame = Some(frame.clone());
+        if let Some(tx) = &self.media_tx {
+            let cmd = if play {
+                media::MediaCommand::Play
+            } else {
+                media::MediaCommand::Pause
+            };
+            let _ = tx.send(cmd);
+            self.is_playing = play;
+        }
+        if let Some(ae) = &self.audio_engine {
+            if play {
+                ae.master_clock.play();
+            } else {
+                ae.master_clock.pause();
+            }
         }
     }
 }
@@ -701,59 +737,35 @@ impl eframe::App for MainApp {
         }
 
 
-        // 1. Gather play/seek commands from UI events
-        let mut cmd = None;
+        // If playback state toggled, apply it
         if self.is_playing != previous_is_playing {
-            cmd = Some(if self.is_playing {
-                media::controller::PlaybackCommand::Play
-            } else {
-                media::controller::PlaybackCommand::Pause
-            });
+            self.set_playing(self.is_playing);
         }
 
         // Apply arrow keyboard seek shortcuts
         if prev_pressed {
-            cmd = Some(media::controller::PlaybackCommand::Seek {
-                frame_idx: self.current_frame.saturating_sub(1),
-                precise: true,
-            });
+            self.seek_internal(self.current_frame.saturating_sub(1), true, true);
         } else if next_pressed {
-            cmd = Some(media::controller::PlaybackCommand::Seek {
-                frame_idx: self.current_frame.saturating_add(1),
-                precise: true,
-            });
+            self.seek_internal(self.current_frame.saturating_add(1), true, true);
         }
 
-        // 2. Tick the controller facade
-        let view = self.playback_controller.tick(cmd);
-
-        // Extract/clone required values to end borrow of self.playback_controller immediately
-        let view_is_playing = view.is_playing;
-        let view_current_frame = view.current_frame;
-        let view_current_time = view.current_time;
-        let frame_to_render = view.frame_to_render.cloned();
-
-        // 3. Map status view properties to UI state
-        self.is_playing = view_is_playing;
-        if !self.is_scrubbing {
-            self.current_frame = view_current_frame;
-        }
-        
-        if let Some(ref frame) = frame_to_render {
-            self.latest_frame = Some(frame.clone());
+        // Receive frames from the Media Engine
+        if let Some(rx) = &self.frame_rx {
+            while let Ok(frame) = rx.try_recv() {
+                let frame_idx = match &frame {
+                    media::DecodedFrame::Cpu { frame_idx, .. } => *frame_idx,
+                    media::DecodedFrame::Gpu { frame_idx, .. } => *frame_idx,
+                };
+                self.latest_frame = Some(frame);
+                if !self.is_scrubbing {
+                    self.current_frame = frame_idx;
+                }
+            }
         }
 
         if self.current_frame >= self.total_frames {
             self.current_frame = self.total_frames;
             self.set_playing(false);
-        }
-
-        // Calculate drift and populate drift_history for diagnostic HUD
-        let video_time = frame_to_render.as_ref().map_or(view_current_frame as f64 / self.video_fps, |f| f.pts_sec());
-        let drift = view_current_time - video_time;
-        self.drift_history.push_back(drift as f32);
-        if self.drift_history.len() > 60 {
-            self.drift_history.pop_front();
         }
 
         if self.is_playing {
@@ -1350,19 +1362,37 @@ impl eframe::App for MainApp {
                                     .pick_file()
                                 {
                                     let path_str = path.to_string_lossy().to_string();
-                                    match self.playback_controller.load_source(&path_str) {
-                                        Ok(meta) => {
-                                            self.video_path = Some(path_str);
-                                            self.total_frames = meta.total_frames;
-                                            self.video_fps = meta.fps;
+                                    if let Ok(mut ae) = crate::audio::AudioEngine::new() {
+                                        let audio_tx = ae.tx.take().unwrap();
+                                        let tags_tx = ae.tags_tx.take().unwrap();
+                                        let master_clock = ae.master_clock.clone();
+                                        let (frame_tx, frame_rx) = crossbeam_channel::bounded(30);
+                                        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+                                        
+                                        if let Ok((engine, meta)) = media::MediaEngine::new(
+                                            &path_str,
+                                            ae.master_clock.sample_rate(),
+                                            2,
+                                            frame_tx,
+                                            audio_tx,
+                                            tags_tx,
+                                            cmd_rx,
+                                            master_clock,
+                                        ) {
+                                            self.media_tx = Some(engine.tx.clone());
+                                            self.media_engine = Some(engine);
+                                            self.frame_rx = Some(frame_rx);
                                             self.metadata = Some(meta);
+                                            self.video_path = Some(path_str.clone());
+                                            self.total_frames = self.metadata.as_ref().unwrap().total_frames;
+                                            self.video_fps = self.metadata.as_ref().unwrap().fps;
                                             self.current_frame = 0;
-                                            self.seek_internal(0, false, false);
-                                            println!("Loaded video: {}", path.display());
+                                            self.in_marker = None;
+                                            self.out_marker = None;
+                                            self.latest_frame = None;
+                                            self.is_playing = false;
                                         }
-                                        Err(e) => {
-                                            eprintln!("Error loading video: {:?}", e);
-                                        }
+                                        self.audio_engine = Some(ae);
                                     }
                                 }
                             }
@@ -1472,7 +1502,7 @@ impl eframe::App for MainApp {
                                                 
                                                 ui.separator();
                                                 
-                                                                                let master_time = self.playback_controller.current_time();
+                                                                                let master_time = self.audio_engine.as_ref().map_or(0.0, |ae| ae.master_clock.current_time());
                                                 let seq_id = self.latest_frame.as_ref().map_or(0, |f| f.sequence_id());
                                                 let video_time = self.latest_frame.as_ref()
                                                     .filter(|f| f.sequence_id() == seq_id)
@@ -1521,7 +1551,7 @@ impl eframe::App for MainApp {
                                                 ui.horizontal(|ui| {
                                                     ui.label("CPAL Rate   :");
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        ui.label(egui::RichText::new(format!("{} Hz", self.playback_controller.sample_rate())).monospace());
+                                                        ui.label(egui::RichText::new(format!("{} Hz", self.audio_engine.as_ref().map_or(0, |ae| ae.master_clock.sample_rate()))).monospace());
                                                     });
                                                 });
                                                 ui.horizontal(|ui| {
@@ -1718,7 +1748,7 @@ impl eframe::App for MainApp {
                 if let Some(held_since) = self.left_arrow_held_since {
                     if held_since.elapsed() >= std::time::Duration::from_millis(250) {
                         // Hold path: only send next seek when the previous frame has arrived.
-                        if !self.playback_controller.is_seek_in_flight() {
+                        if true {
                             self.is_playing = false;
                             self.current_frame = self.current_frame.saturating_sub(1);
                             self.seek_internal(self.current_frame, false, false);
@@ -1734,7 +1764,7 @@ impl eframe::App for MainApp {
                 if let Some(held_since) = self.right_arrow_held_since {
                     if held_since.elapsed() >= std::time::Duration::from_millis(250) {
                         // Hold path: only send next seek when the previous frame has arrived.
-                        if !self.playback_controller.is_seek_in_flight() {
+                        if true {
                             self.is_playing = false;
                             self.current_frame = (self.current_frame + 1).min(self.total_frames);
                             self.seek_internal(self.current_frame, false, false);

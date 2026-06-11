@@ -13,7 +13,7 @@ fn main() -> Result<(), anyhow::Error> {
     let (_cmd_tx, cmd_rx) = unbounded::<MediaCommand>();
 
     // Set up dummy audio producer ring buffer
-    let rb = ringbuf::SharedRb::<ringbuf::storage::Heap<f32>>::new(48000 * 2 * 2);
+    let rb = ringbuf::SharedRb::<ringbuf::storage::Heap<(f32, u64)>>::new(48000 * 2 * 2);
     let (audio_tx, mut audio_cons) = rb.split();
 
     // Set up dummy tags ring buffer
@@ -35,17 +35,9 @@ fn main() -> Result<(), anyhow::Error> {
         }
     });
 
-    let playback_state = std::sync::Arc::new(snippy2::audio::AudioPlaybackState {
-        current_position_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        sample_rate: 48000,
-        has_audio: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        should_flush: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        is_playing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        audio_paused_for_sync: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        fallback_epoch: std::time::Instant::now(),
-        fallback_start_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        fallback_base_us: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-    });
+    let (master_clock, _ticker) = snippy2::audio::clock::MasterClock::new(48000);
+    master_clock.set_has_audio(true);
+    master_clock.play();
 
     // 2. Initialize Media Engine
     let (me, metadata) = MediaEngine::new(
@@ -56,7 +48,7 @@ fn main() -> Result<(), anyhow::Error> {
         audio_tx,
         tags_tx,
         cmd_rx,
-        playback_state,
+        master_clock,
     )?;
 
     println!("Loaded metadata: total_frames={}, fps={}, width={}, height={}, has_audio={}, keyframes count={}",

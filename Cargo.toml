@@ -31,5 +31,5 @@ opt-level = 1
 opt-level = 3
 
 [target.'cfg(unix)'.dependencies]
-pprof = { version = "0.13.0", features = ["flamegraph"] }
+pprof = { version = "0.13.0", features = ["flamegraph", "frame-pointer"] }
 

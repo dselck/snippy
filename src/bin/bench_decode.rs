@@ -24,7 +24,6 @@ fn reset_to_start(rig: &MediaTestRig) -> Result<(), anyhow::Error> {
 /// Begin playback from the current position.
 fn start_playback(rig: &MediaTestRig, start_secs: f64) -> Result<(), anyhow::Error> {
     rig.master_clock.set_position(start_secs);
-    rig.master_clock.play();
     rig.send(MediaCommand::Play)?;
     Ok(())
 }

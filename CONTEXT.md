@@ -60,8 +60,14 @@ _Avoid_: Repaint-driven scrubbing, debounced scrubbing
 The most recent scrubber position recorded by the UI Thread while a seek is in flight. When the in-flight seek completes, the Scrub Loop compares this value against the last-sent frame index to decide whether to issue another seek.
 _Avoid_: Pending seek target, buffered scrub position
 
-**PlaybackController**:
-The deep module that coordinates video loading, playback state, request-driven timeline scrubbing, and real-time audio-video synchronization.
-_Avoid_: Playback manager, sync service
+**VideoSyncEngine**:
+The deep module inside the Media Engine that evaluates video frames against the Master Clock, managing A/V sync and drift math.
+_Avoid_: Sync controller, drift manager
 
+**MasterClockPort**:
+The minimal interface seam that allows the VideoSyncEngine to read the Master Clock PTS and pause/resume hardware audio playback without coupling to the cpal thread.
+_Avoid_: Audio adapter, cpal interface
 
+**VideoDecoderPipeline**:
+A deep module sitting behind the Media Engine thread that isolates FFmpeg packet decoding, GOP caching, and sequential fast paths behind a `seek` and `next_frame` interface.
+_Avoid_: Decoder thread loop, caching layer, packet manager
