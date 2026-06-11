@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct CachedFrame {
-    pub planes: YuvPlanes,
+    pub planes: std::sync::Arc<YuvPlanes>,
     pub pts_sec: f64,
 }
 
