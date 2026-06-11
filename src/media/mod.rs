@@ -1,4 +1,5 @@
 use crossbeam_channel::{Receiver, Sender};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
@@ -208,6 +209,9 @@ fn run_decoding_loop(
     let mut sync_engine = crate::media::sync::VideoSyncEngine::new(Box::new(master_clock.clone()));
     let mut audio_enabled = true;
     let mut packets_iter = input.packets();
+
+    let mut play_queue: VecDeque<DecodedFrame> = VecDeque::new();
+    const MAX_LOOKAHEAD_FRAMES: usize = 15;
 
     loop {
         // 1. Process incoming commands
