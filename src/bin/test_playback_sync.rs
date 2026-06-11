@@ -5,7 +5,8 @@ use std::time::Duration;
 use snippy2::media::{DecodedFrame, MediaCommand, MediaEngine};
 
 fn main() -> Result<(), anyhow::Error> {
-    let video_path = "/Users/dselck/Downloads/Season 1 (2008)/The Hollowmen - 0101 - Fat Chance.mp4";
+    let video_path_buf = snippy2::bench::TestMediaLocator::resolve()?;
+    let video_path = video_path_buf.to_string_lossy();
     println!("=== Testing Playback & Sync with: {} ===", video_path);
 
     // 1. Create channels
@@ -39,9 +40,8 @@ fn main() -> Result<(), anyhow::Error> {
     master_clock.set_has_audio(true);
     master_clock.play();
 
-    // 2. Initialize Media Engine
     let (me, metadata) = MediaEngine::new(
-        video_path,
+        &video_path_buf,
         48000,
         1, // Mono
         frame_tx,
@@ -117,9 +117,7 @@ fn main() -> Result<(), anyhow::Error> {
     println!("\n--- Test Exact Seek: target_frame={} ---", exact_target);
     me.tx.send(MediaCommand::Seek { frame_index: exact_target, keyframe_only: false, sequence_id: 2, audio_enabled: true })?;
 
-    // Drain frame_rx (giving a short sleep to allow the video thread to process/unblock and clear the channel)
-    thread::sleep(Duration::from_millis(50));
-    while frame_rx.try_recv().is_ok() {}
+
 
     // We expect to receive multiple frames as the decoder catches up, ending at exact_target or greater.
     // Discard any stale frames with sequence_id < 2.

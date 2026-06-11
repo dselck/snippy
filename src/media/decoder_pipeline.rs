@@ -65,6 +65,12 @@ impl VideoDecoderPipeline {
         self.decode_more = true;
     }
 
+    pub fn pause(&mut self) {
+        self.play_mode = false;
+        self.decode_more = false;
+        self.seek_target_frame = None;
+    }
+
     pub fn is_active(&self) -> bool {
         self.decode_more
     }

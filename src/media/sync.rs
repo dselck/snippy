@@ -53,10 +53,8 @@ impl VideoSyncEngine {
 
         if frame_pts_sec > clock_pts {
             // Frame is early, we need to wait
-            if self.is_stalled {
-                self.clock.resume_from_catchup();
-                self.is_stalled = false;
-            }
+            self.clock.resume_from_catchup();
+            self.is_stalled = false;
             let wait_sec = frame_pts_sec - clock_pts;
             Ok(SyncAction::Wait(Duration::from_secs_f64(wait_sec)))
         } else {
@@ -68,8 +66,8 @@ impl VideoSyncEngine {
                     self.clock.stall_for_catchup();
                     self.is_stalled = true;
                 }
-            } else if self.is_stalled {
-                // Video has caught up!
+            } else {
+                // Video has caught up or is close to clock!
                 self.clock.resume_from_catchup();
                 self.is_stalled = false;
             }

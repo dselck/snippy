@@ -9,6 +9,8 @@ pub struct AudioEngine {
     pub tx: Option<CachingProd<Arc<SharedRb<Heap<(f32, u64)>>>>>,
     pub tags_tx: Option<CachingProd<Arc<SharedRb<Heap<(u64, u64)>>>>>,
     pub master_clock: clock::MasterClock,
+    pub channels: usize,
+    muted: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AudioEngine {
@@ -23,11 +25,11 @@ impl AudioEngine {
         let channels = config.channels() as usize;
 
         // Create a thread-safe ring buffer for sending decoded float samples to CPAL
-        let rb = SharedRb::<Heap<(f32, u64)>>::new((sample_rate as usize * channels) / 5);
+        let rb = SharedRb::<Heap<(f32, u64)>>::new(sample_rate as usize * channels * 2);
         let (prod, mut cons) = rb.split();
 
         // Create tags ring buffer: tags hold (frames_written_total, pts_us)
-        let tags_rb = SharedRb::<Heap<(u64, u64)>>::new(256);
+        let tags_rb = SharedRb::<Heap<(u64, u64)>>::new(1024);
         let (tags_prod, mut tags_cons) = tags_rb.split();
 
         let (master_clock, ticker) = clock::MasterClock::new(sample_rate);
@@ -38,17 +40,23 @@ impl AudioEngine {
 
         let mut current_consumer_generation = 0u64;
 
+        let muted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let muted_clone = muted.clone();
+
         // CPAL high-priority real-time audio thread callback
         let stream = device.build_output_stream(
             &config.into(),
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let active = ticker.is_active();
+                let is_muted = muted_clone.load(std::sync::atomic::Ordering::Relaxed);
                 
                 let producer_gen = ticker.playback_generation();
+                let mut first_sample = None;
                 if producer_gen != current_consumer_generation {
                     // Drop stale samples
-                    while let Some((_, generation)) = cons.try_pop() {
+                    while let Some((sample, generation)) = cons.try_pop() {
                         if generation == producer_gen {
+                            first_sample = Some(sample);
                             break; // Stop dropping, we hit fresh data
                         }
                     }
@@ -64,8 +72,9 @@ impl AudioEngine {
                     if active {
                         let mut has_data = false;
                         for channel_sample in frame.iter_mut() {
-                            if let Some((sample, _)) = cons.try_pop() {
-                                *channel_sample = sample;
+                            let sample_opt = first_sample.take().or_else(|| cons.try_pop().map(|(s, _)| s));
+                            if let Some(sample) = sample_opt {
+                                *channel_sample = if is_muted { 0.0 } else { sample };
                                 has_data = true;
                             } else {
                                 *channel_sample = 0.0;
@@ -111,7 +120,13 @@ impl AudioEngine {
             tx: Some(prod),
             tags_tx: Some(tags_prod),
             master_clock,
+            channels,
+            muted,
         })
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn play(&self) -> Result<(), cpal::PlayStreamError> {

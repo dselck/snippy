@@ -119,7 +119,8 @@ impl AudioDecoderPipeline {
                         if pts_sec < target_container_time {
                             // Trim overlap
                             let overlap_sec = target_container_time - pts_sec;
-                            let discard_samples = (overlap_sec * self.target_sample_rate as f64).round() as usize;
+                            let discard_frames = (overlap_sec * self.target_sample_rate as f64).round() as usize;
+                            let discard_samples = discard_frames * self.target_channels;
                             if discard_samples < data.len() {
                                 data = data[discard_samples..].to_vec();
                                 data_frames = (data.len() / self.target_channels) as u64;

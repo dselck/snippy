@@ -25,62 +25,134 @@ pub struct MediaTestRig {
     pub metadata: VideoMetadata,
     pub frame_rx: Receiver<DecodedFrame>,
     pub master_clock: MasterClock,
-    _audio_consumer: thread::JoinHandle<()>,
+    _audio_engine: Option<crate::audio::AudioEngine>,
+    _audio_consumer: Option<thread::JoinHandle<()>>,
 }
 
 impl MediaTestRig {
     /// Open a video file and spin up the media engine headlessly.
-    ///
-    /// The `MasterClock` is configured in no-audio fallback mode so the
-    /// `VideoSyncEngine` doesn't block waiting for real audio PTS.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, anyhow::Error> {
         let (frame_tx, frame_rx) = bounded::<DecodedFrame>(4);
         let (_cmd_tx, cmd_rx) = unbounded::<MediaCommand>();
 
-        // Dummy audio ring buffer — never consumed by real hardware
-        let rb = SharedRb::<Heap<(f32, u64)>>::new(48000 * 2 * 2);
-        let (audio_tx, mut audio_cons) = rb.split();
+        if let Ok(mut audio_engine) = crate::audio::AudioEngine::new() {
+            audio_engine.set_muted(true);
+            let audio_tx = audio_engine.tx.take().unwrap();
+            let tags_tx = audio_engine.tags_tx.take().unwrap();
+            let master_clock = audio_engine.master_clock.clone();
 
-        // Dummy tags ring buffer
-        let tags_rb = SharedRb::<Heap<(u64, u64)>>::new(256);
-        let (tags_tx, mut tags_cons) = tags_rb.split();
+            let (engine, metadata) = MediaEngine::new(
+                path,
+                audio_engine.master_clock.sample_rate(),
+                audio_engine.channels,
+                frame_tx,
+                audio_tx,
+                tags_tx,
+                cmd_rx,
+                master_clock.clone(),
+            )?;
 
-        // Drain audio so the media engine never blocks on backpressure
-        let audio_consumer = thread::spawn(move || loop {
-            let mut drained = false;
-            while audio_cons.try_pop().is_some() {
-                drained = true;
-            }
-            while tags_cons.try_pop().is_some() {
-                drained = true;
-            }
-            if !drained {
-                thread::sleep(Duration::from_millis(5));
-            }
-        });
+            Ok(Self {
+                engine,
+                metadata,
+                frame_rx,
+                master_clock,
+                _audio_engine: Some(audio_engine),
+                _audio_consumer: None,
+            })
+        } else {
+            println!("[bench] No default audio device found. Falling back to real-time paced simulation.");
+            let (master_clock, ticker) = MasterClock::new(48000);
+            master_clock.set_has_audio(true); // Treat as audio video
 
-        // Standalone clock — no-audio fallback mode
-        let (master_clock, _ticker) = MasterClock::new(48000);
-        master_clock.set_has_audio(false);
+            let rb = SharedRb::<Heap<(f32, u64)>>::new(48000 * 2 * 2);
+            let (audio_tx, mut audio_cons) = rb.split();
 
-        let (engine, metadata) = MediaEngine::new(
-            path,
-            48000,
-            1, // mono
-            frame_tx,
-            audio_tx,
-            tags_tx,
-            cmd_rx,
-            master_clock.clone(),
-        )?;
+            let tags_rb = SharedRb::<Heap<(u64, u64)>>::new(256);
+            let (tags_tx, mut tags_cons) = tags_rb.split();
 
-        Ok(Self {
-            engine,
-            metadata,
-            frame_rx,
-            master_clock,
-            _audio_consumer: audio_consumer,
-        })
+            let ticker_clone = ticker.clone();
+            let audio_consumer = thread::spawn(move || {
+                let sample_rate = 48000;
+                let mut start_time = Instant::now();
+                let mut samples_read_total = 0u64;
+                let mut last_tag = None;
+                let mut pending_tag = None;
+                let mut last_active = false;
+
+                loop {
+                    let active = ticker_clone.is_active();
+                    if !active {
+                        last_active = false;
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+
+                    if !last_active {
+                        start_time = Instant::now();
+                        last_active = true;
+                    }
+
+                    let elapsed = start_time.elapsed();
+                    let target_samples = (elapsed.as_secs_f64() * sample_rate as f64) as u64;
+
+                    if target_samples > samples_read_total {
+                        let mut to_read = target_samples - samples_read_total;
+                        let mut written = 0;
+
+                        while to_read > 0 {
+                            if let Some((_sample, _gen)) = audio_cons.try_pop() {
+                                written += 1;
+                                samples_read_total += 1;
+                                to_read -= 1;
+
+                                loop {
+                                    let next_tag = pending_tag.take().or_else(|| tags_cons.try_pop());
+                                    if let Some((tag_idx, tag_pts_us)) = next_tag {
+                                        if tag_idx <= samples_read_total {
+                                            last_tag = Some((tag_idx, tag_pts_us));
+                                        } else {
+                                            pending_tag = Some((tag_idx, tag_pts_us));
+                                            break;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+
+                        if written > 0 {
+                            ticker_clone.advance(written, last_tag, samples_read_total);
+                        }
+                    }
+
+                    thread::sleep(Duration::from_millis(5));
+                }
+            });
+
+            let (engine, metadata) = MediaEngine::new(
+                path,
+                48000,
+                1,
+                frame_tx,
+                audio_tx,
+                tags_tx,
+                cmd_rx,
+                master_clock.clone(),
+            )?;
+
+            Ok(Self {
+                engine,
+                metadata,
+                frame_rx,
+                master_clock,
+                _audio_engine: None,
+                _audio_consumer: Some(audio_consumer),
+            })
+        }
     }
 
     /// Send a command to the media engine.

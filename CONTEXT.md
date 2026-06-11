@@ -53,7 +53,7 @@ The data structure passed from the Media Engine to the UI Thread representing a 
 _Avoid_: Video frame payload, raw texture handle
 
 **Scrub Loop**:
-The request-driven cycle that governs seek dispatch during timeline scrubbing. One keyframe seek is outstanding at a time; the next seek is only issued once a DecodedFrame carrying the current sequence ID arrives. On drag end, a single precise seek with audio priming settles the final position.
+The request-driven cycle that governs seek dispatch during timeline scrubbing. One keyframe seek is outstanding at a time; the next seek is only issued once a DecodedFrame carrying the current sequence ID arrives. On drag end, the timeline position (current_frame) snaps to the frame index of the displayed keyframe, ending the scrub cycle without any precise seek.
 _Avoid_: Repaint-driven scrubbing, debounced scrubbing
 
 **Desired Scrub Frame**:

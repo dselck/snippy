@@ -1,8 +1,8 @@
-# Request-Driven Scrub Loop and Gesture-Triggered Precise Settle
+# Request-Driven Scrub Loop without Precise Settle
 
 Timeline scrubbing previously sent a new keyframe seek on every egui repaint tick that the mouse moved. Because each seek increments `latest_sequence_id` and invalidates any in-flight decoded frame, rapid mouse movement produced a perpetual flush loop where the decoder never completed a decode and no frame was ever displayed.
 
-The scrub dispatch is now request-driven: a single keyframe seek is sent, and the next seek is only sent once a decoded frame carrying the current `latest_sequence_id` arrives in the `frame_rx` loop. The UI tracks the latest scrubber position in `desired_scrub_frame`; when the in-flight seek completes, if the position has changed, the next seek fires immediately. On `drag_stopped()`, a single precise seek with audio priming is fired as the settled result — eliminating the previous 500ms debounce-to-precise timer entirely.
+The scrub dispatch is now request-driven: a single keyframe seek is sent, and the next seek is only sent once a decoded frame carrying the current `latest_sequence_id` arrives in the `frame_rx` loop. The UI tracks the latest scrubber position in `desired_scrub_frame`; when the in-flight seek completes, if the position has changed, the next seek fires immediately. On `drag_stopped()`, the timeline position (`current_frame`) immediately snaps to the frame index of the displayed keyframe, and no final precise seek is fired. This avoids the 1-second visual jump/lag after releasing the mouse.
 
 Arrow-key hold follows the same response-driven pattern: after the 250ms entrance guard (which prevents tap/hold ambiguity), each successive precise seek is gated on the previous frame arriving, with no timer involvement. Single arrow taps also go directly to `seek_internal` with no debounce.
 

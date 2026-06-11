@@ -31,8 +31,39 @@ fn simulate_scrub(
     let mut frame_lag = Stats::new();
     let mut desired_frame = positions.first().copied().unwrap_or(0);
 
+    let mut last_step_time = Instant::now();
     for &pos in positions {
-        std::thread::sleep(step_interval);
+        while last_step_time.elapsed() < step_interval {
+            // Non-blocking drain: check for completed seeks
+            while let Ok(frame) = rig.frame_rx.try_recv() {
+                if Some(frame.sequence_id()) == outstanding_seq {
+                    let latency = outstanding_send_time.unwrap().elapsed();
+                    seek_latency.push(latency);
+
+                    let lag = desired_frame.abs_diff(frame.frame_idx());
+                    frame_lag.push(Duration::from_micros(lag as u64));
+
+                    outstanding_seq = None;
+                    outstanding_send_time = None;
+
+                    // If the user has moved on, fire next seek immediately
+                    if desired_frame != frame.frame_idx() {
+                        *seq += 1;
+                        let _ = rig.send(MediaCommand::Seek {
+                            frame_index: desired_frame,
+                            keyframe_only: true,
+                            sequence_id: *seq,
+                            audio_enabled: false,
+                        });
+                        outstanding_seq = Some(*seq);
+                        outstanding_send_time = Some(Instant::now());
+                    }
+                }
+                // Stale frames from earlier sequence IDs are silently dropped.
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        last_step_time = Instant::now();
         desired_frame = pos;
 
         // Fire a seek if the pipeline is idle
@@ -46,34 +77,6 @@ fn simulate_scrub(
             });
             outstanding_seq = Some(*seq);
             outstanding_send_time = Some(Instant::now());
-        }
-
-        // Non-blocking drain: check for completed seeks
-        while let Ok(frame) = rig.frame_rx.try_recv() {
-            if Some(frame.sequence_id()) == outstanding_seq {
-                let latency = outstanding_send_time.unwrap().elapsed();
-                seek_latency.push(latency);
-
-                let lag = desired_frame.abs_diff(frame.frame_idx());
-                frame_lag.push(Duration::from_micros(lag as u64));
-
-                outstanding_seq = None;
-                outstanding_send_time = None;
-
-                // If the user has moved on, fire next seek immediately
-                if desired_frame != frame.frame_idx() {
-                    *seq += 1;
-                    let _ = rig.send(MediaCommand::Seek {
-                        frame_index: desired_frame,
-                        keyframe_only: true,
-                        sequence_id: *seq,
-                        audio_enabled: false,
-                    });
-                    outstanding_seq = Some(*seq);
-                    outstanding_send_time = Some(Instant::now());
-                }
-            }
-            // Stale frames from earlier sequence IDs are silently dropped.
         }
     }
 
@@ -169,17 +172,6 @@ fn run_scenario(
     report.add(scenario.name, latency);
     report.add(&format!("{} (frame lag)", scenario.name), lag);
 
-    // Settle seek: precise seek to the final desired position
-    if let Some(&final_pos) = scenario.positions.last() {
-        *seq += 1;
-        if let Some((_frame, settle_dur)) =
-            rig.timed_seek(final_pos, false, *seq, Duration::from_secs(5))
-        {
-            let mut settle = Stats::new();
-            settle.push(settle_dur);
-            report.add(&format!("{} (settle)", scenario.name), settle);
-        }
-    }
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────

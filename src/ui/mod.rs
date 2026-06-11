@@ -68,6 +68,10 @@ pub struct MainApp {
     pub decode_fps: f32,
     pub left_arrow_held_since: Option<std::time::Instant>,
     pub right_arrow_held_since: Option<std::time::Instant>,
+    pub latest_sequence_id: usize,
+    pub in_flight_seek_seq: Option<usize>,
+    pub desired_scrub_frame: Option<usize>,
+    pub last_sent_seek_frame: Option<usize>,
 }
 
 impl MainApp {
@@ -101,7 +105,7 @@ impl MainApp {
         let demo_path = "workspace_demo_reel.mp4";
         if std::path::Path::new(demo_path).exists() {
             if let Ok(mut ae) = crate::audio::AudioEngine::new() {
-                let channels = 2; // default to stereo for now, or match device config if available
+                let channels = ae.channels;
                 let audio_tx = ae.tx.take().unwrap();
                 let tags_tx = ae.tags_tx.take().unwrap();
                 let master_clock = ae.master_clock.clone();
@@ -155,6 +159,10 @@ impl MainApp {
             decode_fps: 0.0,
             left_arrow_held_since: None,
             right_arrow_held_since: None,
+            latest_sequence_id: 0,
+            in_flight_seek_seq: None,
+            desired_scrub_frame: None,
+            last_sent_seek_frame: None,
         }
     }
 
@@ -166,18 +174,32 @@ impl MainApp {
         format!("{:02}:{:02}.{:02}", minutes, seconds, centiseconds)
     }
 
-    fn seek_internal(&mut self, frame: usize, keyframe_only: bool, _audio_enabled: bool) {
+    fn seek_internal(&mut self, frame: usize, keyframe_only: bool, audio_enabled: bool) {
+        self.latest_sequence_id += 1;
+        self.last_sent_seek_frame = Some(frame);
         if let Some(tx) = &self.media_tx {
             let _ = tx.send(media::MediaCommand::Seek {
                 frame_index: frame,
                 keyframe_only,
-                sequence_id: 0,
-                audio_enabled: true,
+                sequence_id: self.latest_sequence_id,
+                audio_enabled,
             });
             self.current_frame = frame;
         }
         if let Some(ae) = &self.audio_engine {
-            ae.master_clock.set_position(frame as f64 / self.video_fps);
+            ae.master_clock.reset(frame as f64 / self.video_fps);
+        }
+    }
+
+    fn scrub_to(&mut self, target_frame: usize) {
+        self.is_playing = false;
+        if self.in_flight_seek_seq.is_some() {
+            self.desired_scrub_frame = Some(target_frame);
+            self.current_frame = target_frame;
+        } else {
+            self.seek_internal(target_frame, true, false);
+            self.in_flight_seek_seq = Some(self.latest_sequence_id);
+            self.desired_scrub_frame = None;
         }
     }
 
@@ -742,24 +764,42 @@ impl eframe::App for MainApp {
             self.set_playing(self.is_playing);
         }
 
-        // Apply arrow keyboard seek shortcuts
-        if prev_pressed {
-            self.seek_internal(self.current_frame.saturating_sub(1), true, true);
-        } else if next_pressed {
-            self.seek_internal(self.current_frame.saturating_add(1), true, true);
-        }
+
 
         // Receive frames from the Media Engine
         if let Some(rx) = &self.frame_rx {
+            let mut got_frame = false;
             while let Ok(frame) = rx.try_recv() {
+                if frame.sequence_id() < self.latest_sequence_id {
+                    continue;
+                }
                 let frame_idx = match &frame {
                     media::DecodedFrame::Cpu { frame_idx, .. } => *frame_idx,
                     media::DecodedFrame::Gpu { frame_idx, .. } => *frame_idx,
                 };
+                
+                if Some(frame.sequence_id()) == self.in_flight_seek_seq {
+                    self.in_flight_seek_seq = None;
+                }
+                
                 self.latest_frame = Some(frame);
                 if !self.is_scrubbing {
                     self.current_frame = frame_idx;
                 }
+                got_frame = true;
+            }
+            
+            if self.in_flight_seek_seq.is_none() {
+                if let Some(desired) = self.desired_scrub_frame.take() {
+                    if Some(desired) != self.last_sent_seek_frame {
+                        self.seek_internal(desired, true, false);
+                        self.in_flight_seek_seq = Some(self.latest_sequence_id);
+                    }
+                }
+            }
+            
+            if got_frame {
+                ctx.request_repaint();
             }
         }
 
@@ -1147,18 +1187,12 @@ impl eframe::App for MainApp {
                             let rel_x = (mouse_pos.x - wave_rect.left()).clamp(0.0, wave_rect.width());
                             let pct = rel_x / wave_rect.width();
                             let target_frame = (pct * self.total_frames as f32) as usize;
-                            self.set_playing(false);
-                            self.seek_internal(target_frame, true, false);
+                            self.scrub_to(target_frame);
                         }
                     }
-                    // Precise settle: when the drag gesture ends, snap to the keyframe
-                    // we were already displaying — no intra-GOP precise seek.
                     if wave_response.drag_stopped() {
-                        if let Some(mouse_pos) = wave_response.interact_pointer_pos() {
-                            let rel_x = (mouse_pos.x - wave_rect.left()).clamp(0.0, wave_rect.width());
-                            let pct = rel_x / wave_rect.width();
-                            let target_frame = (pct * self.total_frames as f32) as usize;
-                            self.seek_internal(target_frame, true, false);
+                        if let Some(frame) = &self.latest_frame {
+                            self.current_frame = frame.frame_idx();
                         }
                     }
                 });
@@ -1633,13 +1667,13 @@ impl eframe::App for MainApp {
                     let progress_response = self.progress_bar(ui);
                     progress_dragged = progress_response.dragged();
                     if progress_response.dragged() || progress_response.clicked() {
-                        self.set_playing(false);
-                        self.seek_internal(self.current_frame, true, false);
+                        let target_frame = self.current_frame;
+                        self.scrub_to(target_frame);
                     }
-                    // Precise settle: when the drag gesture ends, snap to the keyframe
-                    // we were already displaying — no intra-GOP precise seek.
                     if progress_response.drag_stopped() {
-                        self.seek_internal(self.current_frame, true, false);
+                        if let Some(frame) = &self.latest_frame {
+                            self.current_frame = frame.frame_idx();
+                        }
                     }
 
                     ui.add_space(10.0);

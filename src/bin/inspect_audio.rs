@@ -2,7 +2,7 @@ use ffmpeg_next as ffmpeg;
 
 fn main() -> Result<(), anyhow::Error> {
     ffmpeg::init()?;
-    let path = "/Users/dselck/Downloads/Season 1 (2008)/The Hollowmen - 0101 - Fat Chance.mp4";
+    let path = "/Users/dselck/Downloads/GOAT.2026.1080p.WEBRip.AAC5.1.10bits.x265-Rapta.mkv";
     let mut input = ffmpeg::format::input(&path)?;
 
     let stream = input
