@@ -195,30 +195,33 @@ fn main() -> Result<(), anyhow::Error> {
     let mut report = BenchReport::new("Scrub Responsiveness", &info);
     let mut seq: usize = 0;
 
+    let cap_slow = (total / 4).min(100);
+    let cap_fast = (total / 2).min(300);
+
     let scenarios = vec![
         Scenario {
             name: "Slow fwd",
-            positions: linear_positions(0, total / 4, 2),
+            positions: linear_positions(0, cap_slow, 2),
             step_interval: Duration::from_millis(100),
         },
         Scenario {
             name: "Slow rev",
-            positions: linear_positions(total / 4, 0, 2),
+            positions: linear_positions(cap_slow, 0, 2),
             step_interval: Duration::from_millis(100),
         },
         Scenario {
             name: "Fast fwd",
-            positions: linear_positions(0, total / 2, 10),
+            positions: linear_positions(0, cap_fast, 10),
             step_interval: Duration::from_millis(30),
         },
         Scenario {
             name: "Fast rev",
-            positions: linear_positions(total / 2, 0, 10),
+            positions: linear_positions(cap_fast, 0, 10),
             step_interval: Duration::from_millis(30),
         },
         Scenario {
             name: "Jittery",
-            positions: jittery_positions(total / 4, total / 2, 3, total),
+            positions: jittery_positions(cap_slow, cap_fast, 3, total),
             step_interval: Duration::from_millis(50),
         },
         Scenario {
