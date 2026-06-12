@@ -801,6 +801,14 @@ impl eframe::App for MainApp {
                     self.current_frame = frame_idx;
                 }
                 got_frame = true;
+                self.decode_fps_frame_count += 1;
+            }
+            
+            let elapsed = self.decode_fps_last_reset.elapsed();
+            if elapsed >= std::time::Duration::from_secs(1) {
+                self.decode_fps = self.decode_fps_frame_count as f32 / elapsed.as_secs_f32();
+                self.decode_fps_frame_count = 0;
+                self.decode_fps_last_reset = std::time::Instant::now();
             }
             
             if self.in_flight_seek_seq.is_none() {
@@ -1792,7 +1800,13 @@ impl eframe::App for MainApp {
         // Hold → 250ms entrance guard, then response-driven precise seeks with no timer involvement.
         // Setting self.is_playing = false here is critical: it prevents the AV sync block from
         // running next tick and clobbering current_frame from the master clock.
-        if prev_pressed {
+        // State updates and input logic
+        let is_currently_stepping = matches!(
+            self.arrow_seek_state,
+            ArrowSeekState::SteppingLeft { .. } | ArrowSeekState::SteppingRight { .. }
+        );
+
+        if prev_pressed && !is_currently_stepping {
             self.set_playing(false);
             self.arrow_seek_state = ArrowSeekState::SteppingLeft {
                 held_since: std::time::Instant::now(),
@@ -1800,7 +1814,7 @@ impl eframe::App for MainApp {
             self.current_frame = self.current_frame.saturating_sub(1);
             self.seek_internal(self.current_frame, false, false);
             self.in_flight_seek_seq = Some(self.latest_sequence_id);
-        } else if next_pressed {
+        } else if next_pressed && !is_currently_stepping {
             self.set_playing(false);
             self.arrow_seek_state = ArrowSeekState::SteppingRight {
                 held_since: std::time::Instant::now(),
