@@ -205,11 +205,7 @@ fn run_decoding_loop(
                     let _ = decoder_cmd_tx.send(MediaCommand::Play);
                 }
                 MediaCommand::Pause => {
-                    if playing {
-                        playing = false;
-                        current_frame = None;
-                        while play_queue_rx.try_recv().is_ok() {}
-                    }
+                    playing = false;
                     play_after_seek = false;
                     let _ = decoder_cmd_tx.send(MediaCommand::Pause);
                 }
@@ -236,7 +232,7 @@ fn run_decoding_loop(
                 if let Ok(frame) = play_queue_rx.try_recv() {
                     current_frame = Some(frame);
                 }
-            } else {
+            } else if seek_target_frame_idx.is_some() || play_after_seek {
                 while let Ok(frame) = play_queue_rx.try_recv() {
                     let seq = frame.sequence_id();
                     if let Some(target_idx) = seek_target_frame_idx {
@@ -264,11 +260,7 @@ fn run_decoding_loop(
         if playing {
             if let Some(frame) = &current_frame {
                 let pts_sec = frame.pts_sec();
-                let action = if master_clock.is_playing() {
-                    sync_engine.evaluate_frame(pts_sec)
-                } else {
-                    Ok(SyncAction::Present)
-                };
+                let action = sync_engine.evaluate_frame(pts_sec);
                 match action {
                     Ok(SyncAction::Present) => {
                         let frame = current_frame.take().unwrap();
