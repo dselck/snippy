@@ -1,7 +1,7 @@
 //! Headless arrow-key seeking benchmark.
 //!
 //! Simulates a user holding down ArrowRight (forward) and ArrowLeft (backward)
-//! to measure achieved FPS and frame delivery latency under multi-in-flight pipelining.
+//! to measure achieved FPS and frame delivery latency under single-in-flight throttling.
 
 use snippy2::bench::{format_video_info, BenchReport, MediaTestRig, Stats, TestMediaLocator};
 use snippy2::media::MediaCommand;
@@ -60,14 +60,13 @@ fn simulate_arrow_hold_gui(
     count: usize,
     seq: &mut usize,
     vsync_hz: f64,
-    max_in_flight: usize,
 ) -> (Stats, f64) {
     rig.drain_frames();
 
     let mut stats = Stats::new();
     let mut current = start_frame;
-    let mut in_flight = std::collections::HashSet::<usize>::new();
-    let mut send_times = std::collections::HashMap::<usize, Instant>::new();
+    let mut in_flight: Option<usize> = None;
+    let mut last_send_time = Instant::now();
 
     let tick_interval = Duration::from_secs_f64(1.0 / vsync_hz);
     let mut last_tick = Instant::now();
@@ -86,14 +85,13 @@ fn simulate_arrow_hold_gui(
             // 1. UI receives frames from channel
             let mut got_frame = false;
             while let Ok(frame) = rig.frame_rx.try_recv() {
-                let frame_seq = frame.sequence_id();
-                if in_flight.contains(&frame_seq) {
-                    // Remove all sequence IDs <= frame_seq since they are either completed or aborted
-                    in_flight.retain(|&s| s > frame_seq);
-                    if let Some(send_time) = send_times.remove(&frame_seq) {
-                        stats.push(send_time.elapsed());
-                    }
-                    send_times.retain(|&s, _| s > frame_seq);
+                // Intelligent Buffer Draining: discard older frames
+                if frame.sequence_id() < *seq {
+                    continue;
+                }
+                
+                if Some(frame.sequence_id()) == in_flight {
+                    stats.push(last_send_time.elapsed());
 
                     // Simulate texture upload overhead (copy YUV planes)
                     if let snippy2::media::DecodedFrame::Cpu { planes, .. } = &frame {
@@ -106,6 +104,7 @@ fn simulate_arrow_hold_gui(
                         std::hint::black_box((dummy_y, dummy_u, dummy_v));
                     }
 
+                    in_flight = None;
                     got_frame = true;
                 }
             }
@@ -114,8 +113,8 @@ fn simulate_arrow_hold_gui(
                 frames_displayed += 1;
             }
 
-            // 2. UI sends next seek if under limit
-            if in_flight.len() < max_in_flight && frames_displayed + in_flight.len() < count {
+            // 2. UI sends next seek if idle
+            if in_flight.is_none() && frames_displayed < count {
                 if direction > 0 {
                     current = (current + 1).min(rig.metadata.total_frames.saturating_sub(1));
                 } else {
@@ -123,8 +122,8 @@ fn simulate_arrow_hold_gui(
                 }
 
                 *seq += 1;
-                in_flight.insert(*seq);
-                send_times.insert(*seq, Instant::now());
+                in_flight = Some(*seq);
+                last_send_time = Instant::now();
                 let _ = rig.send(MediaCommand::Seek {
                     frame_index: current,
                     keyframe_only: false,
@@ -174,23 +173,13 @@ fn main() -> Result<(), anyhow::Error> {
 
     // ── Scenario 2: Simulated GUI 60Hz Hold Seek (1-in-flight) ──
     println!("\n--- Scenario 2: Simulated GUI 60Hz Hold Seek (1-in-flight) ---");
-    let (gui_stats_1, gui_fps_1) = simulate_arrow_hold_gui(&rig, 0, 1, count, &mut seq, 60.0, 1);
+    let (gui_stats_1, gui_fps_1) = simulate_arrow_hold_gui(&rig, 0, 1, count, &mut seq, 60.0);
     println!(
         "  Simulated 60Hz GUI (1-in-flight): processed {} frames ({:.1} FPS)",
         count,
         gui_fps_1
     );
     report.add("Hold Right (Simulated 60Hz GUI 1-in-flight) Latency", gui_stats_1);
-
-    // ── Scenario 3: Simulated GUI 60Hz Hold Seek (2-in-flight) ──
-    println!("\n--- Scenario 3: Simulated GUI 60Hz Hold Seek (2-in-flight) ---");
-    let (gui_stats_2, gui_fps_2) = simulate_arrow_hold_gui(&rig, 0, 1, count, &mut seq, 60.0, 2);
-    println!(
-        "  Simulated 60Hz GUI (2-in-flight): processed {} frames ({:.1} FPS)",
-        count,
-        gui_fps_2
-    );
-    report.add("Hold Right (Simulated 60Hz GUI 2-in-flight) Latency", gui_stats_2);
 
     report.print_table();
     report.write_json("arrow_seek")?;
