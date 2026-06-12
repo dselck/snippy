@@ -26,6 +26,14 @@ pub enum PlaybackIcon {
     ExportVideo,
 }
 
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrowSeekState {
+    Idle,
+    SteppingLeft { held_since: std::time::Instant },
+    SteppingRight { held_since: std::time::Instant },
+}
+
 pub struct MainApp {
     // Media Playback State
     pub current_frame: usize,
@@ -66,8 +74,7 @@ pub struct MainApp {
     pub decode_fps_frame_count: usize,
     pub decode_fps_last_reset: std::time::Instant,
     pub decode_fps: f32,
-    pub left_arrow_held_since: Option<std::time::Instant>,
-    pub right_arrow_held_since: Option<std::time::Instant>,
+    pub arrow_seek_state: ArrowSeekState,
     pub latest_sequence_id: usize,
     pub in_flight_seek_seq: Option<usize>,
     pub desired_scrub_frame: Option<usize>,
@@ -158,8 +165,7 @@ impl MainApp {
             decode_fps_frame_count: 0,
             decode_fps_last_reset: std::time::Instant::now(),
             decode_fps: 0.0,
-            left_arrow_held_since: None,
-            right_arrow_held_since: None,
+            arrow_seek_state: ArrowSeekState::Idle,
             latest_sequence_id: 0,
             in_flight_seek_seq: None,
             desired_scrub_frame: None,
@@ -1788,52 +1794,53 @@ impl eframe::App for MainApp {
         // running next tick and clobbering current_frame from the master clock.
         if prev_pressed {
             self.is_playing = false;
+            self.arrow_seek_state = ArrowSeekState::SteppingLeft {
+                held_since: std::time::Instant::now(),
+            };
             self.current_frame = self.current_frame.saturating_sub(1);
-            self.left_arrow_held_since = Some(std::time::Instant::now());
-            self.right_arrow_held_since = None;
             self.seek_internal(self.current_frame, false, false);
+            self.in_flight_seek_seq = Some(self.latest_sequence_id);
         } else if next_pressed {
             self.is_playing = false;
+            self.arrow_seek_state = ArrowSeekState::SteppingRight {
+                held_since: std::time::Instant::now(),
+            };
             self.current_frame = (self.current_frame + 1).min(self.total_frames);
-            self.right_arrow_held_since = Some(std::time::Instant::now());
-            self.left_arrow_held_since = None;
             self.seek_internal(self.current_frame, false, false);
+            self.in_flight_seek_seq = Some(self.latest_sequence_id);
         } else {
-            if prev_down {
-                self.right_arrow_held_since = None;
-                if self.left_arrow_held_since.is_none() {
-                    self.left_arrow_held_since = Some(std::time::Instant::now());
-                }
-                if let Some(held_since) = self.left_arrow_held_since {
-                    if held_since.elapsed() >= std::time::Duration::from_millis(250) {
-                        // Hold path: only send next seek when the previous frame has arrived.
-                        if true {
-                            self.is_playing = false;
-                            self.current_frame = self.current_frame.saturating_sub(1);
-                            self.seek_internal(self.current_frame, false, false);
+            match self.arrow_seek_state {
+                ArrowSeekState::SteppingLeft { held_since } => {
+                    if prev_down {
+                        if held_since.elapsed() >= std::time::Duration::from_millis(250) {
+                            if self.in_flight_seek_seq.is_none() {
+                                self.is_playing = false;
+                                self.current_frame = self.current_frame.saturating_sub(1);
+                                self.seek_internal(self.current_frame, false, false);
+                                self.in_flight_seek_seq = Some(self.latest_sequence_id);
+                            }
                         }
                         ctx.request_repaint();
+                    } else {
+                        self.arrow_seek_state = ArrowSeekState::Idle;
                     }
                 }
-            } else if next_down {
-                self.left_arrow_held_since = None;
-                if self.right_arrow_held_since.is_none() {
-                    self.right_arrow_held_since = Some(std::time::Instant::now());
-                }
-                if let Some(held_since) = self.right_arrow_held_since {
-                    if held_since.elapsed() >= std::time::Duration::from_millis(250) {
-                        // Hold path: only send next seek when the previous frame has arrived.
-                        if true {
-                            self.is_playing = false;
-                            self.current_frame = (self.current_frame + 1).min(self.total_frames);
-                            self.seek_internal(self.current_frame, false, false);
+                ArrowSeekState::SteppingRight { held_since } => {
+                    if next_down {
+                        if held_since.elapsed() >= std::time::Duration::from_millis(250) {
+                            if self.in_flight_seek_seq.is_none() {
+                                self.is_playing = false;
+                                self.current_frame = (self.current_frame + 1).min(self.total_frames);
+                                self.seek_internal(self.current_frame, false, false);
+                                self.in_flight_seek_seq = Some(self.latest_sequence_id);
+                            }
                         }
                         ctx.request_repaint();
+                    } else {
+                        self.arrow_seek_state = ArrowSeekState::Idle;
                     }
                 }
-            } else {
-                self.left_arrow_held_since = None;
-                self.right_arrow_held_since = None;
+                ArrowSeekState::Idle => {}
             }
         }
         self.is_scrubbing = progress_dragged || wave_dragged;
