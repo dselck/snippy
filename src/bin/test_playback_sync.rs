@@ -140,7 +140,7 @@ fn main() -> Result<(), anyhow::Error> {
     assert!(play_frames[0] > 0, "Play should decode from keyframe onwards!");
 
     // 5. Test Exact Seek directly after Play (without Pause command)
-    let exact_target = 340;
+    let exact_target = 50;
     println!("\n--- Test Exact Seek directly after Play: target_frame={} ---", exact_target);
     master_clock.reset(exact_target as f64 / metadata.fps);
     me.tx.send(MediaCommand::Seek { frame_index: exact_target, keyframe_only: false, sequence_id: 2, audio_enabled: true })?;
@@ -198,7 +198,7 @@ fn main() -> Result<(), anyhow::Error> {
     println!("Resumed playback frames: {:?}", temp);
 
     // Now send rapid double seek (first audio_enabled: false, second audio_enabled: true)
-    let double_seek_target = 400;
+    let double_seek_target = 80;
     master_clock.reset(double_seek_target as f64 / metadata.fps);
     
     println!("Sending Seek 1 (audio_enabled: false, seq=3)...");
@@ -242,6 +242,29 @@ fn main() -> Result<(), anyhow::Error> {
     }
     println!("Double post-seek frames received: {:?}", double_post_seek_frames);
     assert!(double_post_seek_frames.len() >= 3, "Playback should automatically resume after double seek!");
+
+    // 7. Test seeking while paused (precise seek followed immediately by pause)
+    println!("\n--- Test precise seek while paused: target_frame=45 ---");
+    // Seek to target frame 45 (which is within GOP starting at keyframe 30)
+    me.tx.send(MediaCommand::Seek { frame_index: 45, keyframe_only: false, sequence_id: 5, audio_enabled: false })?;
+    // Immediately send Pause command
+    me.tx.send(MediaCommand::Pause)?;
+
+    // We expect to eventually receive frame 45 (precise target), not just keyframe 30.
+    let mut received_target = false;
+    let start_time = std::time::Instant::now();
+    while start_time.elapsed() < Duration::from_secs(5) {
+        if let Ok(frame) = frame_rx.recv_timeout(Duration::from_millis(100)) {
+            if frame.sequence_id() == 5 {
+                println!("Received paused seek frame: index={}", frame.frame_idx());
+                if frame.frame_idx() == 45 {
+                    received_target = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(received_target, "Should receive precise seek target frame 45 when paused, not stop at keyframe!");
 
     println!("\n=== All Tests Passed Successfully ===");
     Ok(())
