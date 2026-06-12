@@ -2,15 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Implement high-performance, pipelined frame-by-frame seeking when holding down ArrowLeft/ArrowRight, and build a dedicated benchmark test harness to measure its speed and throughput.
+**Goal:** Implement high-performance, single-in-flight throttled frame-by-frame seeking when holding down ArrowLeft/ArrowRight, and build a dedicated benchmark test harness to measure its speed and throughput.
 
-**Architecture:** We replace the single-in-flight `in_flight_seek_seq: Option<usize>` with a `HashSet<usize>` of `in_flight_seeks`. We allow up to 2 seeks in flight during arrow holds, and disable the stale frame discard logic during stepping. This pipelines decoding and texture uploads to achieve a solid 60 FPS in the GUI.
+**Architecture:** We use a single-in-flight `in_flight_seek_seq: Option<usize>` state. We allow only one seek in flight during arrow holds, and discard older frames in the UI receive loop (intelligent buffer draining). This guarantees sequential fast-path decoding and avoids rendering stalls, achieving a smooth 40-60 FPS (VSync-capped).
 
 **Tech Stack:** Rust, egui, crossbeam channels, ffmpeg-next.
 
 ---
 
-### Task 1: Update the Arrow Seek Benchmark Harness to Support Pipelining
+### Task 1: Update the Arrow Seek Benchmark Harness
 
 **Files:**
 - Modify: `src/bin/bench_arrow_seek.rs`
@@ -22,7 +22,7 @@
   //! Headless arrow-key seeking benchmark.
   //!
   //! Simulates a user holding down ArrowRight (forward) and ArrowLeft (backward)
-  //! to measure achieved FPS and frame delivery latency under multi-in-flight pipelining.
+  //! to measure achieved FPS and frame delivery latency under single-in-flight throttling.
 
   use snippy2::bench::{format_video_info, BenchReport, MediaTestRig, Stats, TestMediaLocator};
   use snippy2::media::MediaCommand;
@@ -81,14 +81,13 @@
       count: usize,
       seq: &mut usize,
       vsync_hz: f64,
-      max_in_flight: usize,
   ) -> (Stats, f64) {
       rig.drain_frames();
 
       let mut stats = Stats::new();
       let mut current = start_frame;
-      let mut in_flight = std::collections::HashSet::<usize>::new();
-      let mut send_times = std::collections::HashMap::<usize, Instant>::new();
+      let mut in_flight: Option<usize> = None;
+      let mut last_send_time = Instant::now();
 
       let tick_interval = Duration::from_secs_f64(1.0 / vsync_hz);
       let mut last_tick = Instant::now();
@@ -107,11 +106,13 @@
               // 1. UI receives frames from channel
               let mut got_frame = false;
               while let Ok(frame) = rig.frame_rx.try_recv() {
-                  let frame_seq = frame.sequence_id();
-                  if in_flight.remove(&frame_seq) {
-                      if let Some(send_time) = send_times.remove(&frame_seq) {
-                          stats.push(send_time.elapsed());
-                      }
+                  // Intelligent Buffer Draining: discard older frames
+                  if frame.sequence_id() < *seq {
+                      continue;
+                  }
+                  
+                  if Some(frame.sequence_id()) == in_flight {
+                      stats.push(last_send_time.elapsed());
 
                       // Simulate texture upload overhead (copy YUV planes)
                       if let snippy2::media::DecodedFrame::Cpu { planes, .. } = &frame {
@@ -124,6 +125,7 @@
                           std::hint::black_box((dummy_y, dummy_u, dummy_v));
                       }
 
+                      in_flight = None;
                       got_frame = true;
                   }
               }
@@ -132,8 +134,8 @@
                   frames_displayed += 1;
               }
 
-              // 2. UI sends next seek if under limit
-              while in_flight.len() < max_in_flight && frames_displayed + in_flight.len() < count {
+              // 2. UI sends next seek if idle
+              if in_flight.is_none() && frames_displayed < count {
                   if direction > 0 {
                       current = (current + 1).min(rig.metadata.total_frames.saturating_sub(1));
                   } else {
@@ -141,8 +143,8 @@
                   }
 
                   *seq += 1;
-                  in_flight.insert(*seq);
-                  send_times.insert(*seq, Instant::now());
+                  in_flight = Some(*seq);
+                  last_send_time = Instant::now();
                   let _ = rig.send(MediaCommand::Seek {
                       frame_index: current,
                       keyframe_only: false,
@@ -192,23 +194,13 @@
 
       // ── Scenario 2: Simulated GUI 60Hz Hold Seek (1-in-flight) ──
       println!("\n--- Scenario 2: Simulated GUI 60Hz Hold Seek (1-in-flight) ---");
-      let (gui_stats_1, gui_fps_1) = simulate_arrow_hold_gui(&rig, 0, 1, count, &mut seq, 60.0, 1);
+      let (gui_stats_1, gui_fps_1) = simulate_arrow_hold_gui(&rig, 0, 1, count, &mut seq, 60.0);
       println!(
           "  Simulated 60Hz GUI (1-in-flight): processed {} frames ({:.1} FPS)",
           count,
           gui_fps_1
       );
       report.add("Hold Right (Simulated 60Hz GUI 1-in-flight) Latency", gui_stats_1);
-
-      // ── Scenario 3: Simulated GUI 60Hz Hold Seek (2-in-flight) ──
-      println!("\n--- Scenario 3: Simulated GUI 60Hz Hold Seek (2-in-flight) ---");
-      let (gui_stats_2, gui_fps_2) = simulate_arrow_hold_gui(&rig, 0, 1, count, &mut seq, 60.0, 2);
-      println!(
-          "  Simulated 60Hz GUI (2-in-flight): processed {} frames ({:.1} FPS)",
-          count,
-          gui_fps_2
-      );
-      report.add("Hold Right (Simulated 60Hz GUI 2-in-flight) Latency", gui_stats_2);
 
       report.print_table();
       report.write_json("arrow_seek")?;
@@ -220,37 +212,29 @@
 
 ---
 
-### Task 2: Implement Multi-In-Flight Seeking and Frame Discard Guard in UI
+### Task 2: Implement Single-In-Flight seeking with Intelligent Buffer Draining in UI
 
 **Files:**
 - Modify: `src/ui/mod.rs`
 
-- [ ] **Step 1: Replace `in_flight_seek_seq` with `in_flight_seeks` HashSet**
+- [ ] **Step 1: Revert `in_flight_seeks` back to `in_flight_seek_seq` Option**
   Update the `MainApp` struct definition in `src/ui/mod.rs`:
-  Remove `pub in_flight_seek_seq: Option<usize>`
-  Add `pub in_flight_seeks: std::collections::HashSet<usize>`
+  Remove `pub in_flight_seeks: std::collections::HashSet<usize>`
+  Add `pub in_flight_seek_seq: Option<usize>`
 
   Update `MainApp::new` initialization:
   ```rust
-              in_flight_seeks: std::collections::HashSet::new(),
+              in_flight_seek_seq: None,
   ```
 
-- [ ] **Step 2: Update all resets of in-flight seek state**
-  Replace all `self.in_flight_seek_seq = None` and `self.in_flight_seek_seq = Some(...)` calls in `src/ui/mod.rs` to insert/remove/clear from the `HashSet`.
-
-- [ ] **Step 3: Update `try_recv()` loop in `update()`**
-  Do NOT discard older frames when stepping:
+- [ ] **Step 2: Update try-receive frame loop to do intelligent buffer draining**
+  Ensure we discard older frames and update `in_flight_seek_seq`:
   ```rust
           // Receive frames from the Media Engine
           if let Some(rx) = &self.frame_rx {
               let mut got_frame = false;
-              let is_stepping = matches!(
-                  self.arrow_seek_state,
-                  ArrowSeekState::SteppingLeft { .. } | ArrowSeekState::SteppingRight { .. }
-              );
-
               while let Ok(frame) = rx.try_recv() {
-                  if !is_stepping && frame.sequence_id() < self.latest_sequence_id {
+                  if frame.sequence_id() < self.latest_sequence_id {
                       continue;
                   }
                   let frame_idx = match &frame {
@@ -258,7 +242,9 @@
                       media::DecodedFrame::Gpu { frame_idx, .. } => *frame_idx,
                   };
                   
-                  self.in_flight_seeks.remove(&frame.sequence_id());
+                  if Some(frame.sequence_id()) == self.in_flight_seek_seq {
+                      self.in_flight_seek_seq = None;
+                  }
                   
                   self.latest_frame = Some(frame);
                   if !self.is_scrubbing {
@@ -269,17 +255,20 @@
               }
   ```
 
+- [ ] **Step 3: Update all resets of in-flight seek state in `src/ui/mod.rs`**
+  Restore the original `self.in_flight_seek_seq = None` and `self.in_flight_seek_seq = Some(self.latest_sequence_id)` logic in `scrub_to`, `drag_stopped`, and the arrow key hold handlers.
+
 - [ ] **Step 4: Update the arrow key hold handlers**
-  Allow up to 2 seeks in flight:
+  Ensure only 1 seek is in flight:
   ```rust
                   ArrowSeekState::SteppingLeft { held_since } => {
                       if prev_down {
                           if held_since.elapsed() >= std::time::Duration::from_millis(250) {
-                              if self.in_flight_seeks.len() < 2 {
+                              if self.in_flight_seek_seq.is_none() {
                                   self.is_playing = false;
                                   self.current_frame = self.current_frame.saturating_sub(1);
                                   self.seek_internal(self.current_frame, false, false);
-                                  self.in_flight_seeks.insert(self.latest_sequence_id);
+                                  self.in_flight_seek_seq = Some(self.latest_sequence_id);
                               }
                           }
                           ctx.request_repaint();
@@ -290,11 +279,11 @@
                   ArrowSeekState::SteppingRight { held_since } => {
                       if next_down {
                           if held_since.elapsed() >= std::time::Duration::from_millis(250) {
-                              if self.in_flight_seeks.len() < 2 {
+                              if self.in_flight_seek_seq.is_none() {
                                   self.is_playing = false;
                                   self.current_frame = (self.current_frame + 1).min(self.total_frames);
                                   self.seek_internal(self.current_frame, false, false);
-                                  self.in_flight_seeks.insert(self.latest_sequence_id);
+                                  self.in_flight_seek_seq = Some(self.latest_sequence_id);
                               }
                           }
                           ctx.request_repaint();
@@ -307,7 +296,7 @@
 - [ ] **Step 5: Run the benchmark again to measure new performance**
   Run the benchmark using the target video `bbb_sunflower_2160p_60fps_normal.mp4`:
   `SNIPPY_BENCH_VIDEO="/Users/dselck/Downloads/bbb_sunflower_2160p_60fps_normal.mp4" cargo run --release --bin bench_arrow_seek`
-  Expected: Scenario 3 (2-in-flight) runs at a solid 60 FPS.
+  Expected: Successful run, Simulated GUI runs at ~56 FPS.
 
 - [ ] **Step 6: Verify the project tests**
   Run: `cargo test`
@@ -316,6 +305,6 @@
 - [ ] **Step 7: Commit changes**
   Run:
   ```bash
-  git add src/ui/mod.rs
-  git commit -m "feat(ui): implement multi-in-flight pipelined seeking"
+  git add src/ui/mod.rs src/media/mod.rs
+  git commit -m "feat(ui): revert to stable single-in-flight seek with intelligent buffer draining"
   ```
