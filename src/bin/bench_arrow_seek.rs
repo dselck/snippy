@@ -1,7 +1,7 @@
 //! Headless arrow-key seeking benchmark.
 //!
 //! Simulates a user holding down ArrowRight (forward) and ArrowLeft (backward)
-//! to measure achieved FPS and frame delivery latency under single-in-flight throttling.
+//! to measure achieved FPS and frame delivery latency under VSync-ticked seeking and buffer draining.
 
 use snippy2::bench::{format_video_info, BenchReport, MediaTestRig, Stats, TestMediaLocator};
 use snippy2::media::MediaCommand;
@@ -65,11 +65,10 @@ fn simulate_arrow_hold_gui(
 
     let mut stats = Stats::new();
     let mut current = start_frame;
-    let mut in_flight: Option<usize> = None;
-    let mut last_send_time = Instant::now();
+    let mut send_times = std::collections::HashMap::<usize, Instant>::new();
 
     let tick_interval = Duration::from_secs_f64(1.0 / vsync_hz);
-    let mut last_tick = Instant::now();
+    let mut next_tick = Instant::now() + tick_interval;
     let mut frames_displayed = 0;
 
     let total_start = Instant::now();
@@ -77,44 +76,43 @@ fn simulate_arrow_hold_gui(
 
     while frames_displayed < count && total_start.elapsed() < duration_limit {
         let now = Instant::now();
-        let elapsed = now.duration_since(last_tick);
 
-        if elapsed >= tick_interval {
-            last_tick = now;
+        if now >= next_tick {
+            // Align next tick to avoid drift
+            next_tick += tick_interval;
 
-            // 1. UI receives frames from channel
-            let mut got_frame = false;
+            // 1. UI receives frames from channel (draining channel)
+            let mut latest_frame_received = None;
+
             while let Ok(frame) = rig.frame_rx.try_recv() {
-                // Intelligent Buffer Draining: discard older frames
                 if frame.sequence_id() < *seq {
                     continue;
                 }
-                
-                if Some(frame.sequence_id()) == in_flight {
-                    stats.push(last_send_time.elapsed());
-
-                    // Simulate texture upload overhead (copy YUV planes)
-                    if let snippy2::media::DecodedFrame::Cpu { planes, .. } = &frame {
-                        let mut dummy_y = vec![0u8; planes.y.len()];
-                        let mut dummy_u = vec![0u8; planes.u.len()];
-                        let mut dummy_v = vec![0u8; planes.v.len()];
-                        dummy_y.copy_from_slice(&planes.y);
-                        dummy_u.copy_from_slice(&planes.u);
-                        dummy_v.copy_from_slice(&planes.v);
-                        std::hint::black_box((dummy_y, dummy_u, dummy_v));
-                    }
-
-                    in_flight = None;
-                    got_frame = true;
-                }
+                latest_frame_received = Some(frame);
             }
 
-            if got_frame {
+            if let Some(frame) = latest_frame_received {
+                let frame_seq = frame.sequence_id();
+                if let Some(send_time) = send_times.remove(&frame_seq) {
+                    stats.push(send_time.elapsed());
+                }
+
+                // Simulate texture upload overhead (copy YUV planes)
+                if let snippy2::media::DecodedFrame::Cpu { planes, .. } = &frame {
+                    let mut dummy_y = vec![0u8; planes.y.len()];
+                    let mut dummy_u = vec![0u8; planes.u.len()];
+                    let mut dummy_v = vec![0u8; planes.v.len()];
+                    dummy_y.copy_from_slice(&planes.y);
+                    dummy_u.copy_from_slice(&planes.u);
+                    dummy_v.copy_from_slice(&planes.v);
+                    std::hint::black_box((dummy_y, dummy_u, dummy_v));
+                }
+
                 frames_displayed += 1;
             }
 
-            // 2. UI sends next seek if idle
-            if in_flight.is_none() && frames_displayed < count {
+            // 2. UI sends next seek unconditionally on every tick (no single-in-flight lock)
+            if frames_displayed < count {
                 if direction > 0 {
                     current = (current + 1).min(rig.metadata.total_frames.saturating_sub(1));
                 } else {
@@ -122,8 +120,7 @@ fn simulate_arrow_hold_gui(
                 }
 
                 *seq += 1;
-                in_flight = Some(*seq);
-                last_send_time = Instant::now();
+                send_times.insert(*seq, Instant::now());
                 let _ = rig.send(MediaCommand::Seek {
                     frame_index: current,
                     keyframe_only: false,
@@ -171,15 +168,15 @@ fn main() -> Result<(), anyhow::Error> {
     );
     report.add("Hold Right (Paused) Latency (Raw)", forward_stats);
 
-    // ── Scenario 2: Simulated GUI 60Hz Hold Seek (1-in-flight) ──
-    println!("\n--- Scenario 2: Simulated GUI 60Hz Hold Seek (1-in-flight) ---");
+    // ── Scenario 2: Simulated GUI 60Hz Hold Seek (VSync-Ticked with Buffer Drain) ──
+    println!("\n--- Scenario 2: Simulated GUI 60Hz Hold Seek (VSync-Ticked with Buffer Drain) ---");
     let (gui_stats_1, gui_fps_1) = simulate_arrow_hold_gui(&rig, 0, 1, count, &mut seq, 60.0);
     println!(
-        "  Simulated 60Hz GUI (1-in-flight): processed {} frames ({:.1} FPS)",
+        "  Simulated 60Hz GUI: processed {} frames ({:.1} FPS)",
         count,
         gui_fps_1
     );
-    report.add("Hold Right (Simulated 60Hz GUI 1-in-flight) Latency", gui_stats_1);
+    report.add("Hold Right (Simulated 60Hz GUI) Latency", gui_stats_1);
 
     report.print_table();
     report.write_json("arrow_seek")?;
