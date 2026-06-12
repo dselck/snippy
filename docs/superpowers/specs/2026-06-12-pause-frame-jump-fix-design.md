@@ -9,6 +9,7 @@ This document details the design for resolving the video frame jump issue when p
 There are two primary scenarios where the video frame jumps:
 1. **Jump to Keyframe when Pausing after Scrubbing**: When the user drags/clicks to seek while paused, the UI sends a precise `Seek` command followed immediately by a `Pause` command. When the video decoder thread receives the `Pause` command, it calls `video_pipeline.pause()`, which unconditionally sets `decode_more = false` and clears `seek_target_frame`. This stops the precise seek catch-up immediately, leaving the player on the keyframe.
 2. **Video Lead by ~900ms when Pausing Playback**: During active playback, the video decoder thread decodes ahead up to 20 frames (approx. 830ms at 24fps) to keep a lookahead buffer filled. When the user clicks play/pause to pause playback, the Media Engine thread sets `playing = false` and drains the play queue. However, the decoder thread concurrently finishes decoding its current packets and pushes additional lookahead frames to the queue before processing the `Pause` command. Since `playing` is now `false`, the Media Engine thread unconditionally forwards any newly received frames in the queue to the UI, causing the video frame to jump forward by ~900ms relative to the paused audio master clock.
+3. **AV Sync Disconnect on Resume**: In play-to-pause transitions, the audio clock stops immediately at time $T$. However, the UI drains lookahead frames from the channel, leaving the displayed video frame at $T + 900\text{ ms}$. When playback is resumed, the video stays frozen waiting for the audio clock to catch up by 900ms.
 
 ---
 
@@ -57,6 +58,41 @@ Introduce a tracking variable `seek_target_frame_idx: Option<usize>` in `run_dec
                     }
                 }
             }
+```
+
+### C. UI Thread State Alignment (`src/ui/mod.rs`)
+
+When pausing active playback in the UI thread (`set_playing(false)`), query the exact time the audio clock stopped at, calculate the corresponding frame index, and issue a precise `Seek` command to that frame index right before sending the `Pause` command. This aligns the video frame perfectly with the audio master clock at the pause point.
+
+```rust
+    fn set_playing(&mut self, play: bool) {
+        if let Some(tx) = &self.media_tx {
+            if play {
+                let _ = tx.send(media::MediaCommand::Play);
+                self.is_playing = true;
+                if let Some(ae) = &self.audio_engine {
+                    ae.master_clock.play();
+                }
+            } else {
+                let was_playing = self.is_playing;
+                self.is_playing = false;
+                if let Some(ae) = &self.audio_engine {
+                    ae.master_clock.pause();
+                }
+                
+                if was_playing {
+                    let mut pause_time = 0.0;
+                    if let Some(ae) = &self.audio_engine {
+                        pause_time = ae.master_clock.current_time();
+                    }
+                    let pause_frame = (pause_time * self.video_fps).round() as usize;
+                    self.seek_internal(pause_frame, false, true);
+                }
+                
+                let _ = tx.send(media::MediaCommand::Pause);
+            }
+        }
+    }
 ```
 
 ---
