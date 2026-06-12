@@ -79,6 +79,7 @@ impl MasterClock {
 
     pub fn play(&self) {
         self.state.is_playing.store(true, Ordering::Relaxed);
+        self.state.audio_paused_for_sync.store(false, Ordering::SeqCst);
         let start_us = self.state.fallback_start_us.load(Ordering::Relaxed);
         if start_us == 0 {
             let now_us = std::cmp::max(1, self.state.fallback_epoch.elapsed().as_micros() as u64);
@@ -195,5 +196,15 @@ mod tests {
         
         ticker.advance(24000, None, 72000);
         assert_eq!(clock.current_pts(), Some(1.5));
+    }
+
+    #[test]
+    fn test_play_clears_sync_pause() {
+        let (clock, ticker) = MasterClock::new(48000);
+        clock.set_has_audio(true);
+        clock.reset(0.0);
+        assert!(!ticker.is_active(), "Ticker should be inactive after reset");
+        clock.play();
+        assert!(ticker.is_active(), "Ticker should be active after play");
     }
 }
