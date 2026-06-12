@@ -28,19 +28,11 @@ When holding down an arrow key:
 ### Broken Debug Overlay FPS Display
 The `decode_fps_frame_count` is defined and initialized in `MainApp` but never incremented or reset in `src/ui/mod.rs`. The `decode_fps` is therefore stuck at 0.0. We need to increment the counter on every received frame and update the FPS value once per second.
 
-### VSync Serialization Idle Time
-In a single-in-flight seek model:
-`UI Sends Seek -> Decoder Decodes -> UI Receives Frame -> UI Sends Next Seek`
-Since the UI is capped by VSync (e.g. 60Hz), the decoder thread sits idle during the VSync wait time (e.g. up to 10ms per frame). This serialization causes the total frame time to exceed 16.6ms if any slight scheduling delay occurs, dropping the framerate to 30 FPS.
+## 2. Proposed Design: Single-In-Flight Seek with Intelligent Buffer Draining
 
-## 2. Proposed Design: Multi-In-Flight Pipelined Seeking
+We will revert the multi-in-flight pipelined seek model to avoid decoder queue contention, complex synchronization, and UI render stalling. Instead, we use a clean **single-in-flight throttled model** combined with **intelligent buffer draining**:
 
-To maximize throughput and ensure a solid 60 FPS in the GUI, we transition from a strict single-in-flight seek model to a **pipelined multi-in-flight model** (up to 2 seeks in flight):
-
-1. **State representation**: Replace `in_flight_seek_seq: Option<usize>` with a set of active sequence IDs:
-   ```rust
-   pub in_flight_seeks: std::collections::HashSet<usize>,
-   ```
-2. **Pipelining**: During the hold repeat phase, we allow sending a seek if `self.in_flight_seeks.len() < 2`.
-3. **No Frame Discarding during Step**: If the UI is in a stepping/seeking state, we do NOT discard "stale" frames based on `self.latest_sequence_id`. This ensures every single step frame is received, rendered, and accounted for in the presentation queue.
-4. **Benchmark Updates**: Update the benchmark harness to run with `max_in_flight = 2` to verify that we achieve a smooth 60 FPS.
+1. **State representation**: We use a single `in_flight_seek_seq: Option<usize>` to track the currently active seek.
+2. **Throttling**: The arrow key repeat handler only dispatches a new seek when `in_flight_seek_seq` is `None`. This guarantees that seeks are sequential (+1 frame), consistently hitting the decoder's sequential fast path (or cache) and achieving 40-60 FPS (VSync-capped).
+3. **Intelligent Buffer Draining**: In the UI frame receive loop, we discard any received frames whose sequence ID is less than `self.latest_sequence_id`. This performs an intelligent buffer drain: if any intermediate frames are received, they are instantly discarded without uploading textures or rendering, preventing UI thread stalls.
+4. **Benchmark Harness**: The benchmark harness will simulate this VSync-capped single-in-flight GUI loop to match the real software behavior.
