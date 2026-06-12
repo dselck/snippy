@@ -76,6 +76,9 @@ pub enum MediaCommand {
         sequence_id: usize,
         audio_enabled: bool,
     },
+    PlayUnpaced {
+        sequence_id: usize,
+    },
     Shutdown,
 }
 
