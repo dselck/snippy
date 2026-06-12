@@ -10,6 +10,13 @@ This behavior causes:
 2. **Sequential Fast-Path Misses**: If the user's input/repaint ticks are faster than the decoder, the target frame index jumps beyond the sequential fast-path limit (currently $+5$ frames). This triggers a hard seek, flushing FFmpeg and seeking the file, which is extremely slow.
 3. **Queue Clearing and Lag**: The decoder constantly discards work to start new seeks, leading to stuttering playback well below real-time.
 
+### Play-to-Pause Transition Bug
+When the user is playing the video and then holds down an arrow key, the UI sets `self.is_playing = false`. However, because the play/pause state synchronization check is run at the *top* of the UI `update()` loop before the key handlers update `self.is_playing`, the transition is missed. Consequently:
+- `self.set_playing(false)` is never called.
+- The audio engine remains unpaused.
+- The Media Engine does not receive a `Pause` command and still believes it is in playback mode.
+- When seek frames arrive, the Media Engine toggles back to `playing = true` and commands the decoder pipeline to play, causing play/seek contention and massive decoding overhead.
+
 ## 2. Proposed Design
 
 ### A. Arrow Seek State Machine
@@ -31,8 +38,8 @@ pub enum ArrowSeekState {
 
 State transitions are driven by keyboard inputs in `MainApp::update()`:
 * **Key Down Transition**: 
-  * If `ArrowLeft` is pressed (`prev_pressed`): set state to `SteppingLeft` and dispatch the first seek.
-  * If `ArrowRight` is pressed (`next_pressed`): set state to `SteppingRight` and dispatch the first seek.
+  * If `ArrowLeft` is pressed (`prev_pressed`): set state to `SteppingLeft`, explicitly call `self.set_playing(false)` to pause the backend, and dispatch the first seek.
+  * If `ArrowRight` is pressed (`next_pressed`): set state to `SteppingRight`, explicitly call `self.set_playing(false)` to pause the backend, and dispatch the first seek.
 * **Key Up Transition**:
   * If in state `SteppingLeft` and `ArrowLeft` is released (`!prev_down`): set state to `Idle`.
   * If in state `SteppingRight` and `ArrowRight` is released (`!next_down`): set state to `Idle`.
@@ -51,11 +58,10 @@ This ensures sequential frames are requested one at a time. Seeking forward will
 
 ### C. Benchmark Test Harness
 
-We will add a headless benchmark binary `src/bin/bench_arrow_seek.rs` to measure the performance of this hold-seeking loop.
+We will update the headless benchmark binary `src/bin/bench_arrow_seek.rs` to measure the performance of this hold-seeking loop under two conditions:
+1. **Clean State**: Starts from a paused state (ideal).
+2. **Transition State**: Starts from an active play state.
+   - **Scenario 3 (Buggy)**: Starts playing, then starts seeking without sending `Pause`.
+   - **Scenario 4 (Fixed)**: Starts playing, sends `Pause`, then starts seeking.
 
-* **Target Video**: Uses `SNIPPY_BENCH_VIDEO` if set, otherwise generates a synthetic video. We will test on `bbb_sunflower_2160p_60fps_normal.mp4`.
-* **Simulation**:
-  * Initializes the `MediaTestRig`.
-  * Simulates a "held-key" repeat loop: dispatches a seek, blocks until the frame arrives, then immediately dispatches the next.
-  * Measures achieved throughput (Frames Per Second) and latency statistics (min, median, max, etc.) for both forward and backward seeking.
-  * Writes standard `BenchReport` JSON files.
+We will verify that the fixed scenario runs at real-time speeds on `bbb_sunflower_2160p_60fps_normal.mp4`.
