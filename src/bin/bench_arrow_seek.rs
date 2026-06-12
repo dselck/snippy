@@ -87,10 +87,13 @@ fn simulate_arrow_hold_gui(
             let mut got_frame = false;
             while let Ok(frame) = rig.frame_rx.try_recv() {
                 let frame_seq = frame.sequence_id();
-                if in_flight.remove(&frame_seq) {
+                if in_flight.contains(&frame_seq) {
+                    // Remove all sequence IDs <= frame_seq since they are either completed or aborted
+                    in_flight.retain(|&s| s > frame_seq);
                     if let Some(send_time) = send_times.remove(&frame_seq) {
                         stats.push(send_time.elapsed());
                     }
+                    send_times.retain(|&s, _| s > frame_seq);
 
                     // Simulate texture upload overhead (copy YUV planes)
                     if let snippy2::media::DecodedFrame::Cpu { planes, .. } = &frame {
@@ -112,7 +115,7 @@ fn simulate_arrow_hold_gui(
             }
 
             // 2. UI sends next seek if under limit
-            while in_flight.len() < max_in_flight && frames_displayed + in_flight.len() < count {
+            if in_flight.len() < max_in_flight && frames_displayed + in_flight.len() < count {
                 if direction > 0 {
                     current = (current + 1).min(rig.metadata.total_frames.saturating_sub(1));
                 } else {

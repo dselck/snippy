@@ -76,7 +76,7 @@ pub struct MainApp {
     pub decode_fps: f32,
     pub arrow_seek_state: ArrowSeekState,
     pub latest_sequence_id: usize,
-    pub in_flight_seek_seq: Option<usize>,
+    pub in_flight_seeks: std::collections::HashSet<usize>,
     pub desired_scrub_frame: Option<usize>,
     pub last_sent_seek_frame: Option<usize>,
     pub was_playing_before_scrub: bool,
@@ -167,7 +167,7 @@ impl MainApp {
             decode_fps: 0.0,
             arrow_seek_state: ArrowSeekState::Idle,
             latest_sequence_id: 0,
-            in_flight_seek_seq: None,
+            in_flight_seeks: std::collections::HashSet::new(),
             desired_scrub_frame: None,
             last_sent_seek_frame: None,
             was_playing_before_scrub: false,
@@ -207,12 +207,12 @@ impl MainApp {
 
     fn scrub_to(&mut self, target_frame: usize) {
         self.is_playing = false;
-        if self.in_flight_seek_seq.is_some() {
+        if !self.in_flight_seeks.is_empty() {
             self.desired_scrub_frame = Some(target_frame);
             self.current_frame = target_frame;
         } else {
             self.seek_internal(target_frame, true, false);
-            self.in_flight_seek_seq = Some(self.latest_sequence_id);
+            self.in_flight_seeks.insert(self.latest_sequence_id);
             self.desired_scrub_frame = None;
         }
     }
@@ -783,8 +783,13 @@ impl eframe::App for MainApp {
         // Receive frames from the Media Engine
         if let Some(rx) = &self.frame_rx {
             let mut got_frame = false;
+            let is_stepping = matches!(
+                self.arrow_seek_state,
+                ArrowSeekState::SteppingLeft { .. } | ArrowSeekState::SteppingRight { .. }
+            );
+
             while let Ok(frame) = rx.try_recv() {
-                if frame.sequence_id() < self.latest_sequence_id {
+                if !is_stepping && frame.sequence_id() < self.latest_sequence_id {
                     continue;
                 }
                 let frame_idx = match &frame {
@@ -792,9 +797,8 @@ impl eframe::App for MainApp {
                     media::DecodedFrame::Gpu { frame_idx, .. } => *frame_idx,
                 };
                 
-                if Some(frame.sequence_id()) == self.in_flight_seek_seq {
-                    self.in_flight_seek_seq = None;
-                }
+                self.in_flight_seeks.remove(&frame.sequence_id());
+                self.in_flight_seeks.retain(|&seq| seq > frame.sequence_id());
                 
                 self.latest_frame = Some(frame);
                 if !self.is_scrubbing {
@@ -811,11 +815,11 @@ impl eframe::App for MainApp {
                 self.decode_fps_last_reset = std::time::Instant::now();
             }
             
-            if self.in_flight_seek_seq.is_none() {
+            if self.in_flight_seeks.is_empty() {
                 if let Some(desired) = self.desired_scrub_frame.take() {
                     if Some(desired) != self.last_sent_seek_frame {
                         self.seek_internal(desired, true, false);
-                        self.in_flight_seek_seq = Some(self.latest_sequence_id);
+                        self.in_flight_seeks.insert(self.latest_sequence_id);
                     }
                 }
             }
@@ -1219,7 +1223,7 @@ impl eframe::App for MainApp {
                         let target = self.latest_frame.as_ref().map(|f| f.frame_idx()).unwrap_or(self.current_frame);
                         self.current_frame = target;
                         self.is_playing = self.was_playing_before_scrub;
-                        self.in_flight_seek_seq = None;
+                        self.in_flight_seeks.clear();
                         self.desired_scrub_frame = None;
                         self.seek_internal(target, false, true);
                         self.set_playing(self.is_playing);
@@ -1709,7 +1713,7 @@ impl eframe::App for MainApp {
                         let target = self.latest_frame.as_ref().map(|f| f.frame_idx()).unwrap_or(self.current_frame);
                         self.current_frame = target;
                         self.is_playing = self.was_playing_before_scrub;
-                        self.in_flight_seek_seq = None;
+                        self.in_flight_seeks.clear();
                         self.desired_scrub_frame = None;
                         self.seek_internal(target, false, true);
                         self.set_playing(self.is_playing);
@@ -1813,7 +1817,8 @@ impl eframe::App for MainApp {
             };
             self.current_frame = self.current_frame.saturating_sub(1);
             self.seek_internal(self.current_frame, false, false);
-            self.in_flight_seek_seq = Some(self.latest_sequence_id);
+            self.in_flight_seeks.clear();
+            self.in_flight_seeks.insert(self.latest_sequence_id);
         } else if next_pressed && !is_currently_stepping {
             self.set_playing(false);
             self.arrow_seek_state = ArrowSeekState::SteppingRight {
@@ -1821,17 +1826,18 @@ impl eframe::App for MainApp {
             };
             self.current_frame = (self.current_frame + 1).min(self.total_frames);
             self.seek_internal(self.current_frame, false, false);
-            self.in_flight_seek_seq = Some(self.latest_sequence_id);
+            self.in_flight_seeks.clear();
+            self.in_flight_seeks.insert(self.latest_sequence_id);
         } else {
             match self.arrow_seek_state {
                 ArrowSeekState::SteppingLeft { held_since } => {
                     if prev_down {
                         if held_since.elapsed() >= std::time::Duration::from_millis(250) {
-                            if self.in_flight_seek_seq.is_none() {
+                            if self.in_flight_seeks.len() < 2 {
                                 self.is_playing = false;
                                 self.current_frame = self.current_frame.saturating_sub(1);
                                 self.seek_internal(self.current_frame, false, false);
-                                self.in_flight_seek_seq = Some(self.latest_sequence_id);
+                                self.in_flight_seeks.insert(self.latest_sequence_id);
                             }
                         }
                         ctx.request_repaint();
@@ -1842,11 +1848,11 @@ impl eframe::App for MainApp {
                 ArrowSeekState::SteppingRight { held_since } => {
                     if next_down {
                         if held_since.elapsed() >= std::time::Duration::from_millis(250) {
-                            if self.in_flight_seek_seq.is_none() {
+                            if self.in_flight_seeks.len() < 2 {
                                 self.is_playing = false;
                                 self.current_frame = (self.current_frame + 1).min(self.total_frames);
                                 self.seek_internal(self.current_frame, false, false);
-                                self.in_flight_seek_seq = Some(self.latest_sequence_id);
+                                self.in_flight_seeks.insert(self.latest_sequence_id);
                             }
                         }
                         ctx.request_repaint();
