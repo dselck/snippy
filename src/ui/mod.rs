@@ -31,7 +31,7 @@ pub enum PlaybackIcon {
 pub enum ArrowSeekState {
     Idle,
     SteppingLeft { held_since: std::time::Instant },
-    SteppingRight { held_since: std::time::Instant },
+    SteppingRight { held_since: std::time::Instant, unpaced_started: bool },
 }
 
 pub struct MainApp {
@@ -1821,6 +1821,7 @@ impl eframe::App for MainApp {
             self.set_playing(false);
             self.arrow_seek_state = ArrowSeekState::SteppingRight {
                 held_since: std::time::Instant::now(),
+                unpaced_started: false,
             };
             self.current_frame = (self.current_frame + 1).min(self.total_frames);
             self.seek_internal(self.current_frame, false, false);
@@ -1839,15 +1840,25 @@ impl eframe::App for MainApp {
                         self.arrow_seek_state = ArrowSeekState::Idle;
                     }
                 }
-                ArrowSeekState::SteppingRight { held_since } => {
+                ArrowSeekState::SteppingRight { held_since, unpaced_started } => {
                     if next_down {
                         if held_since.elapsed() >= std::time::Duration::from_millis(250) {
-                            self.is_playing = false;
-                            self.current_frame = (self.current_frame + 1).min(self.total_frames);
-                            self.seek_internal(self.current_frame, false, false);
+                            if !unpaced_started {
+                                self.latest_sequence_id += 1;
+                                if let Some(tx) = &self.media_tx {
+                                    let _ = tx.send(media::MediaCommand::PlayUnpaced { sequence_id: self.latest_sequence_id });
+                                }
+                                self.arrow_seek_state = ArrowSeekState::SteppingRight {
+                                    held_since,
+                                    unpaced_started: true,
+                                };
+                            }
                         }
                         ctx.request_repaint();
                     } else {
+                        if unpaced_started {
+                            self.set_playing(false);
+                        }
                         self.arrow_seek_state = ArrowSeekState::Idle;
                     }
                 }
