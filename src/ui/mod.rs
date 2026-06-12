@@ -783,16 +783,21 @@ impl eframe::App for MainApp {
         // Receive frames from the Media Engine
         if let Some(rx) = &self.frame_rx {
             let mut got_frame = false;
+            let mut latest_frame_received = None;
+
             while let Ok(frame) = rx.try_recv() {
                 if frame.sequence_id() < self.latest_sequence_id {
                     continue;
                 }
-                let frame_idx = match &frame {
-                    media::DecodedFrame::Cpu { frame_idx, .. } => *frame_idx,
-                    media::DecodedFrame::Gpu { frame_idx, .. } => *frame_idx,
-                };
+                latest_frame_received = Some(frame);
+                got_frame = true;
+                self.decode_fps_frame_count += 1;
+            }
+
+            if let Some(frame) = latest_frame_received {
+                let frame_idx = frame.frame_idx();
                 
-                if Some(frame.sequence_id()) == self.in_flight_seek_seq {
+                if self.in_flight_seek_seq.map_or(false, |seq| frame.sequence_id() >= seq) {
                     self.in_flight_seek_seq = None;
                 }
                 
@@ -800,17 +805,15 @@ impl eframe::App for MainApp {
                 if !self.is_scrubbing {
                     self.current_frame = frame_idx;
                 }
-                got_frame = true;
-                self.decode_fps_frame_count += 1;
             }
-            
+
             let elapsed = self.decode_fps_last_reset.elapsed();
             if elapsed >= std::time::Duration::from_secs(1) {
                 self.decode_fps = self.decode_fps_frame_count as f32 / elapsed.as_secs_f32();
                 self.decode_fps_frame_count = 0;
                 self.decode_fps_last_reset = std::time::Instant::now();
             }
-            
+
             if self.in_flight_seek_seq.is_none() {
                 if let Some(desired) = self.desired_scrub_frame.take() {
                     if Some(desired) != self.last_sent_seek_frame {
@@ -819,7 +822,7 @@ impl eframe::App for MainApp {
                     }
                 }
             }
-            
+
             if got_frame {
                 ctx.request_repaint();
             }
@@ -1827,12 +1830,9 @@ impl eframe::App for MainApp {
                 ArrowSeekState::SteppingLeft { held_since } => {
                     if prev_down {
                         if held_since.elapsed() >= std::time::Duration::from_millis(250) {
-                            if self.in_flight_seek_seq.is_none() {
-                                self.is_playing = false;
-                                self.current_frame = self.current_frame.saturating_sub(1);
-                                self.seek_internal(self.current_frame, false, false);
-                                self.in_flight_seek_seq = Some(self.latest_sequence_id);
-                            }
+                            self.is_playing = false;
+                            self.current_frame = self.current_frame.saturating_sub(1);
+                            self.seek_internal(self.current_frame, false, false);
                         }
                         ctx.request_repaint();
                     } else {
@@ -1842,12 +1842,9 @@ impl eframe::App for MainApp {
                 ArrowSeekState::SteppingRight { held_since } => {
                     if next_down {
                         if held_since.elapsed() >= std::time::Duration::from_millis(250) {
-                            if self.in_flight_seek_seq.is_none() {
-                                self.is_playing = false;
-                                self.current_frame = (self.current_frame + 1).min(self.total_frames);
-                                self.seek_internal(self.current_frame, false, false);
-                                self.in_flight_seek_seq = Some(self.latest_sequence_id);
-                            }
+                            self.is_playing = false;
+                            self.current_frame = (self.current_frame + 1).min(self.total_frames);
+                            self.seek_internal(self.current_frame, false, false);
                         }
                         ctx.request_repaint();
                     } else {
