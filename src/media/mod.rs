@@ -302,23 +302,37 @@ fn run_decoding_loop(
                 }
             }
         } else {
-            crossbeam_channel::select! {
-                recv(background_rx) -> cmd => {
-                    if let Ok(c) = cmd {
-                        pending_cmd = Some(c);
-                    }
-                }
-                recv(play_queue_rx) -> frame => {
-                    if let Ok(f) = frame {
-                        let seq = f.sequence_id();
-                        let _ = frame_tx.try_send(f);
-                        if play_after_seek && seq == latest_seq {
-                            playing = true;
-                            play_after_seek = false;
-                            sync_engine.reset();
-                            let _ = decoder_cmd_tx.send(MediaCommand::Play);
+            if seek_target_frame_idx.is_some() || play_after_seek {
+                crossbeam_channel::select! {
+                    recv(background_rx) -> cmd => {
+                        if let Ok(c) = cmd {
+                            pending_cmd = Some(c);
                         }
                     }
+                    recv(play_queue_rx) -> frame => {
+                        if let Ok(f) = frame {
+                            let seq = f.sequence_id();
+                            if let Some(target_idx) = seek_target_frame_idx {
+                                if seq == latest_seq {
+                                    let f_idx = f.frame_idx();
+                                    let _ = frame_tx.try_send(f);
+                                    if f_idx >= target_idx {
+                                        seek_target_frame_idx = None;
+                                    }
+                                }
+                            }
+                            if play_after_seek && seq == latest_seq {
+                                playing = true;
+                                play_after_seek = false;
+                                sync_engine.reset();
+                                let _ = decoder_cmd_tx.send(MediaCommand::Play);
+                            }
+                        }
+                    }
+                }
+            } else {
+                if let Ok(cmd) = background_rx.recv() {
+                    pending_cmd = Some(cmd);
                 }
             }
         }
