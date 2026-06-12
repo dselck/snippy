@@ -6,11 +6,9 @@ This document details the design for resolving the video frame jump issue when p
 
 ## 1. Problem Description
 
-When a seek is performed while the video is paused (e.g. when dragging and releasing the timeline progress bar, or clicking on a timeline thumbnail/waveform), the video jumps or snaps back to the nearest keyframe instead of stopping at the exact target frame.
-
-This behavior is caused by two overlapping issues in the decoder pipeline and media engine command flow:
-1. **Decoder Thread Aborts Seek Catch-up**: The UI thread sends a `Seek` command followed immediately by a `Pause` command. When the video decoder thread receives the `Pause` command, it calls `video_pipeline.pause()`, which unconditionally sets `decode_more = false` and clears `seek_target_frame`. This stops the precise seek catch-up immediately, leaving the player on the keyframe it started decoding from.
-2. **Media Engine Drains Queue**: In the media engine thread (`src/media/mod.rs`), receiving `Pause` unconditionally drains the decoded frame queue `play_queue_rx`. If the decoder thread managed to decode the target frame before stopping, it gets discarded here, preventing the UI from rendering it.
+There are two primary scenarios where the video frame jumps:
+1. **Jump to Keyframe when Pausing after Scrubbing**: When the user drags/clicks to seek while paused, the UI sends a precise `Seek` command followed immediately by a `Pause` command. When the video decoder thread receives the `Pause` command, it calls `video_pipeline.pause()`, which unconditionally sets `decode_more = false` and clears `seek_target_frame`. This stops the precise seek catch-up immediately, leaving the player on the keyframe.
+2. **Video Lead by ~900ms when Pausing Playback**: During active playback, the video decoder thread decodes ahead up to 20 frames (approx. 830ms at 24fps) to keep a lookahead buffer filled. When the user clicks play/pause to pause playback, the Media Engine thread sets `playing = false` and drains the play queue. However, the decoder thread concurrently finishes decoding its current packets and pushes additional lookahead frames to the queue before processing the `Pause` command. Since `playing` is now `false`, the Media Engine thread unconditionally forwards any newly received frames in the queue to the UI, causing the video frame to jump forward by ~900ms relative to the paused audio master clock.
 
 ---
 
@@ -31,18 +29,34 @@ Modify `video_pipeline.pause()` to keep `decode_more` active if a catch-up seek 
 
 ### B. Media Engine Thread Loop (`src/media/mod.rs`)
 
-Modify the `MediaCommand::Pause` match arm so that it only drains the play queue and resets the current frame if the video was actually playing. If we are already paused/seeking, we preserve the play queue and current frame so the seek target frame isn't discarded.
+Introduce a tracking variable `seek_target_frame_idx: Option<usize>` in `run_decoding_loop` to keep track of active seeks.
+
+1. **Modify `MediaCommand::Seek`**: Set `seek_target_frame_idx = Some(frame_index)`.
+2. **Modify `MediaCommand::Pause`**: Do not unconditionally reset the play queue if not playing, and do not clear `seek_target_frame_idx` (allowing the seek to complete catch-up).
+3. **Conditionally Forward Frames when Paused**: When `playing` is `false`, only forward frames from `play_queue_rx` to the UI if `seek_target_frame_idx` is `Some(...)` (meaning we are actively seeking). If it is `None`, discard the frames.
 
 ```rust
-                MediaCommand::Pause => {
-                    if playing {
-                        playing = false;
-                        current_frame = None;
-                        while play_queue_rx.try_recv().is_ok() {}
+            } else {
+                while let Ok(frame) = play_queue_rx.try_recv() {
+                    let seq = frame.sequence_id();
+                    if let Some(target_idx) = seek_target_frame_idx {
+                        if seq == latest_seq {
+                            let f_idx = frame.frame_idx();
+                            let _ = frame_tx.try_send(frame);
+                            if f_idx >= target_idx {
+                                seek_target_frame_idx = None;
+                            }
+                        }
                     }
-                    play_after_seek = false;
-                    let _ = decoder_cmd_tx.send(MediaCommand::Pause);
+                    if play_after_seek && seq == latest_seq {
+                        playing = true;
+                        play_after_seek = false;
+                        sync_engine.reset();
+                        let _ = decoder_cmd_tx.send(MediaCommand::Play);
+                        break;
+                    }
                 }
+            }
 ```
 
 ---
@@ -50,4 +64,4 @@ Modify the `MediaCommand::Pause` match arm so that it only drains the play queue
 ## 3. Verification Plan
 
 * **Unit Tests**: Run `cargo test` to verify all existing playback and master clock tests pass.
-* **Integration Tests**: Run `cargo run --bin test_playback_sync` to ensure synchronization integration tests pass.
+* **Integration Tests**: Run `cargo run --bin test_playback_sync` to ensure synchronization integration tests pass, including the new paused precise seek and pause jump tests.
