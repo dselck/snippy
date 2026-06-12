@@ -1793,7 +1793,7 @@ impl eframe::App for MainApp {
         // Setting self.is_playing = false here is critical: it prevents the AV sync block from
         // running next tick and clobbering current_frame from the master clock.
         if prev_pressed {
-            self.is_playing = false;
+            self.set_playing(false);
             self.arrow_seek_state = ArrowSeekState::SteppingLeft {
                 held_since: std::time::Instant::now(),
             };
@@ -1801,7 +1801,7 @@ impl eframe::App for MainApp {
             self.seek_internal(self.current_frame, false, false);
             self.in_flight_seek_seq = Some(self.latest_sequence_id);
         } else if next_pressed {
-            self.is_playing = false;
+            self.set_playing(false);
             self.arrow_seek_state = ArrowSeekState::SteppingRight {
                 held_since: std::time::Instant::now(),
             };
