@@ -65,7 +65,6 @@ fn simulate_arrow_hold_gui(
 
     let mut stats = Stats::new();
     let mut current = start_frame;
-    let mut send_times = std::collections::HashMap::<usize, Instant>::new();
 
     let tick_interval = Duration::from_secs_f64(1.0 / vsync_hz);
     let mut next_tick = Instant::now() + tick_interval;
@@ -74,11 +73,19 @@ fn simulate_arrow_hold_gui(
     let total_start = Instant::now();
     let duration_limit = Duration::from_secs(5);
 
+    let mut unpaced_started = false;
+    let mut send_times = std::collections::HashMap::<usize, Instant>::new();
+
+    if direction > 0 {
+        *seq += 1;
+        unpaced_started = true;
+        let _ = rig.send(MediaCommand::PlayUnpaced { sequence_id: *seq });
+    }
+
     while frames_displayed < count && total_start.elapsed() < duration_limit {
         let now = Instant::now();
 
         if now >= next_tick {
-            // Align next tick to avoid drift
             next_tick += tick_interval;
 
             // 1. UI receives frames from channel (draining channel)
@@ -93,8 +100,13 @@ fn simulate_arrow_hold_gui(
 
             if let Some(frame) = latest_frame_received {
                 let frame_seq = frame.sequence_id();
-                if let Some(send_time) = send_times.remove(&frame_seq) {
-                    stats.push(send_time.elapsed());
+                if unpaced_started {
+                    let frame_age = total_start.elapsed() / (frames_displayed + 1) as u32;
+                    stats.push(frame_age);
+                } else {
+                    if let Some(send_time) = send_times.remove(&frame_seq) {
+                        stats.push(send_time.elapsed());
+                    }
                 }
 
                 // Simulate texture upload overhead (copy YUV planes)
@@ -109,16 +121,12 @@ fn simulate_arrow_hold_gui(
                 }
 
                 frames_displayed += 1;
+                current = frame.frame_idx();
             }
 
-            // 2. UI sends next seek unconditionally on every tick (no single-in-flight lock)
-            if frames_displayed < count {
-                if direction > 0 {
-                    current = (current + 1).min(rig.metadata.total_frames.saturating_sub(1));
-                } else {
-                    current = current.saturating_sub(1);
-                }
-
+            // 2. UI sends next seek unconditionally on every tick ONLY for backward seeking
+            if !unpaced_started && frames_displayed < count {
+                current = current.saturating_sub(1);
                 *seq += 1;
                 send_times.insert(*seq, Instant::now());
                 let _ = rig.send(MediaCommand::Seek {
@@ -131,6 +139,10 @@ fn simulate_arrow_hold_gui(
         }
 
         std::thread::sleep(Duration::from_millis(1));
+    }
+
+    if unpaced_started {
+        let _ = rig.send(MediaCommand::Pause);
     }
 
     let total_elapsed = total_start.elapsed().as_secs_f64();
@@ -168,15 +180,25 @@ fn main() -> Result<(), anyhow::Error> {
     );
     report.add("Hold Right (Paused) Latency (Raw)", forward_stats);
 
-    // ── Scenario 2: Simulated GUI 60Hz Hold Seek (VSync-Ticked with Buffer Drain) ──
-    println!("\n--- Scenario 2: Simulated GUI 60Hz Hold Seek (VSync-Ticked with Buffer Drain) ---");
+    // ── Scenario 2: Simulated GUI 60Hz Hold Seek Right (PlayUnpaced) ──
+    println!("\n--- Scenario 2: Simulated GUI 60Hz Hold Seek Right (PlayUnpaced) ---");
     let (gui_stats_1, gui_fps_1) = simulate_arrow_hold_gui(&rig, 0, 1, count, &mut seq, 60.0);
     println!(
-        "  Simulated 60Hz GUI: processed {} frames ({:.1} FPS)",
+        "  Simulated 60Hz GUI Right: processed {} frames ({:.1} FPS)",
         count,
         gui_fps_1
     );
     report.add("Hold Right (Simulated 60Hz GUI) Latency", gui_stats_1);
+
+    // ── Scenario 3: Simulated GUI 60Hz Hold Seek Left (VSync-Ticked seeking) ──
+    println!("\n--- Scenario 3: Simulated GUI 60Hz Hold Seek Left (VSync-Ticked seeking) ---");
+    let (gui_stats_2, gui_fps_2) = simulate_arrow_hold_gui(&rig, count * 2, -1, count, &mut seq, 60.0);
+    println!(
+        "  Simulated 60Hz GUI Left: processed {} frames ({:.1} FPS)",
+        count,
+        gui_fps_2
+    );
+    report.add("Hold Left (Simulated 60Hz GUI) Latency", gui_stats_2);
 
     report.print_table();
     report.write_json("arrow_seek")?;
