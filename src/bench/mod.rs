@@ -68,7 +68,7 @@ impl MediaTestRig {
             let rb = SharedRb::<Heap<(f32, u64)>>::new(48000 * 2 * 2);
             let (audio_tx, mut audio_cons) = rb.split();
 
-            let tags_rb = SharedRb::<Heap<(u64, u64)>>::new(256);
+            let tags_rb = ringbuf::SharedRb::<ringbuf::storage::Heap<(u64, u64, u64)>>::new(256);
             let (tags_tx, mut tags_cons) = tags_rb.split();
 
             let ticker_clone = ticker.clone();
@@ -77,11 +77,27 @@ impl MediaTestRig {
                 let mut start_time = Instant::now();
                 let mut samples_read_total = 0u64;
                 let mut last_tag = None;
-                let mut pending_tag = None;
+                let mut pending_tag: Option<(u64, u64, u64)> = None;
                 let mut last_active = false;
+                let mut current_consumer_generation = 0;
 
                 loop {
                     let active = ticker_clone.is_active();
+
+                    // Always drop stale samples if the generation changed, even when inactive
+                    let producer_gen = ticker_clone.playback_generation();
+                    if producer_gen != current_consumer_generation {
+                        while let Some((_, generation)) = audio_cons.try_pop() {
+                            if generation == producer_gen {
+                                break;
+                            }
+                        }
+                        samples_read_total = 0;
+                        last_tag = None;
+                        pending_tag = None;
+                        current_consumer_generation = producer_gen;
+                    }
+
                     if !active {
                         last_active = false;
                         thread::sleep(Duration::from_millis(5));
@@ -101,18 +117,28 @@ impl MediaTestRig {
                         let mut written = 0;
 
                         while to_read > 0 {
-                            if let Some((_sample, _gen)) = audio_cons.try_pop() {
+                            if let Some((_sample, sample_generation)) = audio_cons.try_pop() {
+                                if sample_generation != current_consumer_generation {
+                                    samples_read_total = 0;
+                                    last_tag = None;
+                                    pending_tag = None;
+                                    current_consumer_generation = sample_generation;
+                                }
+
                                 written += 1;
                                 samples_read_total += 1;
                                 to_read -= 1;
 
                                 loop {
                                     let next_tag = pending_tag.take().or_else(|| tags_cons.try_pop());
-                                    if let Some((tag_idx, tag_pts_us)) = next_tag {
+                                    if let Some((tag_generation, tag_idx, tag_pts_us)) = next_tag {
+                                        if tag_generation != current_consumer_generation {
+                                            continue;
+                                        }
                                         if tag_idx <= samples_read_total {
                                             last_tag = Some((tag_idx, tag_pts_us));
                                         } else {
-                                            pending_tag = Some((tag_idx, tag_pts_us));
+                                            pending_tag = Some((tag_generation, tag_idx, tag_pts_us));
                                             break;
                                         }
                                     } else {
