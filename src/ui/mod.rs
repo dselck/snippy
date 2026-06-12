@@ -212,30 +212,20 @@ impl MainApp {
     }
 
     fn set_playing(&mut self, play: bool) {
-        if let Some(tx) = self.media_tx.clone() {
-            if play {
-                let _ = tx.send(media::MediaCommand::Play);
-                self.is_playing = true;
-                if let Some(ae) = &self.audio_engine {
-                    ae.master_clock.play();
-                }
+        if let Some(tx) = &self.media_tx {
+            let cmd = if play {
+                media::MediaCommand::Play
             } else {
-                let was_playing = self.is_playing;
-                self.is_playing = false;
-                if let Some(ae) = &self.audio_engine {
-                    ae.master_clock.pause();
-                }
-                
-                if was_playing {
-                    let mut pause_time = 0.0;
-                    if let Some(ae) = &self.audio_engine {
-                        pause_time = ae.master_clock.current_time();
-                    }
-                    let pause_frame = (pause_time * self.video_fps).round() as usize;
-                    self.seek_internal(pause_frame, false, true);
-                }
-                
-                let _ = tx.send(media::MediaCommand::Pause);
+                media::MediaCommand::Pause
+            };
+            let _ = tx.send(cmd);
+            self.is_playing = play;
+        }
+        if let Some(ae) = &self.audio_engine {
+            if play {
+                ae.master_clock.play();
+            } else {
+                ae.master_clock.pause();
             }
         }
     }
