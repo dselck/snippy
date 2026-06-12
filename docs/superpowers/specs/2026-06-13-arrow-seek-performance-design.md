@@ -17,9 +17,20 @@ When the user is playing the video and then holds down an arrow key, the UI sets
 - The Media Engine does not receive a `Pause` command and still believes it is in playback mode.
 - When seek frames arrive, the Media Engine toggles back to `playing = true` and commands the decoder pipeline to play, causing play/seek contention and massive decoding overhead.
 
+### OS Auto-Repeat State-Bypass Bug
+OS keyboard auto-repeat registers in egui as repeated `key_pressed` events (usually at a rate of 15Hz to 30Hz). 
+When holding down an arrow key:
+- The repeated `next_pressed`/`prev_pressed` events trigger the initial transition block in `update()`.
+- This resets `held_since` to `Instant::now()` on every tick, meaning `held_since.elapsed()` never reaches the 250ms entrance guard.
+- The high-performance throttled loop is bypassed, and seeks are sent at the OS key-repeat rate (~15-30 FPS) without enforcing the `in_flight_seek_seq` lock.
+- We must guard the `pressed` check by checking that we are not already in a stepping state.
+
+### Broken Debug Overlay FPS Display
+The `decode_fps_frame_count` is defined and initialized in `MainApp` but never incremented or reset in `src/ui/mod.rs`. The `decode_fps` is therefore stuck at 0.0. We need to increment the counter on every received frame and update the FPS value once per second.
+
 ## 2. Proposed Design
 
-### A. Arrow Seek State Machine
+### A. Arrow Seek State Machine with OS Repeat Guard
 
 We will replace the ad-hoc `left_arrow_held_since` and `right_arrow_held_since` variables in `MainApp` with an explicit state machine:
 
@@ -38,8 +49,9 @@ pub enum ArrowSeekState {
 
 State transitions are driven by keyboard inputs in `MainApp::update()`:
 * **Key Down Transition**: 
-  * If `ArrowLeft` is pressed (`prev_pressed`): set state to `SteppingLeft`, explicitly call `self.set_playing(false)` to pause the backend, and dispatch the first seek.
-  * If `ArrowRight` is pressed (`next_pressed`): set state to `SteppingRight`, explicitly call `self.set_playing(false)` to pause the backend, and dispatch the first seek.
+  * Only transition to stepping states if `!is_currently_stepping` (to prevent OS auto-repeat from constantly resetting `held_since`):
+    * If `prev_pressed && !is_currently_stepping`: set state to `SteppingLeft`, call `self.set_playing(false)`, and dispatch the first seek.
+    * If `next_pressed && !is_currently_stepping`: set state to `SteppingRight`, call `self.set_playing(false)`, and dispatch the first seek.
 * **Key Up Transition**:
   * If in state `SteppingLeft` and `ArrowLeft` is released (`!prev_down`): set state to `Idle`.
   * If in state `SteppingRight` and `ArrowRight` is released (`!next_down`): set state to `Idle`.
