@@ -28,52 +28,19 @@ When holding down an arrow key:
 ### Broken Debug Overlay FPS Display
 The `decode_fps_frame_count` is defined and initialized in `MainApp` but never incremented or reset in `src/ui/mod.rs`. The `decode_fps` is therefore stuck at 0.0. We need to increment the counter on every received frame and update the FPS value once per second.
 
-## 2. Proposed Design
+### VSync Serialization Idle Time
+In a single-in-flight seek model:
+`UI Sends Seek -> Decoder Decodes -> UI Receives Frame -> UI Sends Next Seek`
+Since the UI is capped by VSync (e.g. 60Hz), the decoder thread sits idle during the VSync wait time (e.g. up to 10ms per frame). This serialization causes the total frame time to exceed 16.6ms if any slight scheduling delay occurs, dropping the framerate to 30 FPS.
 
-### A. Arrow Seek State Machine with OS Repeat Guard
+## 2. Proposed Design: Multi-In-Flight Pipelined Seeking
 
-We will replace the ad-hoc `left_arrow_held_since` and `right_arrow_held_since` variables in `MainApp` with an explicit state machine:
+To maximize throughput and ensure a solid 60 FPS in the GUI, we transition from a strict single-in-flight seek model to a **pipelined multi-in-flight model** (up to 2 seeks in flight):
 
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArrowSeekState {
-    Idle,
-    SteppingLeft {
-        held_since: std::time::Instant,
-    },
-    SteppingRight {
-        held_since: std::time::Instant,
-    },
-}
-```
-
-State transitions are driven by keyboard inputs in `MainApp::update()`:
-* **Key Down Transition**: 
-  * Only transition to stepping states if `!is_currently_stepping` (to prevent OS auto-repeat from constantly resetting `held_since`):
-    * If `prev_pressed && !is_currently_stepping`: set state to `SteppingLeft`, call `self.set_playing(false)`, and dispatch the first seek.
-    * If `next_pressed && !is_currently_stepping`: set state to `SteppingRight`, call `self.set_playing(false)`, and dispatch the first seek.
-* **Key Up Transition**:
-  * If in state `SteppingLeft` and `ArrowLeft` is released (`!prev_down`): set state to `Idle`.
-  * If in state `SteppingRight` and `ArrowRight` is released (`!next_down`): set state to `Idle`.
-
-### B. One-In-Flight Throttling
-
-To prevent queue flooding, we apply the one-in-flight protocol:
-1. When a seek is sent, we set `in_flight_seek_seq = Some(latest_sequence_id)`.
-2. While `in_flight_seek_seq` is `Some`, we block dispatching any new seek commands from the arrow keys.
-3. When the frame with the matching sequence ID arrives, `in_flight_seek_seq` is set back to `None`.
-4. While the arrow key is held down (and the entrance guard of 250ms has elapsed):
-   * If `in_flight_seek_seq` is `None`, we advance `current_frame` by 1 and dispatch the seek immediately.
-   * We call `ctx.request_repaint()` to keep the egui loop spinning, allowing the next seek to fire the moment the frame arrives.
-
-This ensures sequential frames are requested one at a time. Seeking forward will consistently hit the decoder's sequential fast path, yielding real-time playback.
-
-### C. Benchmark Test Harness
-
-We will update the headless benchmark binary `src/bin/bench_arrow_seek.rs` to measure the performance of this hold-seeking loop under two conditions:
-1. **Clean State**: Starts from a paused state (ideal).
-2. **Transition State**: Starts from an active play state.
-   - **Scenario 3 (Buggy)**: Starts playing, then starts seeking without sending `Pause`.
-   - **Scenario 4 (Fixed)**: Starts playing, sends `Pause`, then starts seeking.
-
-We will verify that the fixed scenario runs at real-time speeds on `bbb_sunflower_2160p_60fps_normal.mp4`.
+1. **State representation**: Replace `in_flight_seek_seq: Option<usize>` with a set of active sequence IDs:
+   ```rust
+   pub in_flight_seeks: std::collections::HashSet<usize>,
+   ```
+2. **Pipelining**: During the hold repeat phase, we allow sending a seek if `self.in_flight_seeks.len() < 2`.
+3. **No Frame Discarding during Step**: If the UI is in a stepping/seeking state, we do NOT discard "stale" frames based on `self.latest_sequence_id`. This ensures every single step frame is received, rendered, and accounted for in the presentation queue.
+4. **Benchmark Updates**: Update the benchmark harness to run with `max_in_flight = 2` to verify that we achieve a smooth 60 FPS.
