@@ -187,6 +187,7 @@ fn run_decoding_loop(
     let mut current_frame: Option<DecodedFrame> = None;
     let mut pending_cmd: Option<MediaCommand> = None;
     let mut wait_duration: Option<std::time::Duration>;
+    let mut seek_target_frame_idx: Option<usize> = None;
 
     loop {
         // 1. Process incoming commands from UI/test rig
@@ -217,6 +218,7 @@ fn run_decoding_loop(
                     latest_seq = sequence_id;
                     playing = false;
                     current_frame = None;
+                    seek_target_frame_idx = Some(frame_index);
                     while play_queue_rx.try_recv().is_ok() {}
                     let _ = decoder_cmd_tx.send(MediaCommand::Seek {
                         frame_index,
@@ -237,12 +239,21 @@ fn run_decoding_loop(
             } else {
                 while let Ok(frame) = play_queue_rx.try_recv() {
                     let seq = frame.sequence_id();
-                    let _ = frame_tx.try_send(frame);
+                    if let Some(target_idx) = seek_target_frame_idx {
+                        if seq == latest_seq {
+                            let f_idx = frame.frame_idx();
+                            let _ = frame_tx.try_send(frame);
+                            if f_idx >= target_idx {
+                                seek_target_frame_idx = None;
+                            }
+                        }
+                    }
                     if play_after_seek && seq == latest_seq {
                         playing = true;
                         play_after_seek = false;
                         sync_engine.reset();
                         let _ = decoder_cmd_tx.send(MediaCommand::Play);
+                        break;
                     }
                 }
             }
