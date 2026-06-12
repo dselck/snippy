@@ -25,7 +25,7 @@
 **Files:**
 - Modify: `src/ui/mod.rs`
 
-- [ ] **Step 1: Update arrow key press transitions with repeat guard and set_playing**
+- [x] **Step 1: Update arrow key press transitions with repeat guard and set_playing**
   Modify the `update` method in `src/ui/mod.rs` to add the `is_currently_stepping` check to block OS auto-repeat from resetting `held_since`, and call `self.set_playing(false)` on transition:
 
   ```rust
@@ -88,7 +88,7 @@
           }
   ```
 
-- [ ] **Step 2: Implement Debug HUD FPS calculation**
+- [x] **Step 2: Implement Debug HUD FPS calculation**
   Increment `self.decode_fps_frame_count` inside the frame receiving loop, and calculate `self.decode_fps` once per second:
 
   In the `if let Some(rx) = &self.frame_rx` block:
@@ -122,16 +122,16 @@
               }
   ```
 
-- [ ] **Step 3: Run the benchmark again to measure new performance**
+- [x] **Step 3: Run the benchmark again to measure new performance**
   Run the benchmark using the target video `bbb_sunflower_2160p_60fps_normal.mp4`:
   `SNIPPY_BENCH_VIDEO="/Users/dselck/Downloads/bbb_sunflower_2160p_60fps_normal.mp4" cargo run --release --bin bench_arrow_seek`
   Expected: Successful run, all Scenarios show correct FPS.
 
-- [ ] **Step 4: Verify the project tests**
+- [x] **Step 4: Verify the project tests**
   Run: `cargo test`
   Expected: All tests pass.
 
-- [ ] **Step 5: Commit changes**
+- [x] **Step 5: Commit changes**
   Run:
   ```bash
   git add src/ui/mod.rs
