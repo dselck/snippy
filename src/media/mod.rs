@@ -204,10 +204,12 @@ fn run_decoding_loop(
                     let _ = decoder_cmd_tx.send(MediaCommand::Play);
                 }
                 MediaCommand::Pause => {
-                    playing = false;
+                    if playing {
+                        playing = false;
+                        current_frame = None;
+                        while play_queue_rx.try_recv().is_ok() {}
+                    }
                     play_after_seek = false;
-                    current_frame = None;
-                    while play_queue_rx.try_recv().is_ok() {}
                     let _ = decoder_cmd_tx.send(MediaCommand::Pause);
                 }
                 MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled } => {
