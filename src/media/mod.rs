@@ -34,7 +34,7 @@ impl MediaEngine {
         target_channels: usize,
         frame_tx: Sender<DecodedFrame>,
         audio_tx: CachingProd<Arc<SharedRb<Heap<(f32, u64)>>>>,
-        tags_tx: CachingProd<Arc<SharedRb<Heap<(u64, u64)>>>>,
+        tags_tx: CachingProd<Arc<SharedRb<Heap<(u64, u64, u64)>>>>,
         cmd_rx: Receiver<MediaCommand>,
         master_clock: crate::audio::clock::MasterClock,
     ) -> Result<(Self, VideoMetadata), anyhow::Error> {
@@ -146,7 +146,7 @@ fn run_decoding_loop(
     target_channels: usize,
     frame_tx: Sender<DecodedFrame>,
     audio_tx: CachingProd<Arc<SharedRb<Heap<(f32, u64)>>>>,
-    tags_tx: CachingProd<Arc<SharedRb<Heap<(u64, u64)>>>>,
+    tags_tx: CachingProd<Arc<SharedRb<Heap<(u64, u64, u64)>>>>,
     background_rx: Receiver<MediaCommand>,
     _cmd_rx: Receiver<MediaCommand>,
     fps: f64,
@@ -306,7 +306,7 @@ fn run_decoder_thread(
     target_channels: usize,
     play_queue_tx: Sender<DecodedFrame>,
     mut audio_tx: CachingProd<Arc<SharedRb<Heap<(f32, u64)>>>>,
-    mut tags_tx: CachingProd<Arc<SharedRb<Heap<(u64, u64)>>>>,
+    mut tags_tx: CachingProd<Arc<SharedRb<Heap<(u64, u64, u64)>>>>,
     decoder_cmd_rx: Receiver<MediaCommand>,
     fps: f64,
     master_clock: crate::audio::clock::MasterClock,
@@ -495,22 +495,40 @@ fn run_decoder_thread(
                                     let generation = master_clock.playback_generation();
                                     for chunk in chunks {
                                         if let Some(tag) = chunk.tag {
-                                            let _ = tags_tx.try_push(tag);
+                                            let _ = tags_tx.try_push((generation, tag.0, tag.1));
                                         }
-                                        let mut pushed_all = true;
-                                        for &sample in &chunk.data {
-                                            let mut retries = 0;
-                                            while audio_tx.try_push((sample, generation)).is_err() {
-                                                if retries >= 3 {
-                                                    pushed_all = false;
+                                        let mut chunk_pushed = false;
+                                        while !chunk_pushed {
+                                            if audio_tx.vacant_len() >= chunk.data.len() {
+                                                for &sample in &chunk.data {
+                                                    let _ = audio_tx.try_push((sample, generation));
+                                                }
+                                                chunk_pushed = true;
+                                            } else {
+                                                // Queue is full. Poll command channel to prevent deadlock.
+                                                if let Ok(cmd) = decoder_cmd_rx.try_recv() {
+                                                    match cmd {
+                                                        MediaCommand::Shutdown => return Ok(()),
+                                                        MediaCommand::Play => {
+                                                            video_pipeline.play();
+                                                        }
+                                                        MediaCommand::Pause => {
+                                                            video_pipeline.pause();
+                                                        }
+                                                        MediaCommand::Seek { .. } => {
+                                                            pending_cmd = Some(cmd);
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                if pending_cmd.is_some() {
                                                     break;
                                                 }
-                                                std::thread::sleep(std::time::Duration::from_millis(5));
-                                                retries += 1;
+                                                std::thread::sleep(std::time::Duration::from_millis(2));
                                             }
-                                            if !pushed_all {
-                                                break;
-                                            }
+                                        }
+                                        if pending_cmd.is_some() {
+                                            break;
                                         }
                                     }
                                 }
