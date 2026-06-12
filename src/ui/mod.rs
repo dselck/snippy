@@ -1831,9 +1831,12 @@ impl eframe::App for MainApp {
                 ArrowSeekState::SteppingLeft { held_since } => {
                     if prev_down {
                         if held_since.elapsed() >= std::time::Duration::from_millis(250) {
-                            self.is_playing = false;
-                            self.current_frame = self.current_frame.saturating_sub(1);
-                            self.seek_internal(self.current_frame, false, false);
+                            if self.in_flight_seek_seq.is_none() {
+                                self.is_playing = false;
+                                let target_frame = self.current_frame.saturating_sub(1);
+                                self.seek_internal(target_frame, false, false);
+                                self.in_flight_seek_seq = Some(self.latest_sequence_id);
+                            }
                         }
                         ctx.request_repaint();
                     } else {
@@ -1858,6 +1861,9 @@ impl eframe::App for MainApp {
                     } else {
                         if unpaced_started {
                             self.set_playing(false);
+                            if let Some(ae) = &self.audio_engine {
+                                ae.master_clock.reset(self.current_frame as f64 / self.video_fps);
+                            }
                         }
                         self.arrow_seek_state = ArrowSeekState::Idle;
                     }
