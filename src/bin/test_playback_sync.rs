@@ -266,6 +266,36 @@ fn main() -> Result<(), anyhow::Error> {
     }
     assert!(received_target, "Should receive precise seek target frame 45 when paused, not stop at keyframe!");
 
+    // 8. Test play-to-pause transition frame leak
+    println!("\n--- Test play-to-pause transition: verify video does not lead after pause ---");
+    me.tx.send(MediaCommand::Play)?;
+    
+    // Let it play for 300ms
+    thread::sleep(Duration::from_millis(300));
+    
+    // Drain frame_rx and capture the latest frame index before pause
+    let mut last_playing_frame = 0;
+    while let Ok(frame) = frame_rx.try_recv() {
+        last_playing_frame = frame.frame_idx();
+    }
+    println!("Pausing playback. Last playing frame received: {}", last_playing_frame);
+    
+    // Send Pause
+    me.tx.send(MediaCommand::Pause)?;
+    
+    // Wait 500ms to allow concurrent decoder work to settle
+    thread::sleep(Duration::from_millis(500));
+    
+    // Check if we received any more frames, and ensure none of them are significantly ahead
+    let mut last_received_frame_after_pause = last_playing_frame;
+    while let Ok(frame) = frame_rx.try_recv() {
+        last_received_frame_after_pause = frame.frame_idx();
+    }
+    
+    let leak_amount = last_received_frame_after_pause.saturating_sub(last_playing_frame);
+    println!("Settle complete. Last received frame after pause: {} (leak = {} frames)", last_received_frame_after_pause, leak_amount);
+    assert!(leak_amount <= 2, "Video frame lead should not exceed 2 frames (actual leak: {} frames)", leak_amount);
+
     println!("\n=== All Tests Passed Successfully ===");
     Ok(())
 }
