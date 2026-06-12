@@ -65,6 +65,14 @@ impl VideoDecoderPipeline {
         self.decode_more = true;
     }
 
+    pub fn play_unpaced(&mut self, sequence_id: usize) {
+        self.play_mode = true;
+        self.seek_target_frame = None;
+        self.keyframe_only_mode = false;
+        self.decode_more = true;
+        self.current_sequence_id = sequence_id;
+    }
+
     pub fn pause(&mut self) {
         self.play_mode = false;
         if self.seek_target_frame.is_none() {
