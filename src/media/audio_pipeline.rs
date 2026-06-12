@@ -132,7 +132,7 @@ impl AudioDecoderPipeline {
                         } else {
                             // Gap: Pad with silence or handle large gap
                             let gap_sec = pts_sec - target_container_time;
-                            if gap_sec <= 0.15 {
+                            if gap_sec <= 1.0 {
                                 let pad_samples = (gap_sec * self.target_sample_rate as f64).round() as usize;
                                 let pts_us = (self.skip_until_time.max(0.0) * 1_000_000.0) as u64;
                                 let pad_data = vec![0.0; pad_samples * self.target_channels];

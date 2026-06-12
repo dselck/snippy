@@ -66,6 +66,7 @@ impl DecodedFrame {
     }
 }
 
+#[derive(Debug)]
 pub enum MediaCommand {
     Play,
     Pause,

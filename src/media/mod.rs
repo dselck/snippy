@@ -182,6 +182,8 @@ fn run_decoding_loop(
     // Run Presenter Thread (current thread)
     let mut sync_engine = crate::media::sync::VideoSyncEngine::new(Box::new(master_clock.clone()));
     let mut playing = false;
+    let mut play_after_seek = false;
+    let mut latest_seq = 0;
     let mut current_frame: Option<DecodedFrame> = None;
     let mut pending_cmd: Option<MediaCommand> = None;
     let mut wait_duration: Option<std::time::Duration>;
@@ -197,16 +199,20 @@ fn run_decoding_loop(
                 }
                 MediaCommand::Play => {
                     playing = true;
+                    play_after_seek = false;
                     sync_engine.reset();
                     let _ = decoder_cmd_tx.send(MediaCommand::Play);
                 }
                 MediaCommand::Pause => {
                     playing = false;
+                    play_after_seek = false;
                     current_frame = None;
                     while play_queue_rx.try_recv().is_ok() {}
                     let _ = decoder_cmd_tx.send(MediaCommand::Pause);
                 }
                 MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled } => {
+                    play_after_seek = playing || play_after_seek;
+                    latest_seq = sequence_id;
                     playing = false;
                     current_frame = None;
                     while play_queue_rx.try_recv().is_ok() {}
@@ -228,7 +234,14 @@ fn run_decoding_loop(
                 }
             } else {
                 while let Ok(frame) = play_queue_rx.try_recv() {
-                    let _ = frame_tx.send(frame);
+                    let seq = frame.sequence_id();
+                    let _ = frame_tx.try_send(frame);
+                    if play_after_seek && seq == latest_seq {
+                        playing = true;
+                        play_after_seek = false;
+                        sync_engine.reset();
+                        let _ = decoder_cmd_tx.send(MediaCommand::Play);
+                    }
                 }
             }
         }
@@ -246,14 +259,14 @@ fn run_decoding_loop(
                 match action {
                     Ok(SyncAction::Present) => {
                         let frame = current_frame.take().unwrap();
-                        let _ = frame_tx.send(frame);
+                        let _ = frame_tx.try_send(frame);
                     }
                     Ok(SyncAction::Wait(remaining)) => {
                         wait_duration = Some(remaining);
                     }
                     Err(_) => {
                         let frame = current_frame.take().unwrap();
-                        let _ = frame_tx.send(frame);
+                        let _ = frame_tx.try_send(frame);
                     }
                 }
             }
@@ -292,7 +305,14 @@ fn run_decoding_loop(
                 }
                 recv(play_queue_rx) -> frame => {
                     if let Ok(f) = frame {
-                        let _ = frame_tx.send(f);
+                        let seq = f.sequence_id();
+                        let _ = frame_tx.try_send(f);
+                        if play_after_seek && seq == latest_seq {
+                            playing = true;
+                            play_after_seek = false;
+                            sync_engine.reset();
+                            let _ = decoder_cmd_tx.send(MediaCommand::Play);
+                        }
                     }
                 }
             }
@@ -422,7 +442,6 @@ fn run_decoder_thread(
                             .map(|idx| keyframes_pts[idx])
                             .unwrap_or(0);
 
-
                         unsafe {
                             let _ = ffmpeg_next::ffi::avformat_seek_file(
                                 input.as_mut_ptr(),
@@ -454,7 +473,6 @@ fn run_decoder_thread(
 
                     if stream_idx == video_stream_idx {
                         if let Ok(frames) = video_pipeline.process_packet(&packet) {
-
                             for frame in frames {
                                 let mut f_opt = Some(frame);
                                 while let Some(f) = f_opt.take() {
@@ -524,7 +542,7 @@ fn run_decoder_thread(
                                                 if pending_cmd.is_some() {
                                                     break;
                                                 }
-                                                std::thread::sleep(std::time::Duration::from_millis(2));
+                                                std::thread::sleep(std::time::Duration::from_millis(10));
                                             }
                                         }
                                         if pending_cmd.is_some() {
@@ -536,7 +554,6 @@ fn run_decoder_thread(
                         }
                     }
                 } else {
-
                     std::thread::sleep(std::time::Duration::from_millis(10));
                 }
             } else {

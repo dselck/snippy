@@ -72,6 +72,7 @@ pub struct MainApp {
     pub in_flight_seek_seq: Option<usize>,
     pub desired_scrub_frame: Option<usize>,
     pub last_sent_seek_frame: Option<usize>,
+    pub was_playing_before_scrub: bool,
 }
 
 impl MainApp {
@@ -110,7 +111,7 @@ impl MainApp {
                 let tags_tx = ae.tags_tx.take().unwrap();
                 let master_clock = ae.master_clock.clone();
                 let (frame_tx, frame_rx) = crossbeam_channel::bounded(30);
-                let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+                let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
                 
                 if let Ok((engine, meta)) = media::MediaEngine::new(
                     demo_path,
@@ -131,7 +132,7 @@ impl MainApp {
             }
         }
 
-        Self {
+        let mut app = Self {
             current_frame: 0,
             total_frames: metadata.as_ref().map_or(1000, |m| m.total_frames),
             is_playing: false,
@@ -163,7 +164,14 @@ impl MainApp {
             in_flight_seek_seq: None,
             desired_scrub_frame: None,
             last_sent_seek_frame: None,
+            was_playing_before_scrub: false,
+        };
+
+        if app.media_tx.is_some() {
+            app.seek_internal(0, false, true);
         }
+
+        app
     }
 
     fn frame_to_time(&self, frame: usize) -> String {
@@ -1182,6 +1190,9 @@ impl eframe::App for MainApp {
                         Color32::from_rgb(236, 72, 153),
                     );
 
+                    if wave_response.drag_started() {
+                        self.was_playing_before_scrub = self.is_playing;
+                    }
                     if wave_response.dragged() || wave_response.clicked() {
                         if let Some(mouse_pos) = wave_response.interact_pointer_pos() {
                             let rel_x = (mouse_pos.x - wave_rect.left()).clamp(0.0, wave_rect.width());
@@ -1190,10 +1201,14 @@ impl eframe::App for MainApp {
                             self.scrub_to(target_frame);
                         }
                     }
-                    if wave_response.drag_stopped() {
-                        if let Some(frame) = &self.latest_frame {
-                            self.current_frame = frame.frame_idx();
-                        }
+                    if wave_response.drag_stopped() || wave_response.clicked() {
+                        let target = self.latest_frame.as_ref().map(|f| f.frame_idx()).unwrap_or(self.current_frame);
+                        self.current_frame = target;
+                        self.is_playing = self.was_playing_before_scrub;
+                        self.in_flight_seek_seq = None;
+                        self.desired_scrub_frame = None;
+                        self.seek_internal(target, false, true);
+                        self.set_playing(self.is_playing);
                     }
                 });
             });
@@ -1401,7 +1416,7 @@ impl eframe::App for MainApp {
                                         let tags_tx = ae.tags_tx.take().unwrap();
                                         let master_clock = ae.master_clock.clone();
                                         let (frame_tx, frame_rx) = crossbeam_channel::bounded(30);
-                                        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+                                        let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
                                         
                                         if let Ok((engine, meta)) = media::MediaEngine::new(
                                             &path_str,
@@ -1425,8 +1440,11 @@ impl eframe::App for MainApp {
                                             self.out_marker = None;
                                             self.latest_frame = None;
                                             self.is_playing = false;
+                                            self.audio_engine = Some(ae);
+                                            self.seek_internal(0, false, true);
+                                        } else {
+                                            self.audio_engine = Some(ae);
                                         }
-                                        self.audio_engine = Some(ae);
                                     }
                                 }
                             }
@@ -1666,14 +1684,21 @@ impl eframe::App for MainApp {
                     // Sleek progress slider
                     let progress_response = self.progress_bar(ui);
                     progress_dragged = progress_response.dragged();
+                    if progress_response.drag_started() {
+                        self.was_playing_before_scrub = self.is_playing;
+                    }
                     if progress_response.dragged() || progress_response.clicked() {
                         let target_frame = self.current_frame;
                         self.scrub_to(target_frame);
                     }
-                    if progress_response.drag_stopped() {
-                        if let Some(frame) = &self.latest_frame {
-                            self.current_frame = frame.frame_idx();
-                        }
+                    if progress_response.drag_stopped() || progress_response.clicked() {
+                        let target = self.latest_frame.as_ref().map(|f| f.frame_idx()).unwrap_or(self.current_frame);
+                        self.current_frame = target;
+                        self.is_playing = self.was_playing_before_scrub;
+                        self.in_flight_seek_seq = None;
+                        self.desired_scrub_frame = None;
+                        self.seek_internal(target, false, true);
+                        self.set_playing(self.is_playing);
                     }
 
                     ui.add_space(10.0);
