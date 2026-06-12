@@ -28,11 +28,14 @@ When holding down an arrow key:
 ### Broken Debug Overlay FPS Display
 The `decode_fps_frame_count` is defined and initialized in `MainApp` but never incremented or reset in `src/ui/mod.rs`. The `decode_fps` is therefore stuck at 0.0. We need to increment the counter on every received frame and update the FPS value once per second.
 
-## 2. Proposed Design: Single-In-Flight Seek with Intelligent Buffer Draining
+## 2. Proposed Design: VSync-Ticked Seeking with Intelligent Buffer Draining
 
-We will revert the multi-in-flight pipelined seek model to avoid decoder queue contention, complex synchronization, and UI render stalling. Instead, we use a clean **single-in-flight throttled model** combined with **intelligent buffer draining**:
+Instead of blocking the UI tick behind a synchronous one-in-flight lock (which results in frame rate degradation due to scheduling jitter), we will use a **VSync-ticked seeking model** with **intelligent buffer draining** for arrow keys:
 
-1. **State representation**: We use a single `in_flight_seek_seq: Option<usize>` to track the currently active seek.
-2. **Throttling**: The arrow key repeat handler only dispatches a new seek when `in_flight_seek_seq` is `None`. This guarantees that seeks are sequential (+1 frame), consistently hitting the decoder's sequential fast path (or cache) and achieving 40-60 FPS (VSync-capped).
-3. **Intelligent Buffer Draining**: In the UI frame receive loop, we discard any received frames whose sequence ID is less than `self.latest_sequence_id`. This performs an intelligent buffer drain: if any intermediate frames are received, they are instantly discarded without uploading textures or rendering, preventing UI thread stalls.
-4. **Benchmark Harness**: The benchmark harness will simulate this VSync-capped single-in-flight GUI loop to match the real software behavior.
+1. **Unblocked Tick Seeking**: In the arrow key hold handlers, we do NOT enforce the `in_flight_seek_seq` lock. Instead, we send exactly one seek command on every UI tick (usually 60Hz/VSync). Since seek targets are sequential (+1 frame), this still hits the decoder's sequential fast-path or cache.
+2. **Intelligent Buffer Draining**: In the UI frame receive loop, we drain the entire channel of received frames:
+   - We discard any stale frames whose sequence ID is less than `self.latest_sequence_id`.
+   - Out of the remaining frames, we only keep and render the **latest frame** (the one with the largest sequence ID), discarding intermediate frames without uploading their textures or invoking shader rendering.
+   - This prevents rendering overhead from stalling the UI thread.
+3. **Scrubbing Safety**: The timeline scrub loop (mouse dragging) will continue to use the single-in-flight `in_flight_seek_seq` lock, as mouse drag events generate updates at a rate much higher than VSync.
+4. **Benchmark updates**: The benchmark harness will simulate this unblocked ticked seeking loop with a 60Hz tick rate and buffer draining.
