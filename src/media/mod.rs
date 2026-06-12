@@ -182,6 +182,7 @@ fn run_decoding_loop(
     // Run Presenter Thread (current thread)
     let mut sync_engine = crate::media::sync::VideoSyncEngine::new(Box::new(master_clock.clone()));
     let mut playing = false;
+    let mut unpaced = false;
     let mut play_after_seek = false;
     let mut latest_seq = 0;
     let mut current_frame: Option<DecodedFrame> = None;
@@ -200,12 +201,22 @@ fn run_decoding_loop(
                 }
                 MediaCommand::Play => {
                     playing = true;
+                    unpaced = false;
                     play_after_seek = false;
                     sync_engine.reset();
                     let _ = decoder_cmd_tx.send(MediaCommand::Play);
                 }
+                MediaCommand::PlayUnpaced { sequence_id } => {
+                    playing = true;
+                    unpaced = true;
+                    play_after_seek = false;
+                    latest_seq = sequence_id;
+                    while play_queue_rx.try_recv().is_ok() {}
+                    let _ = decoder_cmd_tx.send(MediaCommand::PlayUnpaced { sequence_id });
+                }
                 MediaCommand::Pause => {
                     playing = false;
+                    unpaced = false;
                     play_after_seek = false;
                     let _ = decoder_cmd_tx.send(MediaCommand::Pause);
                 }
@@ -213,6 +224,7 @@ fn run_decoding_loop(
                     play_after_seek = playing || play_after_seek;
                     latest_seq = sequence_id;
                     playing = false;
+                    unpaced = false;
                     current_frame = None;
                     seek_target_frame_idx = Some(frame_index);
                     while play_queue_rx.try_recv().is_ok() {}
@@ -259,19 +271,24 @@ fn run_decoding_loop(
         wait_duration = None;
         if playing {
             if let Some(frame) = &current_frame {
-                let pts_sec = frame.pts_sec();
-                let action = sync_engine.evaluate_frame(pts_sec);
-                match action {
-                    Ok(SyncAction::Present) => {
-                        let frame = current_frame.take().unwrap();
-                        let _ = frame_tx.try_send(frame);
-                    }
-                    Ok(SyncAction::Wait(remaining)) => {
-                        wait_duration = Some(remaining);
-                    }
-                    Err(_) => {
-                        let frame = current_frame.take().unwrap();
-                        let _ = frame_tx.try_send(frame);
+                if unpaced {
+                    let frame = current_frame.take().unwrap();
+                    let _ = frame_tx.try_send(frame);
+                } else {
+                    let pts_sec = frame.pts_sec();
+                    let action = sync_engine.evaluate_frame(pts_sec);
+                    match action {
+                        Ok(SyncAction::Present) => {
+                            let frame = current_frame.take().unwrap();
+                            let _ = frame_tx.try_send(frame);
+                        }
+                        Ok(SyncAction::Wait(remaining)) => {
+                            wait_duration = Some(remaining);
+                        }
+                        Err(_) => {
+                            let frame = current_frame.take().unwrap();
+                            let _ = frame_tx.try_send(frame);
+                        }
                     }
                 }
             }
@@ -434,6 +451,11 @@ fn run_decoder_thread(
                     }
                     video_pipeline.play();
                 }
+                MediaCommand::PlayUnpaced { sequence_id } => {
+                    audio_enabled = false;
+                    master_clock.set_has_audio(false);
+                    video_pipeline.play_unpaced(sequence_id);
+                }
                 MediaCommand::Pause => {
                     video_pipeline.pause();
                 }
@@ -509,6 +531,12 @@ fn run_decoder_thread(
                                                         video_pipeline.play();
                                                         f_opt = Some(f);
                                                     }
+                                                    MediaCommand::PlayUnpaced { sequence_id } => {
+                                                        audio_enabled = false;
+                                                        master_clock.set_has_audio(false);
+                                                        video_pipeline.play_unpaced(sequence_id);
+                                                        f_opt = Some(f);
+                                                    }
                                                     MediaCommand::Pause => {
                                                         video_pipeline.pause();
                                                     }
@@ -548,6 +576,11 @@ fn run_decoder_thread(
                                                         MediaCommand::Shutdown => return Ok(()),
                                                         MediaCommand::Play => {
                                                             video_pipeline.play();
+                                                        }
+                                                        MediaCommand::PlayUnpaced { sequence_id } => {
+                                                            audio_enabled = false;
+                                                            master_clock.set_has_audio(false);
+                                                            video_pipeline.play_unpaced(sequence_id);
                                                         }
                                                         MediaCommand::Pause => {
                                                             video_pipeline.pause();
