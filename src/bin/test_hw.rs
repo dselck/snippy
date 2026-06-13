@@ -17,6 +17,7 @@ fn main() {
         );
         if res == 0 && !hw_device_ctx.is_null() {
             (*codec_ctx.as_mut_ptr()).hw_device_ctx = ffmpeg_next::sys::av_buffer_ref(hw_device_ctx);
+            ffmpeg_next::sys::av_buffer_unref(&mut hw_device_ctx);
             println!("Attached Videotoolbox HW Context");
         }
     }

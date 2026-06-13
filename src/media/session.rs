@@ -26,34 +26,58 @@ pub enum InputEvent {
 }
 
 pub struct PlaybackSession {
-    pub current_frame: usize,
-    pub total_frames: usize,
-    pub is_playing: bool,
-    pub video_fps: f64,
+    current_frame: usize,
+    total_frames: usize,
+    is_playing: bool,
+    video_fps: f64,
     
-    pub frame_rx: Option<Receiver<DecodedFrame>>,
-    pub latest_frame: Option<DecodedFrame>,
+    pub(crate) frame_rx: Option<Receiver<DecodedFrame>>,
+    latest_frame: Option<DecodedFrame>,
 
-    pub audio_engine: Option<AudioEngine>,
-    pub media_engine: Option<MediaEngine>,
-    pub media_tx: Option<Sender<MediaCommand>>,
-    pub metadata: Option<VideoMetadata>,
+    audio_engine: Option<AudioEngine>,
+    pub(crate) media_engine: Option<MediaEngine>,
+    pub(crate) media_tx: Option<Sender<MediaCommand>>,
+    pub(crate) metadata: Option<VideoMetadata>,
 
-    pub latest_sequence_id: usize,
-    pub in_flight_seek_seq: Option<usize>,
-    pub desired_scrub_frame: Option<usize>,
-    pub last_sent_seek_frame: Option<usize>,
-    pub was_playing_before_scrub: bool,
+    latest_sequence_id: usize,
+    in_flight_seek_seq: Option<usize>,
+    desired_scrub_frame: Option<usize>,
+    last_sent_seek_frame: Option<usize>,
+    was_playing_before_scrub: bool,
 
     // Headless support
-    pub master_clock: Option<MasterClock>,
-    pub audio_consumer: Option<thread::JoinHandle<()>>,
+    master_clock: Option<MasterClock>,
+    audio_consumer: Option<thread::JoinHandle<()>>,
 
-    pub arrow_seek_state: ArrowSeekState,
-    pub is_scrubbing: bool,
+    arrow_seek_state: ArrowSeekState,
+    is_scrubbing: bool,
 }
 
 impl PlaybackSession {
+    pub fn current_frame(&self) -> usize {
+        self.current_frame
+    }
+
+    pub fn total_frames(&self) -> usize {
+        self.total_frames
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.is_playing
+    }
+
+    pub fn video_fps(&self) -> f64 {
+        self.video_fps
+    }
+
+    pub fn latest_frame(&self) -> Option<&DecodedFrame> {
+        self.latest_frame.as_ref()
+    }
+
+    pub fn master_clock(&self) -> Option<MasterClock> {
+        self.master_clock.clone()
+    }
+
     pub fn new() -> Self {
         Self {
             current_frame: 0,
@@ -273,6 +297,11 @@ impl PlaybackSession {
             }
         }
         
+        if self.current_frame >= self.total_frames {
+            self.current_frame = self.total_frames;
+            self.set_playing(false);
+        }
+        
         (self.latest_frame.as_ref(), frames_received)
     }
 
@@ -432,7 +461,7 @@ mod tests {
         assert!(session.is_scrubbing());
 
         session.handle_input(InputEvent::ScrubDragUpdate { target_frame: 42 });
-        assert_eq!(session.current_frame, 42);
+        assert_eq!(session.current_frame(), 42);
         assert!(session.is_scrubbing());
 
         session.handle_input(InputEvent::ScrubDragEnd);

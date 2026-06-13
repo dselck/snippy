@@ -142,17 +142,15 @@ impl VideoDecoderPipeline {
         false
     }
 
-    pub fn get_cached_frame(&self, frame_index: usize) -> Option<DecodedFrame> {
-        if let Some(cached) = self.gop_cache.get_cached(frame_index) {
-            Some(DecodedFrame::Cpu {
-                frame_idx: frame_index,
-                planes: cached.planes.clone(),
-                sequence_id: self.current_sequence_id,
-                pts_sec: cached.pts_sec,
-            })
-        } else {
-            None
-        }
+    pub fn get_cached_frame(&self, frame_idx: usize) -> Option<DecodedFrame> {
+        self.gop_cache.get_cached(frame_idx).map(|f| {
+            let mut f_frame = f.frame.clone();
+            match &mut f_frame {
+                DecodedFrame::Cpu { sequence_id, .. } => *sequence_id = self.current_sequence_id,
+                DecodedFrame::Gpu { sequence_id, .. } => *sequence_id = self.current_sequence_id,
+            }
+            f_frame
+        })
     }
     
     /// Processes a video packet, returning any frames that are ready to be displayed.
@@ -165,28 +163,23 @@ impl VideoDecoderPipeline {
         
         let mut frames = Vec::new();
 
-        while let Some(decoded) = self.adapter.receive_frame()? {
-            let (frame_idx, pts_sec, planes) = match decoded {
-                DecodedFrame::Cpu { frame_idx, pts_sec, planes, .. } => (frame_idx, pts_sec, planes),
-                _ => unreachable!(),
-            };
-
-            let final_frame = DecodedFrame::Cpu {
-                frame_idx,
-                planes: planes.clone(),
-                sequence_id: self.current_sequence_id,
-                pts_sec,
-            };
-
-            // GOP Cache population
-            if self.keyframes.binary_search(&frame_idx).is_ok() {
-                self.gop_cache.clear_if_different_gop(frame_idx);
+        while let Some(mut decoded) = self.adapter.receive_frame()? {
+            match &mut decoded {
+                DecodedFrame::Cpu { sequence_id, .. } => {
+                    *sequence_id = self.current_sequence_id;
+                }
+                DecodedFrame::Gpu { sequence_id, .. } => {
+                    *sequence_id = self.current_sequence_id;
+                }
             }
-            if self.gop_cache.keyframe_idx == usize::MAX {
-                let target_kf = Self::get_nearest_keyframe(&self.keyframes, frame_idx);
-                self.gop_cache.clear_if_different_gop(target_kf);
-            }
-            self.gop_cache.insert_frame(frame_idx, CachedFrame { planes: planes.clone(), pts_sec });
+
+            let frame_idx = decoded.frame_idx();
+            let _pts_sec = decoded.pts_sec();
+
+            // GOP Cache population: limit cache to the current GOP to prevent unbounded memory growth
+            let nearest_kf = Self::get_nearest_keyframe(&self.keyframes, frame_idx);
+            self.gop_cache.clear_if_different_gop(nearest_kf);
+            self.gop_cache.insert_frame(frame_idx, CachedFrame { frame: decoded.clone() });
 
             self.last_decoded_frame = Some(frame_idx);
 
@@ -195,17 +188,17 @@ impl VideoDecoderPipeline {
                     if frame_idx >= target {
                         self.decode_more = false;
                         self.seek_target_frame = None;
-                        frames.push(final_frame);
+                        frames.push(decoded);
                         break;
                     }
                 }
             } else {
-                frames.push(final_frame.clone());
+                frames.push(decoded.clone());
             }
 
             if self.keyframe_only_mode && !self.play_mode {
                 self.decode_more = false;
-                frames.push(final_frame);
+                frames.push(decoded);
                 break;
             }
         }

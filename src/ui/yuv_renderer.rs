@@ -3,6 +3,7 @@ use crate::media::YuvPlanes;
 
 pub struct YuvRenderer {
     pub pipeline: wgpu::RenderPipeline,
+    pub nv12_pipeline: wgpu::RenderPipeline,
     pub sampler: wgpu::Sampler,
     // holding y, u, v textures
     pub y_texture: Option<wgpu::Texture>,
@@ -10,6 +11,90 @@ pub struct YuvRenderer {
     pub v_texture: Option<wgpu::Texture>,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub bind_group: Option<wgpu::BindGroup>,
+    pub color_buffer: wgpu::Buffer,
+    pub is_nv12: bool,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ColorUniforms {
+    pub y_mult: f32,
+    pub y_offset: f32,
+    pub r_v: f32,
+    pub g_u: f32,
+    pub g_v: f32,
+    pub b_u: f32,
+    pub uv_scale_x: f32,
+    pub uv_scale_y: f32,
+}
+
+impl ColorUniforms {
+    pub fn new(space: ffmpeg_next::color::Space, range: ffmpeg_next::color::Range, uv_scale_x: f32, uv_scale_y: f32) -> Self {
+        let is_full = matches!(range, ffmpeg_next::color::Range::JPEG);
+        let y_mult = if is_full { 1.0 } else { 1.164383 };
+        let y_offset = if is_full { 0.0 } else { 0.062745 };
+        
+        let r_v;
+        let g_u;
+        let g_v;
+        let b_u;
+
+        match space {
+            ffmpeg_next::color::Space::BT470BG | ffmpeg_next::color::Space::SMPTE170M | ffmpeg_next::color::Space::SMPTE240M => {
+                // BT.601
+                if is_full {
+                    r_v = 1.402;
+                    g_u = 0.344136;
+                    g_v = 0.714136;
+                    b_u = 1.772;
+                } else {
+                    r_v = 1.596027;
+                    g_u = 0.391762;
+                    g_v = 0.812968;
+                    b_u = 2.017232;
+                }
+            }
+            ffmpeg_next::color::Space::BT2020NCL | ffmpeg_next::color::Space::BT2020CL => {
+                // BT.2020
+                if is_full {
+                    r_v = 1.4746;
+                    g_u = 0.1645;
+                    g_v = 0.5713;
+                    b_u = 1.8814;
+                } else {
+                    r_v = 1.6786;
+                    g_u = 0.1873;
+                    g_v = 0.6504;
+                    b_u = 2.1417;
+                }
+            }
+            _ => {
+                // BT.709
+                if is_full {
+                    r_v = 1.5748;
+                    g_u = 0.1873;
+                    g_v = 0.4681;
+                    b_u = 1.8556;
+                } else {
+                    r_v = 1.7927;
+                    g_u = 0.2132;
+                    g_v = 0.5329;
+                    b_u = 2.1124;
+                }
+            }
+        }
+        
+        Self {
+            y_mult,
+            y_offset,
+            r_v,
+            g_u,
+            g_v,
+            b_u,
+            uv_scale_x,
+            uv_scale_y,
+        }
+    }
 }
 
 impl YuvRenderer {
@@ -55,6 +140,16 @@ impl YuvRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<ColorUniforms>() as u64),
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -90,6 +185,32 @@ impl YuvRenderer {
             multiview: None,
         });
 
+        let nv12_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("nv12_render_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main_nv12",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+        });
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
@@ -98,18 +219,97 @@ impl YuvRenderer {
             ..Default::default()
         });
 
+        let color_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("color_uniform_buffer"),
+            size: std::mem::size_of::<ColorUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             pipeline,
+            nv12_pipeline,
             sampler,
             y_texture: None,
             u_texture: None,
             v_texture: None,
             bind_group_layout,
             bind_group: None,
+            color_buffer,
+            is_nv12: false,
         }
     }
 
-    pub fn update_textures(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, planes: &YuvPlanes) {
+    pub fn update_textures_from_hw_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        hw_frame: std::sync::Arc<crate::media::types::HwFrameWrapper>,
+        color_space: ffmpeg_next::color::Space,
+        color_range: ffmpeg_next::color::Range,
+    ) {
+        #[cfg(target_os = "macos")]
+        {
+            let textures = unsafe { crate::media::mac_hw_surface::create_texture_from_videotoolbox_frame(device, &hw_frame.frame) };
+            if let Some((tex_y, tex_uv)) = textures {
+                self.is_nv12 = true;
+
+                let y_view = tex_y.create_view(&wgpu::TextureViewDescriptor::default());
+                let uv_view = tex_uv.create_view(&wgpu::TextureViewDescriptor::default());
+
+                self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("nv12_bind_group"),
+                    layout: &self.bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&y_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&uv_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&uv_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: self.color_buffer.as_entire_binding(),
+                        },
+                    ],
+                }));
+
+                let uv_scale_x = hw_frame.frame.width() as f32 / tex_y.width() as f32;
+                let uv_scale_y = hw_frame.frame.height() as f32 / tex_y.height() as f32;
+
+                self.y_texture = Some(tex_y);
+                self.u_texture = Some(tex_uv);
+                self.v_texture = None;
+                
+                let uniforms = ColorUniforms::new(color_space, color_range, uv_scale_x, uv_scale_y);
+                queue.write_buffer(&self.color_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+                
+                queue.on_submitted_work_done(move || {
+                    drop(hw_frame);
+                });
+            }
+        }
+    }
+
+    pub fn update_textures(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        planes: &YuvPlanes,
+        color_space: ffmpeg_next::color::Space,
+        color_range: ffmpeg_next::color::Range,
+    ) {
+        self.is_nv12 = false;
         let y_width = planes.width;
         let y_height = planes.height;
         let uv_width = y_width / 2;
@@ -190,9 +390,16 @@ impl YuvRenderer {
                         binding: 3,
                         resource: wgpu::BindingResource::Sampler(&self.sampler),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.color_buffer.as_entire_binding(),
+                    },
                 ],
             }));
         }
+
+        let uniforms = ColorUniforms::new(color_space, color_range, 1.0, 1.0);
+        queue.write_buffer(&self.color_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
         // Upload Y plane
         if let Some(tex) = &self.y_texture {
@@ -264,11 +471,19 @@ impl YuvRenderer {
         }
     }
 
-    pub fn paint<'rp>(&'rp self, render_pass: &mut wgpu::RenderPass<'rp>) {
+    pub fn render<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>) {
         if let Some(bind_group) = &self.bind_group {
-            render_pass.set_pipeline(&self.pipeline);
+            if self.is_nv12 {
+                render_pass.set_pipeline(&self.nv12_pipeline);
+            } else {
+                render_pass.set_pipeline(&self.pipeline);
+            }
             render_pass.set_bind_group(0, bind_group, &[]);
             render_pass.draw(0..4, 0..1);
         }
+    }
+
+    pub fn video_size(&self) -> Option<(u32, u32)> {
+        self.y_texture.as_ref().map(|t| (t.width(), t.height()))
     }
 }

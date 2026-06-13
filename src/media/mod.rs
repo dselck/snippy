@@ -5,7 +5,7 @@ use std::thread;
 use ringbuf::wrap::CachingProd;
 use ringbuf::storage::Heap;
 use ringbuf::SharedRb;
-use ringbuf::traits::*;
+
 
 pub mod types;
 pub mod cache;

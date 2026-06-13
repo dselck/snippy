@@ -5,6 +5,11 @@ edition = "2024"
 
 [dependencies]
 eframe = { version = "0.27.2", features = ["wgpu"] }
+wgpu = { version = "0.19.4", features = ["hal"] }
+wgpu-hal = { version = "0.19.5" }
+metal = { version = "0.27.0" }
+core-video-sys = { version = "0.1.4", features = ["io_suface"] }
+core-foundation-sys = { version = "0.7.0" }
 ffmpeg-next = "8.1.0"
 cpal = "0.15.3"
 ringbuf = "0.4.4"
@@ -15,6 +20,8 @@ serde_json = "1.0"
 anyhow = "1.0.82"
 bytemuck = { version = "1.16.0", features = ["derive"] }
 rfd = "0.14"
+pollster = "0.4.0"
+objc = "0.2.7"
 
 # Workaround for macOS strict Objective-C type checking panic in winit/objc2
 [profile.dev.package.objc2]

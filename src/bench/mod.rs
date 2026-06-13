@@ -35,7 +35,7 @@ impl MediaTestRig {
             anyhow::bail!("Failed to load video in PlaybackSession");
         }
         let metadata = session.metadata.clone().unwrap();
-        let master_clock = session.master_clock.clone().unwrap();
+        let master_clock = session.master_clock().unwrap();
         let frame_rx = session.frame_rx.clone().unwrap();
         Ok(Self {
             session,

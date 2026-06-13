@@ -1,10 +1,8 @@
-use crate::media::types::YuvPlanes;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct CachedFrame {
-    pub planes: std::sync::Arc<YuvPlanes>,
-    pub pts_sec: f64,
+    pub frame: crate::media::DecodedFrame,
 }
 
 pub struct GopCache {

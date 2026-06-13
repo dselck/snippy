@@ -38,10 +38,39 @@ impl DecoderAdapter for FfmpegDecoderAdapter {
         let mut frame = ffmpeg_next::util::frame::Video::empty();
         match self.video_decoder.receive_frame(&mut frame) {
             Ok(_) => {
-                let mut sw_frame = ffmpeg_next::util::frame::Video::empty();
-                let is_hw_frame = unsafe { !(*frame.as_ptr()).hw_frames_ctx.is_null() };
-                
-                let actual_frame = if is_hw_frame {
+                let pts_sec = match frame.pts() {
+                    Some(pts_val) => pts_val as f64 * self.time_base_f64 - self.video_start_time,
+                    None => self.fallback_frame_idx as f64 / self.fps,
+                };
+                let frame_idx = (pts_sec * self.fps).round() as usize;
+                self.fallback_frame_idx = frame_idx + 1;
+
+                if frame.format() == ffmpeg_next::format::Pixel::VIDEOTOOLBOX {
+                    // Clone the frame so FFmpeg doesn't reuse the CVPixelBuffer while we are rendering it.
+                    let mut hw_clone = ffmpeg_next::util::frame::Video::empty();
+                    unsafe {
+                        let ret = ffmpeg_next::sys::av_frame_ref(hw_clone.as_mut_ptr(), frame.as_ptr());
+                        if ret < 0 {
+                            return Err(DecodeError::Fault(format!("Failed to clone hardware frame: {}", ret)));
+                        }
+                    }
+                    
+                    let wrapper = std::sync::Arc::new(crate::media::types::HwFrameWrapper {
+                        frame: hw_clone,
+                    });
+
+                    return Ok(Some(DecodedFrame::Gpu {
+                        frame_idx,
+                        descriptor: crate::media::types::GpuFrameDescriptor::MacOsHwFrame(wrapper),
+                        sequence_id: 0,
+                        pts_sec,
+                        color_space: frame.color_space(),
+                        color_range: frame.color_range(),
+                    }));
+                }
+
+                let actual_frame = if frame.format() == ffmpeg_next::format::Pixel::VIDEOTOOLBOX || frame.format() == ffmpeg_next::format::Pixel::D3D11 {
+                    let mut sw_frame = ffmpeg_next::util::frame::Video::empty();
                     let ret = unsafe {
                         ffmpeg_next::sys::av_hwframe_transfer_data(
                             sw_frame.as_mut_ptr(),
@@ -52,10 +81,13 @@ impl DecoderAdapter for FfmpegDecoderAdapter {
                     if ret < 0 {
                         return Err(DecodeError::Fault(format!("Failed to transfer hw frame: {}", ret)));
                     }
-                    &sw_frame
+                    sw_frame
                 } else {
-                    &frame
+                    frame.clone()
                 };
+
+                let actual_color_space = actual_frame.color_space();
+                let actual_color_range = actual_frame.color_range();
 
                 let mut scaled_frame = ffmpeg_next::util::frame::Video::empty();
                 let video_frame = if actual_frame.format() != ffmpeg_next::format::Pixel::YUV420P {
@@ -78,7 +110,7 @@ impl DecoderAdapter for FfmpegDecoderAdapter {
                         }
                     };
                     s.run(&actual_frame, &mut scaled_frame).map_err(|e| DecodeError::Fault(e.to_string()))?;
-                    &scaled_frame
+                    scaled_frame
                 } else {
                     actual_frame
                 };
@@ -92,20 +124,16 @@ impl DecoderAdapter for FfmpegDecoderAdapter {
                     y_stride: video_frame.stride(0) as u32,
                     u_stride: video_frame.stride(1) as u32,
                     v_stride: video_frame.stride(2) as u32,
+                    is_10bit: false,
                 });
-
-                let pts_sec = match frame.pts() {
-                    Some(pts_val) => pts_val as f64 * self.time_base_f64 - self.video_start_time,
-                    None => self.fallback_frame_idx as f64 / self.fps,
-                };
-                let frame_idx = (pts_sec * self.fps).round() as usize;
-                self.fallback_frame_idx = frame_idx + 1;
 
                 Ok(Some(DecodedFrame::Cpu {
                     frame_idx,
                     planes,
                     sequence_id: 0,
                     pts_sec,
+                    color_space: actual_color_space,
+                    color_range: actual_color_range,
                 }))
             }
             Err(ffmpeg_next::Error::Eof) => Ok(None),

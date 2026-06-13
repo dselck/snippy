@@ -110,7 +110,7 @@ impl MainApp {
     }
 
     fn frame_to_time(&self, frame: usize) -> String {
-        let total_seconds = frame as f64 / self.playback.video_fps;
+        let total_seconds = frame as f64 / self.playback.video_fps();
         let minutes = (total_seconds / 60.0).floor() as usize;
         let seconds = total_seconds.floor() as usize % 60;
         let centiseconds = ((total_seconds - total_seconds.floor()) * 100.0).floor() as usize;
@@ -576,8 +576,8 @@ impl MainApp {
             Color32::from_rgb(99, 102, 241) // In keep mode, snippets are indigo/kept
         };
         for range in &self.ranges {
-            let left_pct = range.in_frame as f32 / self.playback.total_frames as f32;
-            let right_pct = range.out_frame as f32 / self.playback.total_frames as f32;
+            let left_pct = range.in_frame as f32 / self.playback.total_frames() as f32;
+            let right_pct = range.out_frame as f32 / self.playback.total_frames() as f32;
             let left_x = rect.left() + left_pct * rect.width();
             let right_x = rect.left() + right_pct * rect.width();
             
@@ -595,8 +595,8 @@ impl MainApp {
         // 3. Draw active selection range (current in/out markers) on the track
         if let (Some(inf), Some(outf)) = (self.in_marker, self.out_marker) {
             if inf < outf {
-                let left_pct = inf as f32 / self.playback.total_frames as f32;
-                let right_pct = outf as f32 / self.playback.total_frames as f32;
+                let left_pct = inf as f32 / self.playback.total_frames() as f32;
+                let right_pct = outf as f32 / self.playback.total_frames() as f32;
                 let left_x = rect.left() + left_pct * rect.width();
                 let right_x = rect.left() + right_pct * rect.width();
                 
@@ -613,7 +613,7 @@ impl MainApp {
         }
 
         // 4. Always draw circular playhead handle (always visible)
-        let fraction = (self.playback.current_frame as f32 / self.playback.total_frames as f32).clamp(0.0, 1.0);
+        let fraction = (self.playback.current_frame() as f32 / self.playback.total_frames() as f32).clamp(0.0, 1.0);
         let progress_width = rect.width() * fraction;
         let handle_x = rect.left() + progress_width;
         let handle_center = egui::pos2(handle_x, rect.center().y);
@@ -623,13 +623,19 @@ impl MainApp {
             Color32::from_rgb(236, 72, 153), // Hot pink playhead handle
         );
 
-        // Update current_frame on drag/click so caller can read the new position.
+        if response.drag_started() || response.clicked() {
+            self.playback.handle_input(media::InputEvent::ScrubDragStart);
+        }
         if response.dragged() || response.clicked() {
             if let Some(mouse_pos) = response.interact_pointer_pos() {
                 let rel_x = (mouse_pos.x - rect.left()).clamp(0.0, rect.width());
                 let pct = rel_x / rect.width();
-                self.playback.current_frame = (pct * self.playback.total_frames as f32) as usize;
+                let target_frame = (pct * self.playback.total_frames() as f32) as usize;
+                self.playback.handle_input(media::InputEvent::ScrubDragUpdate { target_frame });
             }
+        }
+        if response.drag_stopped() || response.clicked() {
+            self.playback.handle_input(media::InputEvent::ScrubDragEnd);
         }
 
         response
@@ -645,19 +651,10 @@ impl eframe::App for MainApp {
         let prev_released = ctx.input(|i| i.key_released(egui::Key::ArrowLeft));
         let next_released = ctx.input(|i| i.key_released(egui::Key::ArrowRight));
 
-        let previous_is_playing = self.playback.is_playing;
         let ctrl_d = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::D);
         if ctx.input_mut(|i| i.consume_shortcut(&ctrl_d)) {
             self.show_debug_hud = !self.show_debug_hud;
         }
-
-
-        // If playback state toggled, apply it
-        if self.playback.is_playing != previous_is_playing {
-            self.playback.set_playing(self.playback.is_playing);
-        }
-
-
 
         // Receive frames from the Media Engine
         let (latest_frame, frames_popped) = self.playback.update();
@@ -676,12 +673,7 @@ impl eframe::App for MainApp {
             ctx.request_repaint();
         }
 
-        if self.playback.current_frame >= self.playback.total_frames {
-            self.playback.current_frame = self.playback.total_frames;
-            self.playback.set_playing(false);
-        }
-
-        if self.playback.is_playing || self.playback.is_stepping() || self.playback.is_scrubbing() {
+        if self.playback.is_playing() || self.playback.is_stepping() || self.playback.is_scrubbing() {
             ctx.request_repaint();
         }
 
@@ -698,11 +690,11 @@ impl eframe::App for MainApp {
                     // Timeline Time Indicators & Zoom Controls
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new(self.frame_to_time(self.playback.current_frame))
+                            egui::RichText::new(self.frame_to_time(self.playback.current_frame()))
                                 .size(16.0)
                                 .color(Color32::WHITE)
                         );
-                        ui.label(format!("/ {}", self.frame_to_time(self.playback.total_frames)));
+                        ui.label(format!("/ {}", self.frame_to_time(self.playback.total_frames())));
                         
                         // Zoom controls aligned right
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -722,7 +714,7 @@ impl eframe::App for MainApp {
                             }
 
                             ui.add_space(8.0);
-                            ui.label(format!("Frame {} / {}", self.playback.current_frame, self.playback.total_frames));
+                            ui.label(format!("Frame {} / {}", self.playback.current_frame(), self.playback.total_frames()));
                         });
                     });
 
@@ -786,13 +778,13 @@ impl eframe::App for MainApp {
                     }
 
                     // Calculate frame delta step exponentially
-                    let max_delta = (self.playback.total_frames as f32 / num_gaps as f32).max(1.0);
+                    let max_delta = (self.playback.total_frames() as f32 / num_gaps as f32).max(1.0);
                     let delta_f = (max_delta.ln() * (1.0 - self.zoom_level)).exp();
                     let delta = (delta_f as usize).max(1);
 
                     for i in 0..num_thumbnails {
                         let offset_idx = i as isize - (num_thumbnails / 2) as isize;
-                        let target_frame = self.playback.current_frame as isize + offset_idx * delta as isize;
+                        let target_frame = self.playback.current_frame() as isize + offset_idx * delta as isize;
 
                         let tx = inner_rect.left() + i as f32 * (thumbnail_width + thumbnail_spacing);
                         let thub_rect = egui::Rect::from_min_size(
@@ -800,7 +792,7 @@ impl eframe::App for MainApp {
                             egui::vec2(thumbnail_width, inner_height),
                         );
 
-                        if target_frame >= 0 && target_frame <= self.playback.total_frames as isize {
+                        if target_frame >= 0 && target_frame <= self.playback.total_frames() as isize {
                             let is_center = offset_idx == 0;
                             
                             let bg_color = if is_center {
@@ -901,7 +893,7 @@ impl eframe::App for MainApp {
 
                     // Synced frame calculations matching filmstrip
                     let half_width = num_thumbnails / 2;
-                    let start_frame = self.playback.current_frame as isize - half_width as isize * delta as isize;
+                    let start_frame = self.playback.current_frame() as isize - half_width as isize * delta as isize;
                     let visible_range_width = (2 * half_width * delta) as f32;
 
                     let frame_to_x = |frame: usize| -> f32 {
@@ -917,13 +909,13 @@ impl eframe::App for MainApp {
                     for i in 0..bar_count {
                         let pct = i as f32 / bar_count as f32;
                         let frame_idx_isize = start_frame + (pct * visible_range_width) as isize;
-                        let frame_idx = frame_idx_isize.clamp(0, self.playback.total_frames as isize) as usize;
-                        let out_of_bounds = frame_idx_isize < 0 || frame_idx_isize > self.playback.total_frames as isize;
+                        let frame_idx = frame_idx_isize.clamp(0, self.playback.total_frames() as isize) as usize;
+                        let out_of_bounds = frame_idx_isize < 0 || frame_idx_isize > self.playback.total_frames() as isize;
 
                         let amplitude = if out_of_bounds {
                             0.02
                         } else {
-                            let profile_idx = ((frame_idx as f32 / self.playback.total_frames as f32) * (self.loudness_profile.len() - 1) as f32) as usize;
+                            let profile_idx = ((frame_idx as f32 / self.playback.total_frames() as f32) * (self.loudness_profile.len() - 1) as f32) as usize;
                             self.loudness_profile[profile_idx.clamp(0, self.loudness_profile.len() - 1)]
                         };
 
@@ -1061,7 +1053,7 @@ impl eframe::App for MainApp {
                         if let Some(mouse_pos) = wave_response.interact_pointer_pos() {
                             let rel_x = (mouse_pos.x - wave_rect.left()).clamp(0.0, wave_rect.width());
                             let pct = rel_x / wave_rect.width();
-                            let target_frame = (pct * self.playback.total_frames as f32) as usize;
+                            let target_frame = (pct * self.playback.total_frames() as f32) as usize;
                             self.playback.handle_input(media::InputEvent::ScrubDragUpdate { target_frame });
                         }
                     }
@@ -1148,9 +1140,9 @@ impl eframe::App for MainApp {
                                     painter.rect_filled(rect, 2.0, Color32::from_rgb(30, 27, 51));
                                     
                                     // Draw fill segment
-                                    if self.playback.total_frames > 0 {
-                                        let start_pct = range.in_frame as f32 / self.playback.total_frames as f32;
-                                        let len_pct = (range.out_frame - range.in_frame) as f32 / self.playback.total_frames as f32;
+                                    if self.playback.total_frames() > 0 {
+                                        let start_pct = range.in_frame as f32 / self.playback.total_frames() as f32;
+                                        let len_pct = (range.out_frame - range.in_frame) as f32 / self.playback.total_frames() as f32;
                                         
                                         let fill_left = rect.left() + start_pct * rect.width();
                                         let fill_width = len_pct * rect.width();
@@ -1298,9 +1290,18 @@ impl eframe::App for MainApp {
                             let painter = ui.painter_at(rect);
 
                             let mut rendered = false;
-                            if let Some(media::DecodedFrame::Cpu { planes, .. }) = &self.playback.latest_frame {
-                                let video_w = planes.width as f32;
-                                let video_h = planes.height as f32;
+                            if let Some(frame) = self.playback.latest_frame() {
+                                let (video_w, video_h) = match frame {
+                                    media::DecodedFrame::Cpu { planes, .. } => (planes.width as f32, planes.height as f32),
+                                    media::DecodedFrame::Gpu { descriptor, .. } => {
+                                        if let media::GpuFrameDescriptor::MacOsHwFrame(wrapper) = descriptor {
+                                            (wrapper.frame.width() as f32, wrapper.frame.height() as f32)
+                                        } else {
+                                            (0.0, 0.0)
+                                        }
+                                    }
+                                };
+
                                 if video_w > 0.0 && video_h > 0.0 {
                                     let video_aspect = video_w / video_h;
                                     
@@ -1328,7 +1329,7 @@ impl eframe::App for MainApp {
 
                                     let callback = eframe::egui_wgpu::Callback::new_paint_callback(
                                         target_rect,
-                                        YuvCallback { planes: planes.clone() },
+                                        YuvCallback { frame: frame.clone() },
                                     );
                                     painter.add(callback);
                                     rendered = true;
@@ -1374,18 +1375,18 @@ impl eframe::App for MainApp {
                                                 ui.horizontal(|ui| {
                                                     ui.label(egui::RichText::new("⚡ AV SYNC TELEMETRY").strong().color(Color32::from_rgb(129, 140, 248)));
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        let active_color = if self.playback.is_playing { Color32::from_rgb(74, 222, 128) } else { Color32::from_rgb(156, 163, 175) };
-                                                        ui.label(egui::RichText::new(if self.playback.is_playing { "● ACTIVE" } else { "■ PAUSED" }).color(active_color).font(egui::FontId::monospace(10.0)));
+                                                        let active_color = if self.playback.is_playing() { Color32::from_rgb(74, 222, 128) } else { Color32::from_rgb(156, 163, 175) };
+                                                        ui.label(egui::RichText::new(if self.playback.is_playing() { "● ACTIVE" } else { "■ PAUSED" }).color(active_color).font(egui::FontId::monospace(10.0)));
                                                     });
                                                 });
                                                 
                                                 ui.separator();
                                                 
-                                                                                let master_time = self.playback.audio_engine.as_ref().map_or(0.0, |ae| ae.master_clock.current_time());
-                                                let seq_id = self.playback.latest_frame.as_ref().map_or(0, |f| f.sequence_id());
-                                                let video_time = self.playback.latest_frame.as_ref()
+                                                                                let master_time = self.playback.master_clock().map_or(0.0, |mc| mc.current_time());
+                                                let seq_id = self.playback.latest_frame().map_or(0, |f| f.sequence_id());
+                                                let video_time = self.playback.latest_frame()
                                                     .filter(|f| f.sequence_id() == seq_id)
-                                                    .map_or(self.playback.current_frame as f64 / self.playback.video_fps, |f| f.pts_sec());
+                                                    .map_or(self.playback.current_frame() as f64 / self.playback.video_fps(), |f| f.pts_sec());
                                                 let drift = master_time - video_time;
                                                 
                                                 ui.horizontal(|ui| {
@@ -1430,7 +1431,7 @@ impl eframe::App for MainApp {
                                                 ui.horizontal(|ui| {
                                                     ui.label("CPAL Rate   :");
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        ui.label(egui::RichText::new(format!("{} Hz", self.playback.audio_engine.as_ref().map_or(0, |ae| ae.master_clock.sample_rate()))).monospace());
+                                                         ui.label(egui::RichText::new(format!("{} Hz", self.playback.master_clock().map_or(0, |mc| mc.sample_rate()))).monospace());
                                                     });
                                                 });
                                                 ui.horizontal(|ui| {
@@ -1490,36 +1491,26 @@ impl eframe::App for MainApp {
                                                 // Task 5: Diagnostic Buttons
                                                 ui.add_space(8.0);
                                                 ui.horizontal(|ui| {
-                                                    if ui.button("Flush Buffer").on_hover_text("Flush/drain audio ring buffer").clicked() {
-                                                        self.playback.seek_internal(self.playback.current_frame, false, true);
-                                                        println!("HUD: Manual flush of audio buffer triggered");
-                                                    }
-                                                    if ui.button("Force Resync").on_hover_text("Force resync clocks").clicked() {
-                                                        let current = self.playback.current_frame;
-                                                        self.playback.seek_internal(current, false, true);
-                                                        println!("HUD: Manual resync triggered to frame {}", current);
-                                                    }
-                                                });
-                                            });
-                                        });
-                                });
-                            }
-                        });
+                                                     if ui.button("Flush Buffer").on_hover_text("Flush/drain audio ring buffer").clicked() {
+                                                         self.playback.seek_internal(self.playback.current_frame(), false, true);
+                                                         println!("HUD: Manual flush of audio buffer triggered");
+                                                     }
+                                                     if ui.button("Force Resync").on_hover_text("Force resync clocks").clicked() {
+                                                         let current = self.playback.current_frame();
+                                                         self.playback.seek_internal(current, false, true);
+                                                         println!("HUD: Manual resync triggered to frame {}", current);
+                                                     }
+                                                 });
+                                             });
+                                         });
+                                 });
+                             }
+                         });
 
                     ui.add_space(10.0);
 
                     // Sleek progress slider
-                    let progress_response = self.progress_bar(ui);
-                    if progress_response.drag_started() || progress_response.clicked() {
-                        self.playback.handle_input(media::InputEvent::ScrubDragStart);
-                    }
-                    if progress_response.dragged() || progress_response.clicked() {
-                        let target_frame = self.playback.current_frame;
-                        self.playback.handle_input(media::InputEvent::ScrubDragUpdate { target_frame });
-                    }
-                    if progress_response.drag_stopped() || progress_response.clicked() {
-                        self.playback.handle_input(media::InputEvent::ScrubDragEnd);
-                    }
+                    let _progress_response = self.progress_bar(ui);
 
                     ui.add_space(10.0);
 
@@ -1549,18 +1540,18 @@ impl eframe::App for MainApp {
                                     prev_down = true;
                                 }
                                 if playback_control_button(ui, PlaybackIcon::SetIn, false, "Set In marker at current frame [").clicked() {
-                                    self.in_marker = Some(self.playback.current_frame);
+                                    self.in_marker = Some(self.playback.current_frame());
                                 }
 
                                 // Play/pause button
-                                let play_icon = if self.playback.is_playing { PlaybackIcon::Pause } else { PlaybackIcon::Play };
-                                let play_tooltip = if self.playback.is_playing { "Pause playback" } else { "Start playback" };
+                                let play_icon = if self.playback.is_playing() { PlaybackIcon::Pause } else { PlaybackIcon::Play };
+                                let play_tooltip = if self.playback.is_playing() { "Pause playback" } else { "Start playback" };
                                 if playback_control_button(ui, play_icon, true, play_tooltip).clicked() {
-                                    self.playback.set_playing(!self.playback.is_playing);
+                                    self.playback.toggle_playback();
                                 }
 
                                 if playback_control_button(ui, PlaybackIcon::SetOut, false, "Set Out marker at current frame ]").clicked() {
-                                    self.out_marker = Some(self.playback.current_frame);
+                                    self.out_marker = Some(self.playback.current_frame());
                                 }
                                 let next_resp = playback_control_button(ui, PlaybackIcon::NextFrame, false, "Step forward one frame");
                                 if next_resp.clicked() {
@@ -1570,7 +1561,7 @@ impl eframe::App for MainApp {
                                     next_down = true;
                                 }
                                 if playback_control_button(ui, PlaybackIcon::End, false, "Go to end of video").clicked() {
-                                    self.playback.seek_internal(self.playback.total_frames, false, true);
+                                    self.playback.seek_internal(self.playback.total_frames(), false, true);
                                 }
                             },
                         );
@@ -1624,7 +1615,7 @@ impl eframe::App for MainApp {
 }
 
 struct YuvCallback {
-    planes: std::sync::Arc<media::YuvPlanes>,
+    frame: media::DecodedFrame,
 }
 
 impl eframe::egui_wgpu::CallbackTrait for YuvCallback {
@@ -1637,7 +1628,16 @@ impl eframe::egui_wgpu::CallbackTrait for YuvCallback {
         callback_resources: &mut eframe::egui_wgpu::CallbackResources,
     ) -> Vec<eframe::wgpu::CommandBuffer> {
         if let Some(renderer) = callback_resources.get_mut::<yuv_renderer::YuvRenderer>() {
-            renderer.update_textures(device, queue, &self.planes);
+            match &self.frame {
+                crate::media::DecodedFrame::Cpu { planes, color_space, color_range, .. } => {
+                    renderer.update_textures(device, queue, planes, *color_space, *color_range);
+                }
+                crate::media::DecodedFrame::Gpu { descriptor, color_space, color_range, .. } => {
+                    if let crate::media::GpuFrameDescriptor::MacOsHwFrame(wrapper) = descriptor {
+                        renderer.update_textures_from_hw_frame(device, queue, wrapper.clone(), *color_space, *color_range);
+                    }
+                }
+            }
         }
         vec![]
     }
@@ -1649,26 +1649,40 @@ impl eframe::egui_wgpu::CallbackTrait for YuvCallback {
         callback_resources: &'a eframe::egui_wgpu::CallbackResources,
     ) {
         let viewport = info.viewport_in_pixels();
-        let clip_rect = info.clip_rect_in_pixels();
-
-        render_pass.set_viewport(
-            viewport.left_px as f32,
-            viewport.top_px as f32,
-            viewport.width_px as f32,
-            viewport.height_px as f32,
-            0.0,
-            1.0,
-        );
-
-        render_pass.set_scissor_rect(
-            clip_rect.left_px.max(0) as u32,
-            clip_rect.top_px.max(0) as u32,
-            clip_rect.width_px.max(0) as u32,
-            clip_rect.height_px.max(0) as u32,
-        );
+        let _clip_rect = info.clip_rect_in_pixels();
 
         if let Some(renderer) = callback_resources.get::<yuv_renderer::YuvRenderer>() {
-            renderer.paint(render_pass);
+            let (draw_x, draw_y, draw_width, draw_height) = if let Some((video_width, video_height)) = renderer.video_size() {
+                let view_ratio = viewport.width_px as f32 / viewport.height_px as f32;
+                let video_ratio = video_width as f32 / video_height as f32;
+
+                if view_ratio > video_ratio {
+                    // view is wider than video, pillarbox
+                    let h = viewport.height_px as f32;
+                    let w = h * video_ratio;
+                    let x = viewport.left_px as f32 + (viewport.width_px as f32 - w) / 2.0;
+                    (x, viewport.top_px as f32, w, h)
+                } else {
+                    // view is taller than video, letterbox
+                    let w = viewport.width_px as f32;
+                    let h = w / video_ratio;
+                    let y = viewport.top_px as f32 + (viewport.height_px as f32 - h) / 2.0;
+                    (viewport.left_px as f32, y, w, h)
+                }
+            } else {
+                (viewport.left_px as f32, viewport.top_px as f32, viewport.width_px as f32, viewport.height_px as f32)
+            };
+
+            render_pass.set_viewport(
+                draw_x,
+                draw_y,
+                draw_width,
+                draw_height,
+                0.0,
+                1.0,
+            );
+
+            renderer.render(render_pass);
         }
     }
 }

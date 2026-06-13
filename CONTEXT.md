@@ -53,7 +53,7 @@ The data structure passed from the Media Engine to the UI Thread representing a 
 _Avoid_: Video frame payload, raw texture handle
 
 **Scrub Loop**:
-The request-driven cycle that governs seek dispatch during timeline scrubbing. One keyframe seek is outstanding at a time; the next seek is only issued once a DecodedFrame carrying the current sequence ID arrives. On drag end, the timeline position (current_frame) snaps to the frame index of the displayed keyframe, ending the scrub cycle without any precise seek.
+The request-driven cycle that governs seek dispatch during timeline scrubbing. One keyframe seek is outstanding at a time; the next seek is only issued once a DecodedFrame carrying the current sequence ID arrives. As the UI spams position updates, the session handles rate-limiting and seeks to the nearest keyframe. When updates stop (drag end), the shown frame naturally remains the nearest keyframe to where the mouse ended up, avoiding a final precise seek.
 _Avoid_: Repaint-driven scrubbing, debounced scrubbing
 
 **Desired Scrub Frame**:
@@ -76,13 +76,13 @@ _Avoid_: Decoder thread loop, caching layer, packet manager
 A deep orchestrator sitting outside the UI that takes full ownership of the MediaEngine, AudioEngine, and the Scrub Loop state machine. It provides a testable, headless interface for timeline navigation and playback, ensuring the UI remains a "dumb" view layer.
 _Avoid_: PlaybackController, MainApp state, PlayerCore
 
-**PresenterStateMachine**:
-A deep module extracted from the Media Engine that governs A/V synchronization, lookahead buffering, and seek dispatching via a pure Event/Action interface.
-_Avoid_: Presenter loop, sync thread
+**Presenter Thread**:
+A deep thread shell inside the Media Engine that evaluates video frames against the Master Clock, managing A/V synchronization, lookahead buffering, and seek dispatching directly via blocking channel selections.
+_Avoid_: PresenterStateMachine, sync controller
 
-**DecoderStateMachine**:
-A deep module extracted from the Media Engine that orchestrates FFmpeg packet demuxing, video/audio pipeline feeding, and queue backpressure via a pure Event/Action interface.
-_Avoid_: Decoder loop, Demuxer thread
+**Decoder Thread**:
+A deep thread shell inside the Media Engine that orchestrates FFmpeg packet demuxing, video/audio pipeline feeding, and queue backpressure using native control flow.
+_Avoid_: DecoderStateMachine, Demuxer thread
 
 **FrameSink / AudioSink**:
 Adapter seams that sit inside the DecoderStateMachine, providing pure, non-blocking interfaces for pushing decoded frames and audio samples to downstream queues. These eliminate nested blocking control flow in the thread shell.

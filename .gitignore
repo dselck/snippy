@@ -6,6 +6,9 @@
 .antigravitycli/
 .superpowers/
 
+# Test files
+test-files/
+
 # Operating System Files
 .DS_Store
 .DS_Store?
