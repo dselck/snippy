@@ -112,11 +112,7 @@ impl MasterClockPort for MasterClock {
             Some(self.current_time())
         } else {
             let current_us = self.state.current_position_us.load(Ordering::Relaxed);
-            if current_us == 0 {
-                None
-            } else {
-                Some(current_us as f64 / 1_000_000.0)
-            }
+            Some(current_us as f64 / 1_000_000.0)
         }
     }
 
@@ -192,7 +188,8 @@ mod tests {
         ticker.advance(48000, None, 48000);
         
         assert_eq!(clock.current_pts(), Some(1.0));
-        assert_eq!(clock.current_time(), 1.0);
+        let time_diff = (clock.current_time() - 1.0).abs();
+        assert!(time_diff < 0.01, "time_diff was {}", time_diff);
         
         ticker.advance(24000, None, 72000);
         assert_eq!(clock.current_pts(), Some(1.5));

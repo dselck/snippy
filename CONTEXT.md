@@ -71,3 +71,19 @@ _Avoid_: Audio adapter, cpal interface
 **VideoDecoderPipeline**:
 A deep module sitting behind the Media Engine thread that isolates FFmpeg packet decoding, GOP caching, and sequential fast paths behind a `seek` and `next_frame` interface.
 _Avoid_: Decoder thread loop, caching layer, packet manager
+
+**PlaybackSession**:
+A deep orchestrator sitting outside the UI that takes full ownership of the MediaEngine, AudioEngine, and the Scrub Loop state machine. It provides a testable, headless interface for timeline navigation and playback, ensuring the UI remains a "dumb" view layer.
+_Avoid_: PlaybackController, MainApp state, PlayerCore
+
+**PresenterStateMachine**:
+A deep module extracted from the Media Engine that governs A/V synchronization, lookahead buffering, and seek dispatching via a pure Event/Action interface.
+_Avoid_: Presenter loop, sync thread
+
+**DecoderStateMachine**:
+A deep module extracted from the Media Engine that orchestrates FFmpeg packet demuxing, video/audio pipeline feeding, and queue backpressure via a pure Event/Action interface.
+_Avoid_: Decoder loop, Demuxer thread
+
+**FrameSink / AudioSink**:
+Adapter seams that sit inside the DecoderStateMachine, providing pure, non-blocking interfaces for pushing decoded frames and audio samples to downstream queues. These eliminate nested blocking control flow in the thread shell.
+_Avoid_: Queue adapters, senders

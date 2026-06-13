@@ -47,7 +47,11 @@ impl VideoSyncEngine {
     pub fn evaluate_frame(&mut self, frame_pts_sec: f64) -> Result<SyncAction, SyncError> {
         let clock_pts = match self.clock.current_pts() {
             Some(pts) => pts,
-            None => return Ok(SyncAction::Present),
+            None => {
+                self.clock.resume_from_catchup();
+                self.is_stalled = false;
+                return Ok(SyncAction::Present);
+            }
         };
 
         if frame_pts_sec > clock_pts {

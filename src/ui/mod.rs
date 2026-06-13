@@ -1,7 +1,6 @@
 pub mod yuv_renderer;
 
 use crate::media;
-use crossbeam_channel::Receiver;
 use eframe::egui;
 use eframe::egui::Color32;
 
@@ -27,21 +26,10 @@ pub enum PlaybackIcon {
 }
 
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArrowSeekState {
-    Idle,
-    SteppingLeft { held_since: std::time::Instant },
-    SteppingRight { held_since: std::time::Instant, unpaced_started: bool },
-}
-
 pub struct MainApp {
     // Media Playback State
-    pub current_frame: usize,
-    pub total_frames: usize,
-    pub is_playing: bool,
     pub video_path: Option<String>,
-    pub video_fps: f64,
-    pub is_scrubbing: bool,
+    pub playback: crate::media::PlaybackSession,
 
     // Range Selection Markers
     pub in_marker: Option<usize>,
@@ -53,8 +41,6 @@ pub struct MainApp {
     pub cut_mode: bool,
 
     // Channels & Playback
-    pub frame_rx: Option<Receiver<media::DecodedFrame>>,
-    pub latest_frame: Option<media::DecodedFrame>,
 
     // Mock Audio Loudness Profile (for visual layout)
     pub loudness_profile: Vec<f32>,
@@ -65,21 +51,11 @@ pub struct MainApp {
     // Height of the resizable bottom timeline deck panel
     pub timeline_height: f32,
 
-    pub audio_engine: Option<crate::audio::AudioEngine>,
-    pub media_engine: Option<media::MediaEngine>,
-    pub media_tx: Option<crossbeam_channel::Sender<media::MediaCommand>>,
-    pub metadata: Option<media::VideoMetadata>,
     pub show_debug_hud: bool,
     pub drift_history: std::collections::VecDeque<f32>,
     pub decode_fps_frame_count: usize,
     pub decode_fps_last_reset: std::time::Instant,
     pub decode_fps: f32,
-    pub arrow_seek_state: ArrowSeekState,
-    pub latest_sequence_id: usize,
-    pub in_flight_seek_seq: Option<usize>,
-    pub desired_scrub_frame: Option<usize>,
-    pub last_sent_seek_frame: Option<usize>,
-    pub was_playing_before_scrub: bool,
 }
 
 impl MainApp {
@@ -104,136 +80,41 @@ impl MainApp {
             loudness.push(val.clamp(0.05, 1.0));
         }
 
-        let mut audio_engine_opt = None;
-        let mut media_engine_opt = None;
-        let mut media_tx_opt = None;
-        let mut frame_rx_opt = None;
-        let mut metadata = None;
+        let mut playback = crate::media::PlaybackSession::new();
 
         let demo_path = "workspace_demo_reel.mp4";
         if std::path::Path::new(demo_path).exists() {
-            if let Ok(mut ae) = crate::audio::AudioEngine::new() {
-                let channels = ae.channels;
-                let audio_tx = ae.tx.take().unwrap();
-                let tags_tx = ae.tags_tx.take().unwrap();
-                let master_clock = ae.master_clock.clone();
-                let (frame_tx, frame_rx) = crossbeam_channel::bounded(30);
-                let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
-                
-                if let Ok((engine, meta)) = media::MediaEngine::new(
-                    demo_path,
-                    ae.master_clock.sample_rate(),
-                    channels,
-                    frame_tx,
-                    audio_tx,
-                    tags_tx,
-                    cmd_rx,
-                    master_clock,
-                ) {
-                    media_tx_opt = Some(engine.tx.clone());
-                    media_engine_opt = Some(engine);
-                    metadata = Some(meta);
-                    frame_rx_opt = Some(frame_rx);
-                }
-                audio_engine_opt = Some(ae);
-            }
+            playback.load_video(demo_path);
         }
 
-        let mut app = Self {
-            current_frame: 0,
-            total_frames: metadata.as_ref().map_or(1000, |m| m.total_frames),
-            is_playing: false,
+        let app = Self {
             video_path: Some(demo_path.to_string()),
-            video_fps: metadata.as_ref().map_or(24.0, |m| m.fps),
-            is_scrubbing: false,
+            playback,
             in_marker: None,
             out_marker: None,
             ranges: vec![],
             next_range_id: 1,
             cut_mode: false,
-            frame_rx: frame_rx_opt,
-            latest_frame: None,
             loudness_profile: loudness,
             zoom_level: 0.0,
             timeline_height: 145.0,
-            audio_engine: audio_engine_opt,
-            media_engine: media_engine_opt,
-            media_tx: media_tx_opt,
-            metadata,
             show_debug_hud: false,
             drift_history: std::collections::VecDeque::with_capacity(60),
             decode_fps_frame_count: 0,
             decode_fps_last_reset: std::time::Instant::now(),
             decode_fps: 0.0,
-            arrow_seek_state: ArrowSeekState::Idle,
-            latest_sequence_id: 0,
-            in_flight_seek_seq: None,
-            desired_scrub_frame: None,
-            last_sent_seek_frame: None,
-            was_playing_before_scrub: false,
         };
 
-        if app.media_tx.is_some() {
-            app.seek_internal(0, false, true);
-        }
 
         app
     }
 
     fn frame_to_time(&self, frame: usize) -> String {
-        let total_seconds = frame as f64 / self.video_fps;
+        let total_seconds = frame as f64 / self.playback.video_fps;
         let minutes = (total_seconds / 60.0).floor() as usize;
         let seconds = total_seconds.floor() as usize % 60;
         let centiseconds = ((total_seconds - total_seconds.floor()) * 100.0).floor() as usize;
         format!("{:02}:{:02}.{:02}", minutes, seconds, centiseconds)
-    }
-
-    fn seek_internal(&mut self, frame: usize, keyframe_only: bool, audio_enabled: bool) {
-        self.latest_sequence_id += 1;
-        self.last_sent_seek_frame = Some(frame);
-        if let Some(tx) = &self.media_tx {
-            let _ = tx.send(media::MediaCommand::Seek {
-                frame_index: frame,
-                keyframe_only,
-                sequence_id: self.latest_sequence_id,
-                audio_enabled,
-            });
-            self.current_frame = frame;
-        }
-        if let Some(ae) = &self.audio_engine {
-            ae.master_clock.reset(frame as f64 / self.video_fps);
-        }
-    }
-
-    fn scrub_to(&mut self, target_frame: usize) {
-        self.is_playing = false;
-        if self.in_flight_seek_seq.is_some() {
-            self.desired_scrub_frame = Some(target_frame);
-            self.current_frame = target_frame;
-        } else {
-            self.seek_internal(target_frame, true, false);
-            self.in_flight_seek_seq = Some(self.latest_sequence_id);
-            self.desired_scrub_frame = None;
-        }
-    }
-
-    fn set_playing(&mut self, play: bool) {
-        if let Some(tx) = &self.media_tx {
-            let cmd = if play {
-                media::MediaCommand::Play
-            } else {
-                media::MediaCommand::Pause
-            };
-            let _ = tx.send(cmd);
-            self.is_playing = play;
-        }
-        if let Some(ae) = &self.audio_engine {
-            if play {
-                ae.master_clock.play();
-            } else {
-                ae.master_clock.pause();
-            }
-        }
     }
 }
 
@@ -695,8 +576,8 @@ impl MainApp {
             Color32::from_rgb(99, 102, 241) // In keep mode, snippets are indigo/kept
         };
         for range in &self.ranges {
-            let left_pct = range.in_frame as f32 / self.total_frames as f32;
-            let right_pct = range.out_frame as f32 / self.total_frames as f32;
+            let left_pct = range.in_frame as f32 / self.playback.total_frames as f32;
+            let right_pct = range.out_frame as f32 / self.playback.total_frames as f32;
             let left_x = rect.left() + left_pct * rect.width();
             let right_x = rect.left() + right_pct * rect.width();
             
@@ -714,8 +595,8 @@ impl MainApp {
         // 3. Draw active selection range (current in/out markers) on the track
         if let (Some(inf), Some(outf)) = (self.in_marker, self.out_marker) {
             if inf < outf {
-                let left_pct = inf as f32 / self.total_frames as f32;
-                let right_pct = outf as f32 / self.total_frames as f32;
+                let left_pct = inf as f32 / self.playback.total_frames as f32;
+                let right_pct = outf as f32 / self.playback.total_frames as f32;
                 let left_x = rect.left() + left_pct * rect.width();
                 let right_x = rect.left() + right_pct * rect.width();
                 
@@ -732,7 +613,7 @@ impl MainApp {
         }
 
         // 4. Always draw circular playhead handle (always visible)
-        let fraction = (self.current_frame as f32 / self.total_frames as f32).clamp(0.0, 1.0);
+        let fraction = (self.playback.current_frame as f32 / self.playback.total_frames as f32).clamp(0.0, 1.0);
         let progress_width = rect.width() * fraction;
         let handle_x = rect.left() + progress_width;
         let handle_center = egui::pos2(handle_x, rect.center().y);
@@ -747,7 +628,7 @@ impl MainApp {
             if let Some(mouse_pos) = response.interact_pointer_pos() {
                 let rel_x = (mouse_pos.x - rect.left()).clamp(0.0, rect.width());
                 let pct = rel_x / rect.width();
-                self.current_frame = (pct * self.total_frames as f32) as usize;
+                self.playback.current_frame = (pct * self.playback.total_frames as f32) as usize;
             }
         }
 
@@ -757,16 +638,14 @@ impl MainApp {
 
 impl eframe::App for MainApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let mut progress_dragged = false;
-        let mut wave_dragged = false;
-
-        let previous_is_playing = self.is_playing;
         let mut prev_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
         let mut next_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
-
         let mut prev_down = ctx.input(|i| i.key_down(egui::Key::ArrowLeft));
         let mut next_down = ctx.input(|i| i.key_down(egui::Key::ArrowRight));
+        let prev_released = ctx.input(|i| i.key_released(egui::Key::ArrowLeft));
+        let next_released = ctx.input(|i| i.key_released(egui::Key::ArrowRight));
 
+        let previous_is_playing = self.playback.is_playing;
         let ctrl_d = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::D);
         if ctx.input_mut(|i| i.consume_shortcut(&ctrl_d)) {
             self.show_debug_hud = !self.show_debug_hud;
@@ -774,66 +653,35 @@ impl eframe::App for MainApp {
 
 
         // If playback state toggled, apply it
-        if self.is_playing != previous_is_playing {
-            self.set_playing(self.is_playing);
+        if self.playback.is_playing != previous_is_playing {
+            self.playback.set_playing(self.playback.is_playing);
         }
 
 
 
         // Receive frames from the Media Engine
-        if let Some(rx) = &self.frame_rx {
-            let mut got_frame = false;
-            let mut latest_frame_received = None;
-
-            while let Ok(frame) = rx.try_recv() {
-                if frame.sequence_id() < self.latest_sequence_id {
-                    continue;
-                }
-                latest_frame_received = Some(frame);
-                got_frame = true;
-                self.decode_fps_frame_count += 1;
-            }
-
-            if let Some(frame) = latest_frame_received {
-                let frame_idx = frame.frame_idx();
-                
-                if self.in_flight_seek_seq.map_or(false, |seq| frame.sequence_id() >= seq) {
-                    self.in_flight_seek_seq = None;
-                }
-                
-                self.latest_frame = Some(frame);
-                if !self.is_scrubbing {
-                    self.current_frame = frame_idx;
-                }
-            }
-
-            let elapsed = self.decode_fps_last_reset.elapsed();
-            if elapsed >= std::time::Duration::from_secs(1) {
-                self.decode_fps = self.decode_fps_frame_count as f32 / elapsed.as_secs_f32();
-                self.decode_fps_frame_count = 0;
-                self.decode_fps_last_reset = std::time::Instant::now();
-            }
-
-            if self.in_flight_seek_seq.is_none() {
-                if let Some(desired) = self.desired_scrub_frame.take() {
-                    if Some(desired) != self.last_sent_seek_frame {
-                        self.seek_internal(desired, true, false);
-                        self.in_flight_seek_seq = Some(self.latest_sequence_id);
-                    }
-                }
-            }
-
-            if got_frame {
-                ctx.request_repaint();
-            }
+        let (latest_frame, frames_popped) = self.playback.update();
+        if frames_popped > 0 {
+            self.decode_fps_frame_count += frames_popped;
         }
 
-        if self.current_frame >= self.total_frames {
-            self.current_frame = self.total_frames;
-            self.set_playing(false);
+        let elapsed = self.decode_fps_last_reset.elapsed();
+        if elapsed >= std::time::Duration::from_secs(1) {
+            self.decode_fps = self.decode_fps_frame_count as f32 / elapsed.as_secs_f32();
+            self.decode_fps_frame_count = 0;
+            self.decode_fps_last_reset = std::time::Instant::now();
         }
 
-        if self.is_playing {
+        if latest_frame.is_some() {
+            ctx.request_repaint();
+        }
+
+        if self.playback.current_frame >= self.playback.total_frames {
+            self.playback.current_frame = self.playback.total_frames;
+            self.playback.set_playing(false);
+        }
+
+        if self.playback.is_playing || self.playback.is_stepping() || self.playback.is_scrubbing() {
             ctx.request_repaint();
         }
 
@@ -850,11 +698,11 @@ impl eframe::App for MainApp {
                     // Timeline Time Indicators & Zoom Controls
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new(self.frame_to_time(self.current_frame))
+                            egui::RichText::new(self.frame_to_time(self.playback.current_frame))
                                 .size(16.0)
                                 .color(Color32::WHITE)
                         );
-                        ui.label(format!("/ {}", self.frame_to_time(self.total_frames)));
+                        ui.label(format!("/ {}", self.frame_to_time(self.playback.total_frames)));
                         
                         // Zoom controls aligned right
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -874,7 +722,7 @@ impl eframe::App for MainApp {
                             }
 
                             ui.add_space(8.0);
-                            ui.label(format!("Frame {} / {}", self.current_frame, self.total_frames));
+                            ui.label(format!("Frame {} / {}", self.playback.current_frame, self.playback.total_frames));
                         });
                     });
 
@@ -938,13 +786,13 @@ impl eframe::App for MainApp {
                     }
 
                     // Calculate frame delta step exponentially
-                    let max_delta = (self.total_frames as f32 / num_gaps as f32).max(1.0);
+                    let max_delta = (self.playback.total_frames as f32 / num_gaps as f32).max(1.0);
                     let delta_f = (max_delta.ln() * (1.0 - self.zoom_level)).exp();
                     let delta = (delta_f as usize).max(1);
 
                     for i in 0..num_thumbnails {
                         let offset_idx = i as isize - (num_thumbnails / 2) as isize;
-                        let target_frame = self.current_frame as isize + offset_idx * delta as isize;
+                        let target_frame = self.playback.current_frame as isize + offset_idx * delta as isize;
 
                         let tx = inner_rect.left() + i as f32 * (thumbnail_width + thumbnail_spacing);
                         let thub_rect = egui::Rect::from_min_size(
@@ -952,7 +800,7 @@ impl eframe::App for MainApp {
                             egui::vec2(thumbnail_width, inner_height),
                         );
 
-                        if target_frame >= 0 && target_frame <= self.total_frames as isize {
+                        if target_frame >= 0 && target_frame <= self.playback.total_frames as isize {
                             let is_center = offset_idx == 0;
                             
                             let bg_color = if is_center {
@@ -1001,8 +849,8 @@ impl eframe::App for MainApp {
                             let response_id = ui.make_persistent_id(format!("filmstrip_th_{}", i));
                             let th_response = ui.interact(thub_rect, response_id, egui::Sense::click());
                             if th_response.clicked() {
-                                self.set_playing(false);
-                                self.seek_internal(target_frame as usize, false, true);
+                                self.playback.set_playing(false);
+                                self.playback.seek_internal(target_frame as usize, false, true);
                             }
                         } else {
                             // Out of bounds thumbnail placeholder
@@ -1042,7 +890,6 @@ impl eframe::App for MainApp {
                         egui::Sense::click_and_drag(),
                     );
                     let wave_response = wave_response.on_hover_text("Waveform Viewport: Drag or click to scrub");
-                    wave_dragged = wave_response.dragged();
 
                     let painter = ui.painter_at(wave_rect);
                     painter.rect(
@@ -1054,7 +901,7 @@ impl eframe::App for MainApp {
 
                     // Synced frame calculations matching filmstrip
                     let half_width = num_thumbnails / 2;
-                    let start_frame = self.current_frame as isize - half_width as isize * delta as isize;
+                    let start_frame = self.playback.current_frame as isize - half_width as isize * delta as isize;
                     let visible_range_width = (2 * half_width * delta) as f32;
 
                     let frame_to_x = |frame: usize| -> f32 {
@@ -1070,13 +917,13 @@ impl eframe::App for MainApp {
                     for i in 0..bar_count {
                         let pct = i as f32 / bar_count as f32;
                         let frame_idx_isize = start_frame + (pct * visible_range_width) as isize;
-                        let frame_idx = frame_idx_isize.clamp(0, self.total_frames as isize) as usize;
-                        let out_of_bounds = frame_idx_isize < 0 || frame_idx_isize > self.total_frames as isize;
+                        let frame_idx = frame_idx_isize.clamp(0, self.playback.total_frames as isize) as usize;
+                        let out_of_bounds = frame_idx_isize < 0 || frame_idx_isize > self.playback.total_frames as isize;
 
                         let amplitude = if out_of_bounds {
                             0.02
                         } else {
-                            let profile_idx = ((frame_idx as f32 / self.total_frames as f32) * (self.loudness_profile.len() - 1) as f32) as usize;
+                            let profile_idx = ((frame_idx as f32 / self.playback.total_frames as f32) * (self.loudness_profile.len() - 1) as f32) as usize;
                             self.loudness_profile[profile_idx.clamp(0, self.loudness_profile.len() - 1)]
                         };
 
@@ -1207,25 +1054,19 @@ impl eframe::App for MainApp {
                         Color32::from_rgb(236, 72, 153),
                     );
 
-                    if wave_response.drag_started() {
-                        self.was_playing_before_scrub = self.is_playing;
+                    if wave_response.drag_started() || wave_response.clicked() {
+                        self.playback.handle_input(media::InputEvent::ScrubDragStart);
                     }
                     if wave_response.dragged() || wave_response.clicked() {
                         if let Some(mouse_pos) = wave_response.interact_pointer_pos() {
                             let rel_x = (mouse_pos.x - wave_rect.left()).clamp(0.0, wave_rect.width());
                             let pct = rel_x / wave_rect.width();
-                            let target_frame = (pct * self.total_frames as f32) as usize;
-                            self.scrub_to(target_frame);
+                            let target_frame = (pct * self.playback.total_frames as f32) as usize;
+                            self.playback.handle_input(media::InputEvent::ScrubDragUpdate { target_frame });
                         }
                     }
                     if wave_response.drag_stopped() || wave_response.clicked() {
-                        let target = self.latest_frame.as_ref().map(|f| f.frame_idx()).unwrap_or(self.current_frame);
-                        self.current_frame = target;
-                        self.is_playing = self.was_playing_before_scrub;
-                        self.in_flight_seek_seq = None;
-                        self.desired_scrub_frame = None;
-                        self.seek_internal(target, false, true);
-                        self.set_playing(self.is_playing);
+                        self.playback.handle_input(media::InputEvent::ScrubDragEnd);
                     }
                 });
             });
@@ -1307,9 +1148,9 @@ impl eframe::App for MainApp {
                                     painter.rect_filled(rect, 2.0, Color32::from_rgb(30, 27, 51));
                                     
                                     // Draw fill segment
-                                    if self.total_frames > 0 {
-                                        let start_pct = range.in_frame as f32 / self.total_frames as f32;
-                                        let len_pct = (range.out_frame - range.in_frame) as f32 / self.total_frames as f32;
+                                    if self.playback.total_frames > 0 {
+                                        let start_pct = range.in_frame as f32 / self.playback.total_frames as f32;
+                                        let len_pct = (range.out_frame - range.in_frame) as f32 / self.playback.total_frames as f32;
                                         
                                         let fill_left = rect.left() + start_pct * rect.width();
                                         let fill_width = len_pct * rect.width();
@@ -1428,41 +1269,10 @@ impl eframe::App for MainApp {
                                     .pick_file()
                                 {
                                     let path_str = path.to_string_lossy().to_string();
-                                    if let Ok(mut ae) = crate::audio::AudioEngine::new() {
-                                        let audio_tx = ae.tx.take().unwrap();
-                                        let tags_tx = ae.tags_tx.take().unwrap();
-                                        let master_clock = ae.master_clock.clone();
-                                        let (frame_tx, frame_rx) = crossbeam_channel::bounded(30);
-                                        let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
-                                        
-                                        if let Ok((engine, meta)) = media::MediaEngine::new(
-                                            &path_str,
-                                            ae.master_clock.sample_rate(),
-                                            2,
-                                            frame_tx,
-                                            audio_tx,
-                                            tags_tx,
-                                            cmd_rx,
-                                            master_clock,
-                                        ) {
-                                            self.media_tx = Some(engine.tx.clone());
-                                            self.media_engine = Some(engine);
-                                            self.frame_rx = Some(frame_rx);
-                                            self.metadata = Some(meta);
-                                            self.video_path = Some(path_str.clone());
-                                            self.total_frames = self.metadata.as_ref().unwrap().total_frames;
-                                            self.video_fps = self.metadata.as_ref().unwrap().fps;
-                                            self.current_frame = 0;
-                                            self.in_marker = None;
-                                            self.out_marker = None;
-                                            self.latest_frame = None;
-                                            self.is_playing = false;
-                                            self.audio_engine = Some(ae);
-                                            self.seek_internal(0, false, true);
-                                        } else {
-                                            self.audio_engine = Some(ae);
-                                        }
-                                    }
+                                    self.playback.load_video(&path_str);
+                                    self.video_path = Some(path_str.clone());
+                                    self.in_marker = None;
+                                    self.out_marker = None;
                                 }
                             }
                         });
@@ -1488,7 +1298,7 @@ impl eframe::App for MainApp {
                             let painter = ui.painter_at(rect);
 
                             let mut rendered = false;
-                            if let Some(media::DecodedFrame::Cpu { planes, .. }) = &self.latest_frame {
+                            if let Some(media::DecodedFrame::Cpu { planes, .. }) = &self.playback.latest_frame {
                                 let video_w = planes.width as f32;
                                 let video_h = planes.height as f32;
                                 if video_w > 0.0 && video_h > 0.0 {
@@ -1564,18 +1374,18 @@ impl eframe::App for MainApp {
                                                 ui.horizontal(|ui| {
                                                     ui.label(egui::RichText::new("⚡ AV SYNC TELEMETRY").strong().color(Color32::from_rgb(129, 140, 248)));
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        let active_color = if self.is_playing { Color32::from_rgb(74, 222, 128) } else { Color32::from_rgb(156, 163, 175) };
-                                                        ui.label(egui::RichText::new(if self.is_playing { "● ACTIVE" } else { "■ PAUSED" }).color(active_color).font(egui::FontId::monospace(10.0)));
+                                                        let active_color = if self.playback.is_playing { Color32::from_rgb(74, 222, 128) } else { Color32::from_rgb(156, 163, 175) };
+                                                        ui.label(egui::RichText::new(if self.playback.is_playing { "● ACTIVE" } else { "■ PAUSED" }).color(active_color).font(egui::FontId::monospace(10.0)));
                                                     });
                                                 });
                                                 
                                                 ui.separator();
                                                 
-                                                                                let master_time = self.audio_engine.as_ref().map_or(0.0, |ae| ae.master_clock.current_time());
-                                                let seq_id = self.latest_frame.as_ref().map_or(0, |f| f.sequence_id());
-                                                let video_time = self.latest_frame.as_ref()
+                                                                                let master_time = self.playback.audio_engine.as_ref().map_or(0.0, |ae| ae.master_clock.current_time());
+                                                let seq_id = self.playback.latest_frame.as_ref().map_or(0, |f| f.sequence_id());
+                                                let video_time = self.playback.latest_frame.as_ref()
                                                     .filter(|f| f.sequence_id() == seq_id)
-                                                    .map_or(self.current_frame as f64 / self.video_fps, |f| f.pts_sec());
+                                                    .map_or(self.playback.current_frame as f64 / self.playback.video_fps, |f| f.pts_sec());
                                                 let drift = master_time - video_time;
                                                 
                                                 ui.horizontal(|ui| {
@@ -1620,7 +1430,7 @@ impl eframe::App for MainApp {
                                                 ui.horizontal(|ui| {
                                                     ui.label("CPAL Rate   :");
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        ui.label(egui::RichText::new(format!("{} Hz", self.audio_engine.as_ref().map_or(0, |ae| ae.master_clock.sample_rate()))).monospace());
+                                                        ui.label(egui::RichText::new(format!("{} Hz", self.playback.audio_engine.as_ref().map_or(0, |ae| ae.master_clock.sample_rate()))).monospace());
                                                     });
                                                 });
                                                 ui.horizontal(|ui| {
@@ -1681,12 +1491,12 @@ impl eframe::App for MainApp {
                                                 ui.add_space(8.0);
                                                 ui.horizontal(|ui| {
                                                     if ui.button("Flush Buffer").on_hover_text("Flush/drain audio ring buffer").clicked() {
-                                                        self.seek_internal(self.current_frame, false, true);
+                                                        self.playback.seek_internal(self.playback.current_frame, false, true);
                                                         println!("HUD: Manual flush of audio buffer triggered");
                                                     }
                                                     if ui.button("Force Resync").on_hover_text("Force resync clocks").clicked() {
-                                                        let current = self.current_frame;
-                                                        self.seek_internal(current, false, true);
+                                                        let current = self.playback.current_frame;
+                                                        self.playback.seek_internal(current, false, true);
                                                         println!("HUD: Manual resync triggered to frame {}", current);
                                                     }
                                                 });
@@ -1700,22 +1510,15 @@ impl eframe::App for MainApp {
 
                     // Sleek progress slider
                     let progress_response = self.progress_bar(ui);
-                    progress_dragged = progress_response.dragged();
-                    if progress_response.drag_started() {
-                        self.was_playing_before_scrub = self.is_playing;
+                    if progress_response.drag_started() || progress_response.clicked() {
+                        self.playback.handle_input(media::InputEvent::ScrubDragStart);
                     }
                     if progress_response.dragged() || progress_response.clicked() {
-                        let target_frame = self.current_frame;
-                        self.scrub_to(target_frame);
+                        let target_frame = self.playback.current_frame;
+                        self.playback.handle_input(media::InputEvent::ScrubDragUpdate { target_frame });
                     }
                     if progress_response.drag_stopped() || progress_response.clicked() {
-                        let target = self.latest_frame.as_ref().map(|f| f.frame_idx()).unwrap_or(self.current_frame);
-                        self.current_frame = target;
-                        self.is_playing = self.was_playing_before_scrub;
-                        self.in_flight_seek_seq = None;
-                        self.desired_scrub_frame = None;
-                        self.seek_internal(target, false, true);
-                        self.set_playing(self.is_playing);
+                        self.playback.handle_input(media::InputEvent::ScrubDragEnd);
                     }
 
                     ui.add_space(10.0);
@@ -1736,7 +1539,7 @@ impl eframe::App for MainApp {
                                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
                                 if playback_control_button(ui, PlaybackIcon::Start, false, "Go to start of video").clicked() {
-                                    self.seek_internal(0, false, true);
+                                    self.playback.seek_internal(0, false, true);
                                 }
                                 let prev_resp = playback_control_button(ui, PlaybackIcon::PrevFrame, false, "Step backward one frame");
                                 if prev_resp.clicked() {
@@ -1746,18 +1549,18 @@ impl eframe::App for MainApp {
                                     prev_down = true;
                                 }
                                 if playback_control_button(ui, PlaybackIcon::SetIn, false, "Set In marker at current frame [").clicked() {
-                                    self.in_marker = Some(self.current_frame);
+                                    self.in_marker = Some(self.playback.current_frame);
                                 }
 
                                 // Play/pause button
-                                let play_icon = if self.is_playing { PlaybackIcon::Pause } else { PlaybackIcon::Play };
-                                let play_tooltip = if self.is_playing { "Pause playback" } else { "Start playback" };
+                                let play_icon = if self.playback.is_playing { PlaybackIcon::Pause } else { PlaybackIcon::Play };
+                                let play_tooltip = if self.playback.is_playing { "Pause playback" } else { "Start playback" };
                                 if playback_control_button(ui, play_icon, true, play_tooltip).clicked() {
-                                    self.set_playing(!self.is_playing);
+                                    self.playback.set_playing(!self.playback.is_playing);
                                 }
 
                                 if playback_control_button(ui, PlaybackIcon::SetOut, false, "Set Out marker at current frame ]").clicked() {
-                                    self.out_marker = Some(self.current_frame);
+                                    self.out_marker = Some(self.playback.current_frame);
                                 }
                                 let next_resp = playback_control_button(ui, PlaybackIcon::NextFrame, false, "Step forward one frame");
                                 if next_resp.clicked() {
@@ -1767,7 +1570,7 @@ impl eframe::App for MainApp {
                                     next_down = true;
                                 }
                                 if playback_control_button(ui, PlaybackIcon::End, false, "Go to end of video").clicked() {
-                                    self.seek_internal(self.total_frames, false, true);
+                                    self.playback.seek_internal(self.playback.total_frames, false, true);
                                 }
                             },
                         );
@@ -1799,79 +1602,24 @@ impl eframe::App for MainApp {
                 });
             });
 
-        // Frame stepping: single tap → direct precise seek, no debounce.
-        // Hold → 250ms entrance guard, then response-driven precise seeks with no timer involvement.
-        // Setting self.is_playing = false here is critical: it prevents the AV sync block from
-        // running next tick and clobbering current_frame from the master clock.
-        // State updates and input logic
-        let is_currently_stepping = matches!(
-            self.arrow_seek_state,
-            ArrowSeekState::SteppingLeft { .. } | ArrowSeekState::SteppingRight { .. }
-        );
-
-        if prev_pressed && !is_currently_stepping {
-            self.set_playing(false);
-            self.arrow_seek_state = ArrowSeekState::SteppingLeft {
-                held_since: std::time::Instant::now(),
-            };
-            self.current_frame = self.current_frame.saturating_sub(1);
-            self.seek_internal(self.current_frame, false, false);
-            self.in_flight_seek_seq = Some(self.latest_sequence_id);
-        } else if next_pressed && !is_currently_stepping {
-            self.set_playing(false);
-            self.arrow_seek_state = ArrowSeekState::SteppingRight {
-                held_since: std::time::Instant::now(),
-                unpaced_started: false,
-            };
-            self.current_frame = (self.current_frame + 1).min(self.total_frames);
-            self.seek_internal(self.current_frame, false, false);
-            self.in_flight_seek_seq = Some(self.latest_sequence_id);
-        } else {
-            match self.arrow_seek_state {
-                ArrowSeekState::SteppingLeft { held_since } => {
-                    if prev_down {
-                        if held_since.elapsed() >= std::time::Duration::from_millis(250) {
-                            if self.in_flight_seek_seq.is_none() {
-                                self.is_playing = false;
-                                let target_frame = self.current_frame.saturating_sub(1);
-                                self.seek_internal(target_frame, false, false);
-                                self.in_flight_seek_seq = Some(self.latest_sequence_id);
-                            }
-                        }
-                        ctx.request_repaint();
-                    } else {
-                        self.arrow_seek_state = ArrowSeekState::Idle;
-                    }
-                }
-                ArrowSeekState::SteppingRight { held_since, unpaced_started } => {
-                    if next_down {
-                        if held_since.elapsed() >= std::time::Duration::from_millis(250) {
-                            if !unpaced_started {
-                                self.latest_sequence_id += 1;
-                                if let Some(tx) = &self.media_tx {
-                                    let _ = tx.send(media::MediaCommand::PlayUnpaced { sequence_id: self.latest_sequence_id });
-                                }
-                                self.arrow_seek_state = ArrowSeekState::SteppingRight {
-                                    held_since,
-                                    unpaced_started: true,
-                                };
-                            }
-                        }
-                        ctx.request_repaint();
-                    } else {
-                        if unpaced_started {
-                            self.set_playing(false);
-                            if let Some(ae) = &self.audio_engine {
-                                ae.master_clock.reset(self.current_frame as f64 / self.video_fps);
-                            }
-                        }
-                        self.arrow_seek_state = ArrowSeekState::Idle;
-                    }
-                }
-                ArrowSeekState::Idle => {}
-            }
+        if prev_pressed {
+            self.playback.handle_input(media::InputEvent::ArrowLeftPressed);
         }
-        self.is_scrubbing = progress_dragged || wave_dragged;
+        if prev_down {
+            self.playback.handle_input(media::InputEvent::ArrowLeftDown);
+        }
+        if prev_released {
+            self.playback.handle_input(media::InputEvent::ArrowLeftReleased);
+        }
+        if next_pressed {
+            self.playback.handle_input(media::InputEvent::ArrowRightPressed);
+        }
+        if next_down {
+            self.playback.handle_input(media::InputEvent::ArrowRightDown);
+        }
+        if next_released {
+            self.playback.handle_input(media::InputEvent::ArrowRightReleased);
+        }
     }
 }
 

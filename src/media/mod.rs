@@ -455,11 +455,13 @@ fn run_decoder_thread(
             events.push(crate::media::decoder_state::DecoderEvent::Wakeup);
         }
 
+        let mut did_work = false;
         for event in events {
             let actions = sm.step(event);
             for action in actions {
                 match action {
                     crate::media::decoder_state::DecoderAction::DemuxNextPacket => {
+                        did_work = true;
                         if let Some(packet_res) = packets_iter.next() {
                             let (stream, packet) = packet_res;
                             let sub_actions = sm.step(crate::media::decoder_state::DecoderEvent::PacketDemuxed {
@@ -487,6 +489,7 @@ fn run_decoder_thread(
                         }
                     }
                     crate::media::decoder_state::DecoderAction::SeekDemuxer { pts } => {
+                        did_work = true;
                         drop(packets_iter);
                         unsafe {
                             let _ = ffmpeg_next::ffi::avformat_seek_file(
@@ -501,6 +504,7 @@ fn run_decoder_thread(
                         packets_iter = input.packets();
                     }
                     crate::media::decoder_state::DecoderAction::ScheduleWakeup(duration) => {
+                        did_work = true;
                         std::thread::sleep(duration);
                     }
                 }
@@ -508,7 +512,7 @@ fn run_decoder_thread(
         }
 
         // Active, but maybe queues are full, so let's sleep a tiny bit to be friendly
-        if sm.is_decoding_active() && pending_cmd.is_none() {
+        if sm.is_decoding_active() && pending_cmd.is_none() && !did_work {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }

@@ -4,14 +4,13 @@
 //! hardware, `Stats` for timing analysis, `BenchReport` for dual console/JSON
 //! output, and `TestMediaLocator` for resolving test media files.
 
-use crossbeam_channel::{bounded, unbounded, Receiver};
-use ringbuf::{storage::Heap, traits::*, SharedRb};
+use crossbeam_channel::Receiver;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use std::{env, fs, thread};
+use std::{env, fs};
 
 use crate::audio::clock::MasterClock;
-use crate::media::{DecodedFrame, MediaCommand, MediaEngine, VideoMetadata};
+use crate::media::{DecodedFrame, MediaCommand, VideoMetadata};
 
 // ── MediaTestRig ────────────────────────────────────────────────────────────
 
@@ -21,182 +20,55 @@ use crate::media::{DecodedFrame, MediaCommand, MediaEngine, VideoMetadata};
 /// MasterClock, crossbeam channels) so callers can simply `send()` commands
 /// and `recv_frame()` responses.
 pub struct MediaTestRig {
-    pub engine: MediaEngine,
+    pub session: crate::media::PlaybackSession,
     pub metadata: VideoMetadata,
-    pub frame_rx: Receiver<DecodedFrame>,
     pub master_clock: MasterClock,
-    _audio_engine: Option<crate::audio::AudioEngine>,
-    _audio_consumer: Option<thread::JoinHandle<()>>,
+    pub frame_rx: Receiver<DecodedFrame>,
 }
 
 impl MediaTestRig {
     /// Open a video file and spin up the media engine headlessly.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, anyhow::Error> {
-        let (frame_tx, frame_rx) = bounded::<DecodedFrame>(4);
-        let (_cmd_tx, cmd_rx) = unbounded::<MediaCommand>();
-
-        if let Ok(mut audio_engine) = crate::audio::AudioEngine::new() {
-            audio_engine.set_muted(true);
-            let audio_tx = audio_engine.tx.take().unwrap();
-            let tags_tx = audio_engine.tags_tx.take().unwrap();
-            let master_clock = audio_engine.master_clock.clone();
-
-            let (engine, metadata) = MediaEngine::new(
-                path,
-                audio_engine.master_clock.sample_rate(),
-                audio_engine.channels,
-                frame_tx,
-                audio_tx,
-                tags_tx,
-                cmd_rx,
-                master_clock.clone(),
-            )?;
-
-            Ok(Self {
-                engine,
-                metadata,
-                frame_rx,
-                master_clock,
-                _audio_engine: Some(audio_engine),
-                _audio_consumer: None,
-            })
-        } else {
-            println!("[bench] No default audio device found. Falling back to real-time paced simulation.");
-            let (master_clock, ticker) = MasterClock::new(48000);
-            master_clock.set_has_audio(true); // Treat as audio video
-
-            let rb = SharedRb::<Heap<(f32, u64)>>::new(48000 * 2 * 2);
-            let (audio_tx, mut audio_cons) = rb.split();
-
-            let tags_rb = ringbuf::SharedRb::<ringbuf::storage::Heap<(u64, u64, u64)>>::new(256);
-            let (tags_tx, mut tags_cons) = tags_rb.split();
-
-            let ticker_clone = ticker.clone();
-            let audio_consumer = thread::spawn(move || {
-                let sample_rate = 48000;
-                let mut start_time = Instant::now();
-                let mut samples_read_total = 0u64;
-                let mut last_tag = None;
-                let mut pending_tag: Option<(u64, u64, u64)> = None;
-                let mut last_active = false;
-                let mut current_consumer_generation = 0;
-
-                loop {
-                    let active = ticker_clone.is_active();
-
-                    // Always drop stale samples if the generation changed, even when inactive
-                    let producer_gen = ticker_clone.playback_generation();
-                    if producer_gen != current_consumer_generation {
-                        while let Some((_, generation)) = audio_cons.try_pop() {
-                            if generation == producer_gen {
-                                break;
-                            }
-                        }
-                        samples_read_total = 0;
-                        last_tag = None;
-                        pending_tag = None;
-                        current_consumer_generation = producer_gen;
-                    }
-
-                    if !active {
-                        last_active = false;
-                        thread::sleep(Duration::from_millis(5));
-                        continue;
-                    }
-
-                    if !last_active {
-                        start_time = Instant::now();
-                        last_active = true;
-                    }
-
-                    let elapsed = start_time.elapsed();
-                    let target_samples = (elapsed.as_secs_f64() * sample_rate as f64) as u64;
-
-                    if target_samples > samples_read_total {
-                        let mut to_read = target_samples - samples_read_total;
-                        let mut written = 0;
-
-                        while to_read > 0 {
-                            if let Some((_sample, sample_generation)) = audio_cons.try_pop() {
-                                if sample_generation != current_consumer_generation {
-                                    samples_read_total = 0;
-                                    last_tag = None;
-                                    pending_tag = None;
-                                    current_consumer_generation = sample_generation;
-                                }
-
-                                written += 1;
-                                samples_read_total += 1;
-                                to_read -= 1;
-
-                                loop {
-                                    let next_tag = pending_tag.take().or_else(|| tags_cons.try_pop());
-                                    if let Some((tag_generation, tag_idx, tag_pts_us)) = next_tag {
-                                        if tag_generation != current_consumer_generation {
-                                            continue;
-                                        }
-                                        if tag_idx <= samples_read_total {
-                                            last_tag = Some((tag_idx, tag_pts_us));
-                                        } else {
-                                            pending_tag = Some((tag_generation, tag_idx, tag_pts_us));
-                                            break;
-                                        }
-                                    } else {
-                                        break;
-                                    }
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-
-                        if written > 0 {
-                            ticker_clone.advance(written, last_tag, samples_read_total);
-                        }
-                    }
-
-                    thread::sleep(Duration::from_millis(5));
-                }
-            });
-
-            let (engine, metadata) = MediaEngine::new(
-                path,
-                48000,
-                1,
-                frame_tx,
-                audio_tx,
-                tags_tx,
-                cmd_rx,
-                master_clock.clone(),
-            )?;
-
-            Ok(Self {
-                engine,
-                metadata,
-                frame_rx,
-                master_clock,
-                _audio_engine: None,
-                _audio_consumer: Some(audio_consumer),
-            })
+        let mut session = crate::media::PlaybackSession::new();
+        session.load_video(&path.as_ref().to_string_lossy());
+        if session.media_engine.is_none() {
+            anyhow::bail!("Failed to load video in PlaybackSession");
         }
+        let metadata = session.metadata.clone().unwrap();
+        let master_clock = session.master_clock.clone().unwrap();
+        let frame_rx = session.frame_rx.clone().unwrap();
+        Ok(Self {
+            session,
+            metadata,
+            master_clock,
+            frame_rx,
+        })
     }
 
     /// Send a command to the media engine.
     pub fn send(&self, cmd: MediaCommand) -> Result<(), anyhow::Error> {
-        self.engine.tx.send(cmd)?;
+        if let Some(tx) = &self.session.media_tx {
+            tx.send(cmd)?;
+        }
         Ok(())
     }
 
     /// Block until a frame arrives or timeout expires.
     pub fn recv_frame(&self, timeout: Duration) -> Option<DecodedFrame> {
-        self.frame_rx.recv_timeout(timeout).ok()
+        if let Some(rx) = &self.session.frame_rx {
+            rx.recv_timeout(timeout).ok()
+        } else {
+            None
+        }
     }
 
     /// Drain all currently-buffered frames, returning them.
     pub fn drain_frames(&self) -> Vec<DecodedFrame> {
         let mut frames = Vec::new();
-        while let Ok(frame) = self.frame_rx.try_recv() {
-            frames.push(frame);
+        if let Some(rx) = &self.session.frame_rx {
+            while let Ok(frame) = rx.try_recv() {
+                frames.push(frame);
+            }
         }
         frames
     }
@@ -229,12 +101,16 @@ impl MediaTestRig {
             if remaining.is_zero() {
                 return None;
             }
-            match self.frame_rx.recv_timeout(remaining) {
-                Ok(frame) if frame.sequence_id() == sequence_id => {
-                    return Some((frame, start.elapsed()));
+            if let Some(rx) = &self.session.frame_rx {
+                match rx.recv_timeout(remaining) {
+                    Ok(frame) if frame.sequence_id() == sequence_id => {
+                        return Some((frame, start.elapsed()));
+                    }
+                    Ok(_) => continue, // stale frame, keep waiting
+                    Err(_) => return None,
                 }
-                Ok(_) => continue, // stale frame, keep waiting
-                Err(_) => return None,
+            } else {
+                return None;
             }
         }
     }

@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 /// Seek to frame 0 and drain stale frames so the rig is in a clean state.
 fn reset_to_start(rig: &MediaTestRig) -> Result<(), anyhow::Error> {
     rig.send(MediaCommand::Pause)?;
+    rig.master_clock.pause();
     rig.timed_seek(0, false, 0, Duration::from_secs(5));
     rig.drain_frames();
     Ok(())
@@ -25,6 +26,7 @@ fn reset_to_start(rig: &MediaTestRig) -> Result<(), anyhow::Error> {
 fn start_playback(rig: &MediaTestRig, start_secs: f64) -> Result<(), anyhow::Error> {
     rig.master_clock.set_position(start_secs);
     rig.send(MediaCommand::Play)?;
+    rig.master_clock.play();
     Ok(())
 }
 
@@ -78,6 +80,7 @@ fn burst_decode(
     let elapsed = wall_start.elapsed();
 
     rig.send(MediaCommand::Pause)?;
+    rig.master_clock.pause();
 
     drop(_guard);
 
@@ -124,6 +127,7 @@ fn sustained_decode(
     let elapsed = wall_start.elapsed();
 
     rig.send(MediaCommand::Pause)?;
+    rig.master_clock.pause();
 
     drop(_guard);
 
@@ -174,6 +178,7 @@ fn decode_after_seek(
 
         // Seek to position
         rig.send(MediaCommand::Pause)?;
+        rig.master_clock.pause();
         let seq_id = 100 + i;
         rig.timed_seek(target_frame, false, seq_id, Duration::from_secs(5));
         rig.drain_frames();
@@ -192,6 +197,7 @@ fn decode_after_seek(
         let elapsed = t0.elapsed();
 
         rig.send(MediaCommand::Pause)?;
+        rig.master_clock.pause();
 
         println!(
             "  Position {:.0}% (frame {target_frame}): {count} frames in {}",
@@ -227,6 +233,7 @@ fn gop_boundary_spikes(
     let (frames, intervals) = collect_frames_for(rig, Duration::from_secs(3));
 
     rig.send(MediaCommand::Pause)?;
+    rig.master_clock.pause();
 
     drop(_guard);
 
