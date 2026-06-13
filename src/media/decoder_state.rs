@@ -3,10 +3,21 @@ use crate::media::decoder_pipeline::VideoDecoderPipeline;
 use crate::media::audio_pipeline::AudioDecoderPipeline;
 use std::time::Duration;
 
+pub trait FrameSink: Send {
+    fn try_push(&mut self, frame: DecodedFrame) -> Result<(), DecodedFrame>;
+    fn len(&self) -> usize;
+}
+
+pub trait AudioSink: Send {
+    fn try_push_slice(&mut self, data: &[f32], generation: u64) -> usize;
+    fn vacant_len(&self) -> usize;
+    fn push_tag(&mut self, generation: u64, idx: u64, pts_us: u64);
+}
+
 pub enum DecoderEvent {
     Command(MediaCommand),
     PacketDemuxed { packet: ffmpeg_next::Packet, stream_index: usize },
-    QueueStatus { video_queue_len: usize, audio_vacant_len: usize },
+    Wakeup,
 }
 
 impl std::fmt::Debug for DecoderEvent {
@@ -18,47 +29,26 @@ impl std::fmt::Debug for DecoderEvent {
                     .field("stream_index", stream_index)
                     .finish()
             }
-            DecoderEvent::QueueStatus { video_queue_len, audio_vacant_len } => {
-                f.debug_struct("QueueStatus")
-                    .field("video_queue_len", video_queue_len)
-                    .field("audio_vacant_len", audio_vacant_len)
-                    .finish()
-            }
+            DecoderEvent::Wakeup => write!(f, "Wakeup"),
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum DecoderAction {
     DemuxNextPacket,
     SeekDemuxer { pts: i64 },
-    PushVideo(DecodedFrame),
-    PushAudio { data: Vec<f32>, tag: Option<(u64, u64)>, generation: u64 },
     ScheduleWakeup(Duration),
-}
-
-impl PartialEq for DecoderAction {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (DecoderAction::DemuxNextPacket, DecoderAction::DemuxNextPacket) => true,
-            (DecoderAction::SeekDemuxer { pts: p1 }, DecoderAction::SeekDemuxer { pts: p2 }) => p1 == p2,
-            (DecoderAction::PushVideo(f1), DecoderAction::PushVideo(f2)) => {
-                f1.frame_idx() == f2.frame_idx() && f1.sequence_id() == f2.sequence_id() && f1.pts_sec() == f2.pts_sec()
-            }
-            (DecoderAction::PushAudio { data: d1, tag: t1, generation: g1 },
-             DecoderAction::PushAudio { data: d2, tag: t2, generation: g2 }) => {
-                d1 == d2 && t1 == t2 && g1 == g2
-            }
-            (DecoderAction::ScheduleWakeup(d1), DecoderAction::ScheduleWakeup(d2)) => d1 == d2,
-            _ => false,
-        }
-    }
 }
 
 pub struct DecoderStateMachine {
     pub video_pipeline: VideoDecoderPipeline,
     pub audio_pipeline_opt: Option<AudioDecoderPipeline>,
     master_clock: crate::audio::clock::MasterClock,
+    pub video_sink: Box<dyn FrameSink>,
+    pub audio_sink: Option<Box<dyn AudioSink>>,
+    pub pending_video: Vec<DecodedFrame>,
+    pub pending_audio: Vec<(Vec<f32>, Option<(u64, u64)>, u64)>,
     keyframes: Vec<usize>,
     keyframes_pts: Vec<i64>,
     audio_enabled: bool,
@@ -84,6 +74,8 @@ impl DecoderStateMachine {
         video_pipeline: VideoDecoderPipeline,
         audio_pipeline_opt: Option<AudioDecoderPipeline>,
         master_clock: crate::audio::clock::MasterClock,
+        video_sink: Box<dyn FrameSink>,
+        audio_sink: Option<Box<dyn AudioSink>>,
         keyframes: Vec<usize>,
         keyframes_pts: Vec<i64>,
         fps: f64,
@@ -95,6 +87,10 @@ impl DecoderStateMachine {
             video_pipeline,
             audio_pipeline_opt,
             master_clock,
+            video_sink,
+            audio_sink,
+            pending_video: Vec::new(),
+            pending_audio: Vec::new(),
             keyframes,
             keyframes_pts,
             audio_enabled: true,
@@ -111,6 +107,31 @@ impl DecoderStateMachine {
 
     pub fn audio_enabled(&self) -> bool {
         self.audio_enabled
+    }
+
+    pub fn try_flush_pending(&mut self) {
+        while !self.pending_video.is_empty() {
+            let frame = self.pending_video.remove(0);
+            if let Err(f) = self.video_sink.try_push(frame) {
+                self.pending_video.insert(0, f);
+                break;
+            }
+        }
+
+        if let Some(sink) = &mut self.audio_sink {
+            while !self.pending_audio.is_empty() {
+                let (data, tag, generation) = self.pending_audio.remove(0);
+                if let Some(t) = tag {
+                    sink.push_tag(generation, t.0, t.1);
+                }
+                let pushed = sink.try_push_slice(&data, generation);
+                if pushed < data.len() {
+                    let remaining = data[pushed..].to_vec();
+                    self.pending_audio.insert(0, (remaining, None, generation));
+                    break;
+                }
+            }
+        }
     }
 
     pub fn step(&mut self, event: DecoderEvent) -> Vec<DecoderAction> {
@@ -145,6 +166,10 @@ impl DecoderStateMachine {
                     MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae } => {
                         self.audio_enabled = ae;
                         self.master_clock.set_has_audio(self.has_audio_stream && self.audio_enabled);
+                        
+                        self.pending_video.clear();
+                        self.pending_audio.clear();
+
                         let handled = self.video_pipeline.seek(frame_index, keyframe_only, sequence_id, self.audio_enabled);
 
                         if let Some(audio_pipeline) = self.audio_pipeline_opt.as_mut() {
@@ -156,7 +181,9 @@ impl DecoderStateMachine {
 
                         if handled {
                             if let Some(frame) = self.video_pipeline.get_cached_frame(frame_index) {
-                                actions.push(DecoderAction::PushVideo(frame));
+                                if let Err(f) = self.video_sink.try_push(frame) {
+                                    self.pending_video.push(f);
+                                }
                             }
                         } else {
                             let target_kf = get_nearest_keyframe(&self.keyframes, frame_index);
@@ -173,7 +200,7 @@ impl DecoderStateMachine {
                 if stream_index == self.video_stream_index {
                     if let Ok(frames) = self.video_pipeline.process_packet(&packet) {
                         for frame in frames {
-                            actions.push(DecoderAction::PushVideo(frame));
+                            self.pending_video.push(frame);
                         }
                     }
                 } else if Some(stream_index) == self.audio_stream_index_opt && self.audio_enabled {
@@ -185,21 +212,21 @@ impl DecoderStateMachine {
                             if let Ok(chunks) = audio_pipeline.receive_samples() {
                                 let generation = self.master_clock.playback_generation();
                                 for chunk in chunks {
-                                    actions.push(DecoderAction::PushAudio {
-                                        data: chunk.data,
-                                        tag: chunk.tag,
-                                        generation,
-                                    });
+                                    self.pending_audio.push((chunk.data, chunk.tag, generation));
                                 }
                             }
                         }
                     }
                 }
+                self.try_flush_pending();
             }
-            DecoderEvent::QueueStatus { video_queue_len, audio_vacant_len } => {
-                if self.video_pipeline.is_active() {
-                    let audio_needs_frames = self.audio_enabled && (audio_vacant_len >= 2048);
-                    let queue_needs_frames = (video_queue_len < 20) || audio_needs_frames;
+            DecoderEvent::Wakeup => {
+                self.try_flush_pending();
+                if self.is_decoding_active() {
+                    let audio_needs_frames = self.audio_enabled && self.audio_sink.as_ref().map_or(false, |sink| {
+                        self.pending_audio.is_empty() && sink.vacant_len() >= 2048
+                    });
+                    let queue_needs_frames = (self.pending_video.is_empty() && self.video_sink.len() < 20) || audio_needs_frames;
                     if queue_needs_frames {
                         actions.push(DecoderAction::DemuxNextPacket);
                     }
@@ -228,15 +255,32 @@ mod tests {
         fn flush(&mut self) {}
     }
 
+    struct MockFrameSink {
+        frames: std::sync::Arc<std::sync::Mutex<Vec<DecodedFrame>>>,
+    }
+    impl FrameSink for MockFrameSink {
+        fn try_push(&mut self, frame: DecodedFrame) -> Result<(), DecodedFrame> {
+            self.frames.lock().unwrap().push(frame);
+            Ok(())
+        }
+        fn len(&self) -> usize {
+            self.frames.lock().unwrap().len()
+        }
+    }
+
     #[test]
     fn test_decoder_play_activates_pipeline() {
         let adapter = Box::new(MockDecoderAdapter);
         let video_pipeline = VideoDecoderPipeline::new(adapter, vec![0, 10]);
         let (master_clock, _ticker) = MasterClock::new(44100);
+        let frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let video_sink = Box::new(MockFrameSink { frames });
         let mut sm = DecoderStateMachine::new(
             video_pipeline,
             None,
             master_clock,
+            video_sink,
+            None,
             vec![0, 10],
             vec![0, 1000],
             24.0,
@@ -253,14 +297,18 @@ mod tests {
     }
 
     #[test]
-    fn test_decoder_queue_status_triggers_demux() {
+    fn test_decoder_wakeup_triggers_demux() {
         let adapter = Box::new(MockDecoderAdapter);
         let video_pipeline = VideoDecoderPipeline::new(adapter, vec![0, 10]);
         let (master_clock, _ticker) = MasterClock::new(44100);
+        let frames = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let video_sink = Box::new(MockFrameSink { frames });
         let mut sm = DecoderStateMachine::new(
             video_pipeline,
             None,
             master_clock,
+            video_sink,
+            None,
             vec![0, 10],
             vec![0, 1000],
             24.0,
@@ -270,10 +318,7 @@ mod tests {
         );
 
         sm.step(DecoderEvent::Command(MediaCommand::Play));
-        let actions = sm.step(DecoderEvent::QueueStatus {
-            video_queue_len: 5,
-            audio_vacant_len: 1000,
-        });
+        let actions = sm.step(DecoderEvent::Wakeup);
 
         assert!(actions.contains(&DecoderAction::DemuxNextPacket));
     }

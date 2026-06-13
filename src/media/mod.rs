@@ -303,13 +303,52 @@ fn run_decoding_loop(
     Ok(())
 }
 
+struct ChannelFrameSink {
+    tx: crossbeam_channel::Sender<DecodedFrame>,
+}
+impl crate::media::decoder_state::FrameSink for ChannelFrameSink {
+    fn try_push(&mut self, frame: DecodedFrame) -> Result<(), DecodedFrame> {
+        self.tx.try_send(frame).map_err(|e| match e {
+            crossbeam_channel::TrySendError::Full(f) => f,
+            crossbeam_channel::TrySendError::Disconnected(f) => f,
+        })
+    }
+    fn len(&self) -> usize {
+        self.tx.len()
+    }
+}
+
+struct RingbufAudioSink {
+    audio_tx: ringbuf::wrap::CachingProd<std::sync::Arc<ringbuf::SharedRb<ringbuf::storage::Heap<(f32, u64)>>>>,
+    tags_tx: ringbuf::wrap::CachingProd<std::sync::Arc<ringbuf::SharedRb<ringbuf::storage::Heap<(u64, u64, u64)>>>>,
+}
+impl crate::media::decoder_state::AudioSink for RingbufAudioSink {
+    fn try_push_slice(&mut self, data: &[f32], generation: u64) -> usize {
+        let mut pushed = 0;
+        for &sample in data {
+            if self.audio_tx.try_push((sample, generation)).is_ok() {
+                pushed += 1;
+            } else {
+                break;
+            }
+        }
+        pushed
+    }
+    fn vacant_len(&self) -> usize {
+        self.audio_tx.vacant_len()
+    }
+    fn push_tag(&mut self, generation: u64, idx: u64, pts_us: u64) {
+        let _ = self.tags_tx.try_push((generation, idx, pts_us));
+    }
+}
+
 fn run_decoder_thread(
     path: String,
     target_sample_rate: u32,
     target_channels: usize,
     play_queue_tx: Sender<DecodedFrame>,
-    mut audio_tx: CachingProd<Arc<SharedRb<Heap<(f32, u64)>>>>,
-    mut tags_tx: CachingProd<Arc<SharedRb<Heap<(u64, u64, u64)>>>>,
+    audio_tx: CachingProd<Arc<SharedRb<Heap<(f32, u64)>>>>,
+    tags_tx: CachingProd<Arc<SharedRb<Heap<(u64, u64, u64)>>>>,
     decoder_cmd_rx: Receiver<MediaCommand>,
     fps: f64,
     master_clock: crate::audio::clock::MasterClock,
@@ -366,10 +405,25 @@ fn run_decoder_thread(
         crate::media::decoder_pipeline::VideoDecoderPipeline::new(adapter, keyframes.clone())
     };
 
+    let video_sink = Box::new(ChannelFrameSink {
+        tx: play_queue_tx.clone(),
+    });
+
+    let audio_sink: Option<Box<dyn crate::media::decoder_state::AudioSink>> = if has_audio_stream {
+        Some(Box::new(RingbufAudioSink {
+            audio_tx,
+            tags_tx,
+        }))
+    } else {
+        None
+    };
+
     let mut sm = crate::media::decoder_state::DecoderStateMachine::new(
         video_pipeline,
         audio_pipeline_opt,
         master_clock,
+        video_sink,
+        audio_sink,
         keyframes,
         keyframes_pts,
         fps,
@@ -382,7 +436,7 @@ fn run_decoder_thread(
     let mut pending_cmd: Option<MediaCommand> = None;
 
     loop {
-        // Step 1: Query incoming commands
+        // Query incoming commands
         let cmd_opt = pending_cmd.take().or_else(|| {
             if !sm.is_decoding_active() {
                 decoder_cmd_rx.recv().ok()
@@ -398,13 +452,9 @@ fn run_decoder_thread(
             }
             events.push(crate::media::decoder_state::DecoderEvent::Command(cmd));
         } else if sm.is_decoding_active() {
-            events.push(crate::media::decoder_state::DecoderEvent::QueueStatus {
-                video_queue_len: play_queue_tx.len(),
-                audio_vacant_len: audio_tx.vacant_len(),
-            });
+            events.push(crate::media::decoder_state::DecoderEvent::Wakeup);
         }
 
-        // Step 2: Feed events to the state machine and process actions
         for event in events {
             let actions = sm.step(event);
             for action in actions {
@@ -412,66 +462,24 @@ fn run_decoder_thread(
                     crate::media::decoder_state::DecoderAction::DemuxNextPacket => {
                         if let Some(packet_res) = packets_iter.next() {
                             let (stream, packet) = packet_res;
-                            let stream_idx = stream.index();
-                            // Process packet event
                             let sub_actions = sm.step(crate::media::decoder_state::DecoderEvent::PacketDemuxed {
                                 packet,
-                                stream_index: stream_idx,
+                                stream_index: stream.index(),
                             });
-                            for sub_action in sub_actions {
-                                match sub_action {
-                                    crate::media::decoder_state::DecoderAction::PushVideo(frame) => {
-                                        let mut f_opt = Some(frame);
-                                        while let Some(f) = f_opt.take() {
-                                            crossbeam_channel::select! {
-                                                send(play_queue_tx, f) -> res => {
-                                                    if res.is_err() {
-                                                        return Ok(());
-                                                    }
-                                                }
-                                                recv(decoder_cmd_rx) -> cmd => {
-                                                    if let Ok(c) = cmd {
-                                                        if matches!(c, MediaCommand::Shutdown) {
-                                                            return Ok(());
-                                                        }
-                                                        // Stash it
-                                                        pending_cmd = Some(c);
-                                                    }
-                                                }
-                                                default(std::time::Duration::from_millis(10)) => {
-                                                    f_opt = Some(f);
-                                                }
-                                            }
-                                            // Break if a seek/command was stashed to process it immediately
-                                            if pending_cmd.is_some() {
-                                                break;
-                                            }
-                                        }
+                            for sub in sub_actions {
+                                if let crate::media::decoder_state::DecoderAction::SeekDemuxer { pts } = sub {
+                                    drop(packets_iter);
+                                    unsafe {
+                                        let _ = ffmpeg_next::ffi::avformat_seek_file(
+                                            input.as_mut_ptr(),
+                                            video_stream_idx as i32,
+                                            i64::MIN,
+                                            pts,
+                                            pts,
+                                            0,
+                                        );
                                     }
-                                    crate::media::decoder_state::DecoderAction::PushAudio { data, tag, generation } => {
-                                        if let Some(tag_val) = tag {
-                                            let _ = tags_tx.try_push((generation, tag_val.0, tag_val.1));
-                                        }
-                                        let mut chunk_pushed = false;
-                                        while !chunk_pushed && pending_cmd.is_none() {
-                                            if audio_tx.vacant_len() >= data.len() {
-                                                for &sample in &data {
-                                                    let _ = audio_tx.try_push((sample, generation));
-                                                }
-                                                chunk_pushed = true;
-                                            } else {
-                                                if let Ok(cmd) = decoder_cmd_rx.try_recv() {
-                                                    if matches!(cmd, MediaCommand::Shutdown) {
-                                                        return Ok(());
-                                                    }
-                                                    pending_cmd = Some(cmd);
-                                                    break;
-                                                }
-                                                std::thread::sleep(std::time::Duration::from_millis(10));
-                                            }
-                                        }
-                                    }
-                                    _ => {}
+                                    packets_iter = input.packets();
                                 }
                             }
                         } else {
@@ -492,13 +500,9 @@ fn run_decoder_thread(
                         }
                         packets_iter = input.packets();
                     }
-                    crate::media::decoder_state::DecoderAction::PushVideo(frame) => {
-                        let _ = play_queue_tx.send(frame);
+                    crate::media::decoder_state::DecoderAction::ScheduleWakeup(duration) => {
+                        std::thread::sleep(duration);
                     }
-                    crate::media::decoder_state::DecoderAction::PushAudio { .. } => {
-                        // Handled in sub_actions above
-                    }
-                    crate::media::decoder_state::DecoderAction::ScheduleWakeup(_) => {}
                 }
             }
         }
