@@ -9,6 +9,8 @@ use ringbuf::traits::*;
 
 pub mod types;
 pub mod cache;
+pub mod presenter_state;
+
 
 pub mod decoder_pipeline;
 pub mod ffmpeg_adapter;
@@ -16,7 +18,9 @@ pub mod audio_pipeline;
 pub mod sync;
 
 pub use crate::media::types::*;
-pub use crate::media::cache::*;
+pub use crate::media::cache::*;pub mod session;
+pub use crate::media::session::*;
+
 pub use crate::media::decoder_pipeline::*;
 pub use crate::media::ffmpeg_adapter::*;
 pub use crate::media::audio_pipeline::*;
@@ -140,6 +144,18 @@ fn get_nearest_keyframe(keyframes: &[usize], target: usize) -> usize {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PresenterState {
+    Paused,
+    Playing,
+    PlayingUnpaced { sequence_id: usize },
+    Seeking {
+        target_frame_idx: Option<usize>,
+        sequence_id: usize,
+        resume_playing_after: bool,
+    },
+}
+
 fn run_decoding_loop(
     path: &str,
     target_sample_rate: u32,
@@ -181,14 +197,12 @@ fn run_decoding_loop(
 
     // Run Presenter Thread (current thread)
     let mut sync_engine = crate::media::sync::VideoSyncEngine::new(Box::new(master_clock.clone()));
-    let mut playing = false;
-    let mut unpaced = false;
-    let mut play_after_seek = false;
-    let mut latest_seq = 0;
+    let mut state = PresenterState::Paused;
     let mut current_frame: Option<DecodedFrame> = None;
     let mut pending_cmd: Option<MediaCommand> = None;
     let mut wait_duration: Option<std::time::Duration>;
-    let mut seek_target_frame_idx: Option<usize> = None;
+    let mut last_wait_frame: Option<(usize, usize)> = None;
+    let mut lookahead_queue = std::collections::VecDeque::new();
 
     loop {
         // 1. Process incoming commands from UI/test rig
@@ -200,33 +214,38 @@ fn run_decoding_loop(
                     return Ok(());
                 }
                 MediaCommand::Play => {
-                    playing = true;
-                    unpaced = false;
-                    play_after_seek = false;
+                    state = PresenterState::Playing;
+                    lookahead_queue.clear();
+                    current_frame = None;
                     sync_engine.reset();
                     let _ = decoder_cmd_tx.send(MediaCommand::Play);
                 }
                 MediaCommand::PlayUnpaced { sequence_id } => {
-                    playing = true;
-                    unpaced = true;
-                    play_after_seek = false;
-                    latest_seq = sequence_id;
+                    state = PresenterState::PlayingUnpaced { sequence_id };
+                    lookahead_queue.clear();
+                    current_frame = None;
                     while play_queue_rx.try_recv().is_ok() {}
                     let _ = decoder_cmd_tx.send(MediaCommand::PlayUnpaced { sequence_id });
                 }
                 MediaCommand::Pause => {
-                    playing = false;
-                    unpaced = false;
-                    play_after_seek = false;
+                    state = PresenterState::Paused;
+                    lookahead_queue.clear();
+                    current_frame = None;
                     let _ = decoder_cmd_tx.send(MediaCommand::Pause);
                 }
                 MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled } => {
-                    play_after_seek = playing || play_after_seek;
-                    latest_seq = sequence_id;
-                    playing = false;
-                    unpaced = false;
+                    let resume_playing_after = match state {
+                        PresenterState::Playing | PresenterState::PlayingUnpaced { .. } => true,
+                        PresenterState::Seeking { resume_playing_after: r, .. } => r,
+                        PresenterState::Paused => false,
+                    };
+                    state = PresenterState::Seeking {
+                        target_frame_idx: Some(frame_index),
+                        sequence_id,
+                        resume_playing_after,
+                    };
                     current_frame = None;
-                    seek_target_frame_idx = Some(frame_index);
+                    lookahead_queue.clear();
                     while play_queue_rx.try_recv().is_ok() {}
                     let _ = decoder_cmd_tx.send(MediaCommand::Seek {
                         frame_index,
@@ -239,39 +258,49 @@ fn run_decoding_loop(
         }
 
         // 2. Fetch frame if needed
-        if current_frame.is_none() {
-            if playing {
-                if let Ok(frame) = play_queue_rx.try_recv() {
-                    current_frame = Some(frame);
-                }
-            } else if seek_target_frame_idx.is_some() || play_after_seek {
+        match state {
+            PresenterState::Playing | PresenterState::PlayingUnpaced { .. } => {
                 while let Ok(frame) = play_queue_rx.try_recv() {
-                    let seq = frame.sequence_id();
-                    if let Some(target_idx) = seek_target_frame_idx {
-                        if seq == latest_seq {
-                            let f_idx = frame.frame_idx();
-                            let _ = frame_tx.try_send(frame);
-                            if f_idx >= target_idx {
-                                seek_target_frame_idx = None;
+                    lookahead_queue.push_back(frame);
+                }
+            }
+            _ => {}
+        }
+
+        if current_frame.is_none() {
+            match state {
+                PresenterState::Playing | PresenterState::PlayingUnpaced { .. } => {
+                    current_frame = lookahead_queue.pop_front();
+                }
+                PresenterState::Seeking { ref mut target_frame_idx, sequence_id, resume_playing_after } => {
+                    while let Ok(frame) = play_queue_rx.try_recv() {
+                        let seq = frame.sequence_id();
+                        if let Some(target_idx) = *target_frame_idx {
+                            if seq == sequence_id {
+                                let f_idx = frame.frame_idx();
+                                let _ = frame_tx.try_send(frame);
+                                if f_idx >= target_idx {
+                                    *target_frame_idx = None;
+                                }
                             }
                         }
-                    }
-                    if play_after_seek && seq == latest_seq {
-                        playing = true;
-                        play_after_seek = false;
-                        sync_engine.reset();
-                        let _ = decoder_cmd_tx.send(MediaCommand::Play);
-                        break;
+                        if resume_playing_after && seq == sequence_id {
+                            state = PresenterState::Playing;
+                            sync_engine.reset();
+                            let _ = decoder_cmd_tx.send(MediaCommand::Play);
+                            break;
+                        }
                     }
                 }
+                PresenterState::Paused => {}
             }
         }
 
         // 3. Present current frame if due
         wait_duration = None;
-        if playing {
+        if matches!(state, PresenterState::Playing | PresenterState::PlayingUnpaced { .. }) {
             if let Some(frame) = &current_frame {
-                if unpaced {
+                if matches!(state, PresenterState::PlayingUnpaced { .. }) {
                     let frame = current_frame.take().unwrap();
                     let _ = frame_tx.try_send(frame);
                 } else {
@@ -279,13 +308,21 @@ fn run_decoding_loop(
                     let action = sync_engine.evaluate_frame(pts_sec);
                     match action {
                         Ok(SyncAction::Present) => {
+                            last_wait_frame = None;
                             let frame = current_frame.take().unwrap();
                             let _ = frame_tx.try_send(frame);
                         }
                         Ok(SyncAction::Wait(remaining)) => {
                             wait_duration = Some(remaining);
+                            let f_idx = frame.frame_idx();
+                            let count = match last_wait_frame {
+                                Some((idx, c)) if idx == f_idx => c + 1,
+                                _ => 1,
+                            };
+                            last_wait_frame = Some((f_idx, count));
                         }
                         Err(_) => {
+                            last_wait_frame = None;
                             let frame = current_frame.take().unwrap();
                             let _ = frame_tx.try_send(frame);
                         }
@@ -295,31 +332,32 @@ fn run_decoding_loop(
         }
 
         // 4. Wait / sleep efficiently
-        if playing {
-            if let Some(remaining) = wait_duration {
-                if remaining > std::time::Duration::from_millis(1) {
-                    let wait_cap = std::time::Duration::from_millis(10);
-                    if let Ok(cmd) = background_rx.recv_timeout(remaining.min(wait_cap)) {
-                        pending_cmd = Some(cmd);
-                    }
-                }
-            } else {
-                crossbeam_channel::select! {
-                    recv(background_rx) -> cmd => {
-                        if let Ok(c) = cmd {
-                            pending_cmd = Some(c);
+        match state {
+            PresenterState::Playing | PresenterState::PlayingUnpaced { .. } => {
+                if let Some(remaining) = wait_duration {
+                    if remaining > std::time::Duration::from_millis(1) {
+                        let wait_cap = std::time::Duration::from_millis(10);
+                        if let Ok(cmd) = background_rx.recv_timeout(remaining.min(wait_cap)) {
+                            pending_cmd = Some(cmd);
                         }
                     }
-                    recv(play_queue_rx) -> frame => {
-                        if let Ok(f) = frame {
-                            current_frame = Some(f);
+                } else {
+                    crossbeam_channel::select! {
+                        recv(background_rx) -> cmd => {
+                            if let Ok(c) = cmd {
+                                pending_cmd = Some(c);
+                            }
                         }
+                        recv(play_queue_rx) -> frame => {
+                            if let Ok(f) = frame {
+                                lookahead_queue.push_back(f);
+                            }
+                        }
+                        default(std::time::Duration::from_millis(2)) => {}
                     }
-                    default(std::time::Duration::from_millis(2)) => {}
                 }
             }
-        } else {
-            if seek_target_frame_idx.is_some() || play_after_seek {
+            PresenterState::Seeking { mut target_frame_idx, sequence_id, resume_playing_after } => {
                 crossbeam_channel::select! {
                     recv(background_rx) -> cmd => {
                         if let Ok(c) = cmd {
@@ -329,25 +367,27 @@ fn run_decoding_loop(
                     recv(play_queue_rx) -> frame => {
                         if let Ok(f) = frame {
                             let seq = f.sequence_id();
-                            if let Some(target_idx) = seek_target_frame_idx {
-                                if seq == latest_seq {
+                            if let Some(target_idx) = target_frame_idx {
+                                if seq == sequence_id {
                                     let f_idx = f.frame_idx();
                                     let _ = frame_tx.try_send(f);
                                     if f_idx >= target_idx {
-                                        seek_target_frame_idx = None;
+                                        target_frame_idx = None;
                                     }
                                 }
                             }
-                            if play_after_seek && seq == latest_seq {
-                                playing = true;
-                                play_after_seek = false;
+                            if resume_playing_after && seq == sequence_id {
+                                state = PresenterState::Playing;
                                 sync_engine.reset();
                                 let _ = decoder_cmd_tx.send(MediaCommand::Play);
+                            } else {
+                                state = PresenterState::Seeking { target_frame_idx, sequence_id, resume_playing_after };
                             }
                         }
                     }
                 }
-            } else {
+            }
+            PresenterState::Paused => {
                 if let Ok(cmd) = background_rx.recv() {
                     pending_cmd = Some(cmd);
                 }
@@ -530,7 +570,7 @@ fn run_decoder_thread(
                                                     MediaCommand::Play => {
                                                         video_pipeline.play();
                                                         f_opt = Some(f);
-                                                    }
+                                                     }
                                                     MediaCommand::PlayUnpaced { sequence_id } => {
                                                         audio_enabled = false;
                                                         master_clock.set_has_audio(false);
@@ -545,6 +585,9 @@ fn run_decoder_thread(
                                                     }
                                                 }
                                             }
+                                        }
+                                        default(std::time::Duration::from_millis(10)) => {
+                                            f_opt = Some(f);
                                         }
                                     }
                                 }
