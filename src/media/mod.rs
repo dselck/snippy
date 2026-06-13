@@ -10,6 +10,8 @@ use ringbuf::traits::*;
 pub mod types;
 pub mod cache;
 pub mod presenter_state;
+pub mod decoder_state;
+
 
 
 pub mod decoder_pipeline;
