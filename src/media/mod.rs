@@ -135,16 +135,6 @@ impl MediaEngine {
     }
 }
 
-fn get_nearest_keyframe(keyframes: &[usize], target: usize) -> usize {
-    if keyframes.is_empty() {
-        return target;
-    }
-    match keyframes.binary_search(&target) {
-        Ok(i) => keyframes[i],
-        Err(0) => keyframes[0],
-        Err(i) => keyframes[i - 1],
-    }
-}
 
 fn run_decoding_loop(
     path: &str,
@@ -366,7 +356,7 @@ fn run_decoder_thread(
         }
     };
 
-    let mut video_pipeline = {
+    let video_pipeline = {
         let adapter = Box::new(crate::media::ffmpeg_adapter::FfmpegDecoderAdapter::new(
             video_decoder,
             video_time_base_f64,
@@ -376,209 +366,146 @@ fn run_decoder_thread(
         crate::media::decoder_pipeline::VideoDecoderPipeline::new(adapter, keyframes.clone())
     };
 
-    let mut audio_pipeline_opt = audio_pipeline_opt;
+    let mut sm = crate::media::decoder_state::DecoderStateMachine::new(
+        video_pipeline,
+        audio_pipeline_opt,
+        master_clock,
+        keyframes,
+        keyframes_pts,
+        fps,
+        video_stream_idx,
+        audio_stream_idx_opt,
+        has_audio_stream,
+    );
 
-    let mut audio_enabled = true;
-    master_clock.set_has_audio(has_audio_stream && audio_enabled);
     let mut packets_iter = input.packets();
-    let mut is_decoding_active = video_pipeline.is_active();
     let mut pending_cmd: Option<MediaCommand> = None;
 
     loop {
+        // Step 1: Query incoming commands
         let cmd_opt = pending_cmd.take().or_else(|| {
-            if !is_decoding_active {
+            if !sm.is_decoding_active() {
                 decoder_cmd_rx.recv().ok()
             } else {
                 decoder_cmd_rx.try_recv().ok()
             }
         });
 
+        let mut events = Vec::new();
         if let Some(cmd) = cmd_opt {
-            match cmd {
-                MediaCommand::Shutdown => return Ok(()),
-                MediaCommand::Play => {
-                    if !audio_enabled {
-                        audio_enabled = true;
-                        master_clock.set_has_audio(has_audio_stream && audio_enabled);
-                        if let Some(audio_pipeline) = audio_pipeline_opt.as_mut() {
-                            let current_frame = video_pipeline.fallback_frame_idx;
-                            audio_pipeline.handle_seek(current_frame as f64 / fps);
-                            master_clock.inc_playback_generation();
-                        }
-                    }
-                    video_pipeline.play();
-                }
-                MediaCommand::PlayUnpaced { sequence_id } => {
-                    audio_enabled = false;
-                    master_clock.set_has_audio(false);
-                    video_pipeline.play_unpaced(sequence_id);
-                }
-                MediaCommand::Pause => {
-                    video_pipeline.pause();
-                }
-                MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae } => {
-                    audio_enabled = ae;
-                    master_clock.set_has_audio(has_audio_stream && audio_enabled);
-                    let handled = video_pipeline.seek(frame_index, keyframe_only, sequence_id, audio_enabled);
-
-                    if let Some(audio_pipeline) = audio_pipeline_opt.as_mut() {
-                        if audio_enabled {
-                            audio_pipeline.handle_seek(frame_index as f64 / fps);
-                            master_clock.inc_playback_generation();
-                        }
-                    }
-
-                    if handled {
-                        if let Some(frame) = video_pipeline.get_cached_frame(frame_index) {
-                            let _ = play_queue_tx.send(frame);
-                        }
-                    } else {
-                        drop(packets_iter);
-
-                        let target_kf = get_nearest_keyframe(&keyframes, frame_index);
-                        let kf_pts = keyframes.binary_search(&target_kf)
-                            .map(|idx| keyframes_pts[idx])
-                            .unwrap_or(0);
-
-                        unsafe {
-                            let _ = ffmpeg_next::ffi::avformat_seek_file(
-                                input.as_mut_ptr(),
-                                video_stream_idx as i32,
-                                i64::MIN,
-                                kf_pts,
-                                kf_pts,
-                                0,
-                            );
-                        }
-
-                        packets_iter = input.packets();
-                    }
-                }
+            if matches!(cmd, MediaCommand::Shutdown) {
+                return Ok(());
             }
-            is_decoding_active = video_pipeline.is_active();
-
-            continue;
+            events.push(crate::media::decoder_state::DecoderEvent::Command(cmd));
+        } else if sm.is_decoding_active() {
+            events.push(crate::media::decoder_state::DecoderEvent::QueueStatus {
+                video_queue_len: play_queue_tx.len(),
+                audio_vacant_len: audio_tx.vacant_len(),
+            });
         }
 
-        if is_decoding_active {
-            let audio_needs_frames = audio_enabled && (audio_tx.vacant_len() >= 2048);
-            let queue_needs_frames = (play_queue_tx.len() < 20) || audio_needs_frames;
-
-            if queue_needs_frames {
-                if let Some(packet_res) = packets_iter.next() {
-                    let (stream, packet) = packet_res;
-                    let stream_idx = stream.index();
-
-                    if stream_idx == video_stream_idx {
-                        if let Ok(frames) = video_pipeline.process_packet(&packet) {
-                            for frame in frames {
-                                let mut f_opt = Some(frame);
-                                while let Some(f) = f_opt.take() {
-                                    crossbeam_channel::select! {
-                                        send(play_queue_tx, f) -> res => {
-                                            if res.is_err() {
-                                                return Ok(());
-                                            }
-                                        }
-                                        recv(decoder_cmd_rx) -> cmd => {
-                                            if let Ok(c) = cmd {
-                                                match c {
-                                                    MediaCommand::Shutdown => return Ok(()),
-                                                    MediaCommand::Play => {
-                                                        video_pipeline.play();
-                                                        f_opt = Some(f);
-                                                     }
-                                                    MediaCommand::PlayUnpaced { sequence_id } => {
-                                                        audio_enabled = false;
-                                                        master_clock.set_has_audio(false);
-                                                        video_pipeline.play_unpaced(sequence_id);
-                                                        f_opt = Some(f);
+        // Step 2: Feed events to the state machine and process actions
+        for event in events {
+            let actions = sm.step(event);
+            for action in actions {
+                match action {
+                    crate::media::decoder_state::DecoderAction::DemuxNextPacket => {
+                        if let Some(packet_res) = packets_iter.next() {
+                            let (stream, packet) = packet_res;
+                            let stream_idx = stream.index();
+                            // Process packet event
+                            let sub_actions = sm.step(crate::media::decoder_state::DecoderEvent::PacketDemuxed {
+                                packet,
+                                stream_index: stream_idx,
+                            });
+                            for sub_action in sub_actions {
+                                match sub_action {
+                                    crate::media::decoder_state::DecoderAction::PushVideo(frame) => {
+                                        let mut f_opt = Some(frame);
+                                        while let Some(f) = f_opt.take() {
+                                            crossbeam_channel::select! {
+                                                send(play_queue_tx, f) -> res => {
+                                                    if res.is_err() {
+                                                        return Ok(());
                                                     }
-                                                    MediaCommand::Pause => {
-                                                        video_pipeline.pause();
-                                                    }
-                                                    MediaCommand::Seek { .. } => {
+                                                }
+                                                recv(decoder_cmd_rx) -> cmd => {
+                                                    if let Ok(c) = cmd {
+                                                        if matches!(c, MediaCommand::Shutdown) {
+                                                            return Ok(());
+                                                        }
+                                                        // Stash it
                                                         pending_cmd = Some(c);
                                                     }
                                                 }
+                                                default(std::time::Duration::from_millis(10)) => {
+                                                    f_opt = Some(f);
+                                                }
+                                            }
+                                            // Break if a seek/command was stashed to process it immediately
+                                            if pending_cmd.is_some() {
+                                                break;
                                             }
                                         }
-                                        default(std::time::Duration::from_millis(10)) => {
-                                            f_opt = Some(f);
-                                        }
                                     }
-                                }
-                            }
-                        }
-                    } else if Some(stream_idx) == audio_stream_idx_opt && audio_enabled {
-                        if let Some(audio_pipeline) = audio_pipeline_opt.as_mut() {
-                            if let Some(pts) = packet.pts() {
-                                audio_pipeline.update_current_time_from_pts(pts);
-                            }
-                            if audio_pipeline.send_packet(&packet).is_ok() {
-                                if let Ok(chunks) = audio_pipeline.receive_samples() {
-                                    let generation = master_clock.playback_generation();
-                                    for chunk in chunks {
-                                        if let Some(tag) = chunk.tag {
-                                            let _ = tags_tx.try_push((generation, tag.0, tag.1));
+                                    crate::media::decoder_state::DecoderAction::PushAudio { data, tag, generation } => {
+                                        if let Some(tag_val) = tag {
+                                            let _ = tags_tx.try_push((generation, tag_val.0, tag_val.1));
                                         }
                                         let mut chunk_pushed = false;
-                                        while !chunk_pushed {
-                                            if audio_tx.vacant_len() >= chunk.data.len() {
-                                                for &sample in &chunk.data {
+                                        while !chunk_pushed && pending_cmd.is_none() {
+                                            if audio_tx.vacant_len() >= data.len() {
+                                                for &sample in &data {
                                                     let _ = audio_tx.try_push((sample, generation));
                                                 }
                                                 chunk_pushed = true;
                                             } else {
-                                                // Queue is full. Poll command channel to prevent deadlock.
                                                 if let Ok(cmd) = decoder_cmd_rx.try_recv() {
-                                                    match cmd {
-                                                        MediaCommand::Shutdown => return Ok(()),
-                                                        MediaCommand::Play => {
-                                                            video_pipeline.play();
-                                                        }
-                                                        MediaCommand::PlayUnpaced { sequence_id } => {
-                                                            audio_enabled = false;
-                                                            master_clock.set_has_audio(false);
-                                                            video_pipeline.play_unpaced(sequence_id);
-                                                        }
-                                                        MediaCommand::Pause => {
-                                                            video_pipeline.pause();
-                                                        }
-                                                        MediaCommand::Seek { .. } => {
-                                                            pending_cmd = Some(cmd);
-                                                            break;
-                                                        }
+                                                    if matches!(cmd, MediaCommand::Shutdown) {
+                                                        return Ok(());
                                                     }
-                                                }
-                                                if pending_cmd.is_some() {
+                                                    pending_cmd = Some(cmd);
                                                     break;
                                                 }
                                                 std::thread::sleep(std::time::Duration::from_millis(10));
                                             }
                                         }
-                                        if pending_cmd.is_some() {
-                                            break;
-                                        }
                                     }
+                                    _ => {}
                                 }
                             }
+                        } else {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
                         }
                     }
-                } else {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-            } else {
-                crossbeam_channel::select! {
-                    recv(decoder_cmd_rx) -> cmd => {
-                        if let Ok(c) = cmd {
-                            pending_cmd = Some(c);
+                    crate::media::decoder_state::DecoderAction::SeekDemuxer { pts } => {
+                        drop(packets_iter);
+                        unsafe {
+                            let _ = ffmpeg_next::ffi::avformat_seek_file(
+                                input.as_mut_ptr(),
+                                video_stream_idx as i32,
+                                i64::MIN,
+                                pts,
+                                pts,
+                                0,
+                            );
                         }
+                        packets_iter = input.packets();
                     }
-                    default(std::time::Duration::from_millis(5)) => {}
+                    crate::media::decoder_state::DecoderAction::PushVideo(frame) => {
+                        let _ = play_queue_tx.send(frame);
+                    }
+                    crate::media::decoder_state::DecoderAction::PushAudio { .. } => {
+                        // Handled in sub_actions above
+                    }
+                    crate::media::decoder_state::DecoderAction::ScheduleWakeup(_) => {}
                 }
             }
         }
-        is_decoding_active = video_pipeline.is_active();
+
+        // Active, but maybe queues are full, so let's sleep a tiny bit to be friendly
+        if sm.is_decoding_active() && pending_cmd.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
     }
 }
