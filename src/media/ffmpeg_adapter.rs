@@ -38,30 +38,49 @@ impl DecoderAdapter for FfmpegDecoderAdapter {
         let mut frame = ffmpeg_next::util::frame::Video::empty();
         match self.video_decoder.receive_frame(&mut frame) {
             Ok(_) => {
+                let mut sw_frame = ffmpeg_next::util::frame::Video::empty();
+                let is_hw_frame = unsafe { !(*frame.as_ptr()).hw_frames_ctx.is_null() };
+                
+                let actual_frame = if is_hw_frame {
+                    let ret = unsafe {
+                        ffmpeg_next::sys::av_hwframe_transfer_data(
+                            sw_frame.as_mut_ptr(),
+                            frame.as_ptr(),
+                            0,
+                        )
+                    };
+                    if ret < 0 {
+                        return Err(DecodeError::Fault(format!("Failed to transfer hw frame: {}", ret)));
+                    }
+                    &sw_frame
+                } else {
+                    &frame
+                };
+
                 let mut scaled_frame = ffmpeg_next::util::frame::Video::empty();
-                let video_frame = if frame.format() != ffmpeg_next::format::Pixel::YUV420P {
+                let video_frame = if actual_frame.format() != ffmpeg_next::format::Pixel::YUV420P {
                     let s = match self.scaler {
-                        Some(ref mut s) if s.input().format == frame.format()
-                            && s.input().width == frame.width()
-                            && s.input().height == frame.height() => s,
+                        Some(ref mut s) if s.input().format == actual_frame.format()
+                            && s.input().width == actual_frame.width()
+                            && s.input().height == actual_frame.height() => s,
                         _ => {
                             let new_s = ffmpeg_next::software::scaling::context::Context::get(
-                                frame.format(),
-                                frame.width(),
-                                frame.height(),
+                                actual_frame.format(),
+                                actual_frame.width(),
+                                actual_frame.height(),
                                 ffmpeg_next::format::Pixel::YUV420P,
-                                frame.width(),
-                                frame.height(),
+                                actual_frame.width(),
+                                actual_frame.height(),
                                 ffmpeg_next::software::scaling::flag::Flags::BILINEAR,
                             ).map_err(|e| DecodeError::Fault(e.to_string()))?;
                             self.scaler = Some(new_s);
                             self.scaler.as_mut().unwrap()
                         }
                     };
-                    s.run(&frame, &mut scaled_frame).map_err(|e| DecodeError::Fault(e.to_string()))?;
+                    s.run(&actual_frame, &mut scaled_frame).map_err(|e| DecodeError::Fault(e.to_string()))?;
                     &scaled_frame
                 } else {
-                    &frame
+                    actual_frame
                 };
 
                 let planes = std::sync::Arc::new(YuvPlanes {
