@@ -68,7 +68,7 @@ fn simulate_arrow_hold_gui(
 
     let tick_interval = Duration::from_secs_f64(1.0 / vsync_hz);
     let mut next_tick = Instant::now() + tick_interval;
-    let mut frames_displayed = 0;
+    let mut frames_received = 0;
 
     let total_start = Instant::now();
     let duration_limit = Duration::from_secs(5);
@@ -82,7 +82,7 @@ fn simulate_arrow_hold_gui(
         let _ = rig.send(MediaCommand::PlayUnpaced { sequence_id: *seq });
     }
 
-    while frames_displayed < count && total_start.elapsed() < duration_limit {
+    while frames_received < count && total_start.elapsed() < duration_limit {
         let now = Instant::now();
 
         if now >= next_tick {
@@ -96,12 +96,13 @@ fn simulate_arrow_hold_gui(
                     continue;
                 }
                 latest_frame_received = Some(frame);
+                frames_received += 1;
             }
 
             if let Some(frame) = latest_frame_received {
                 let frame_seq = frame.sequence_id();
                 if unpaced_started {
-                    let frame_age = total_start.elapsed() / (frames_displayed + 1) as u32;
+                    let frame_age = total_start.elapsed() / frames_received.max(1) as u32;
                     stats.push(frame_age);
                 } else {
                     if let Some(send_time) = send_times.remove(&frame_seq) {
@@ -120,12 +121,11 @@ fn simulate_arrow_hold_gui(
                     std::hint::black_box((dummy_y, dummy_u, dummy_v));
                 }
 
-                frames_displayed += 1;
                 current = frame.frame_idx();
             }
 
             // 2. UI sends next seek unconditionally on every tick ONLY for backward seeking
-            if !unpaced_started && frames_displayed < count {
+            if !unpaced_started && frames_received < count {
                 current = current.saturating_sub(1);
                 *seq += 1;
                 send_times.insert(*seq, Instant::now());
@@ -146,7 +146,7 @@ fn simulate_arrow_hold_gui(
     }
 
     let total_elapsed = total_start.elapsed().as_secs_f64();
-    let actual_fps = frames_displayed as f64 / total_elapsed;
+    let actual_fps = frames_received as f64 / total_elapsed;
 
     (stats, actual_fps)
 }
