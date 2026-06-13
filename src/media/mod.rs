@@ -9,10 +9,9 @@ use ringbuf::traits::*;
 
 pub mod types;
 pub mod cache;
-pub mod presenter_state;
-pub mod decoder_state;
-
-
+pub mod sinks;
+pub use crate::media::sinks::*;
+pub mod mac_hw_surface;
 
 pub mod decoder_pipeline;
 pub mod ffmpeg_adapter;
@@ -20,7 +19,8 @@ pub mod audio_pipeline;
 pub mod sync;
 
 pub use crate::media::types::*;
-pub use crate::media::cache::*;pub mod session;
+pub use crate::media::cache::*;
+pub mod session;
 pub use crate::media::session::*;
 
 pub use crate::media::decoder_pipeline::*;
@@ -135,6 +135,28 @@ impl MediaEngine {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PresenterState {
+    Paused,
+    Playing,
+    PlayingUnpaced { sequence_id: usize },
+    Seeking {
+        target_frame_idx: Option<usize>,
+        sequence_id: usize,
+        resume_playing_after: bool,
+    },
+}
+
+fn get_nearest_keyframe(keyframes: &[usize], target: usize) -> usize {
+    if keyframes.is_empty() {
+        return target;
+    }
+    match keyframes.binary_search(&target) {
+        Ok(i) => keyframes[i],
+        Err(0) => keyframes[0],
+        Err(i) => keyframes[i - 1],
+    }
+}
 
 fn run_decoding_loop(
     path: &str,
@@ -175,170 +197,209 @@ fn run_decoding_loop(
         );
     });
 
-    let sync_engine = crate::media::sync::VideoSyncEngine::new(Box::new(master_clock.clone()));
-    let mut sm = crate::media::presenter_state::PresenterStateMachine::new(sync_engine);
+    let mut sync_engine = crate::media::sync::VideoSyncEngine::new(Box::new(master_clock.clone()));
+    let mut state = PresenterState::Paused;
+    let mut current_frame: Option<DecodedFrame> = None;
+    let mut lookahead_queue = std::collections::VecDeque::new();
+    let mut last_wait_frame: Option<(usize, usize)> = None;
 
-    // Track the active wakeup duration
     let mut active_wakeup: Option<std::time::Duration> = None;
 
     loop {
-        // Step 1: Wait for events from background command channel or play queue (with computed timeout if active_wakeup is some)
-        let event = if let Some(timeout) = active_wakeup {
-            // Wait with a small millisecond floor to avoid immediate spinning
+        // Step 1: Handle input events
+        let mut events = Vec::new();
+
+        if let Some(timeout) = active_wakeup {
             let wait_timeout = timeout.min(std::time::Duration::from_millis(10));
             if wait_timeout > std::time::Duration::from_millis(1) {
                 crossbeam_channel::select! {
                     recv(background_rx) -> cmd => {
-                        if let Ok(c) = cmd {
-                            Some(crate::media::presenter_state::PresenterEvent::Command(c))
-                        } else {
-                            None
-                        }
+                        if let Ok(c) = cmd { events.push(c); } else { return Ok(()); }
                     }
                     recv(play_queue_rx) -> frame => {
-                        if let Ok(f) = frame {
-                            Some(crate::media::presenter_state::PresenterEvent::FrameDecoded(f))
-                        } else {
-                            None
-                        }
+                        if let Ok(f) = frame { events.push(MediaCommand::PlayUnpaced { sequence_id: 999999 }); /* hack to pass frame */
+                            match &mut state {
+                                PresenterState::Playing | PresenterState::PlayingUnpaced { .. } => {
+                                    lookahead_queue.push_back(f);
+                                }
+                                PresenterState::Seeking { target_frame_idx, sequence_id, resume_playing_after } => {
+                                    if f.sequence_id() == *sequence_id {
+                                        if let Some(target_idx) = *target_frame_idx {
+                                            let f_idx = f.frame_idx();
+                                            let _ = frame_tx.try_send(f.clone());
+                                            if f_idx >= target_idx {
+                                                *target_frame_idx = None;
+                                            }
+                                        }
+                                        if *resume_playing_after {
+                                            state = PresenterState::Playing;
+                                            sync_engine.reset();
+                                            let _ = decoder_cmd_tx.send(MediaCommand::Play);
+                                        }
+                                    }
+                                }
+                                PresenterState::Paused => {}
+                            }
+                        } else { return Ok(()); }
                     }
-                    default(wait_timeout) => {
-                        Some(crate::media::presenter_state::PresenterEvent::Wakeup)
-                    }
+                    default(wait_timeout) => {}
                 }
-            } else {
-                Some(crate::media::presenter_state::PresenterEvent::Wakeup)
             }
         } else {
-            // Blocking wait or non-spinning select
-            match sm.state() {
-                crate::media::presenter_state::PresenterState::Paused => {
-                    // Paused: only care about commands
+            match state {
+                PresenterState::Paused => {
                     if let Ok(cmd) = background_rx.recv() {
-                        Some(crate::media::presenter_state::PresenterEvent::Command(cmd))
-                    } else {
-                        None
-                    }
+                        events.push(cmd);
+                    } else { return Ok(()); }
                 }
-                crate::media::presenter_state::PresenterState::Seeking { .. } => {
-                    // Seeking: wait on command OR play queue
+                PresenterState::Seeking { .. } => {
                     crossbeam_channel::select! {
                         recv(background_rx) -> cmd => {
-                            if let Ok(c) = cmd {
-                                Some(crate::media::presenter_state::PresenterEvent::Command(c))
-                            } else {
-                                None
-                            }
+                            if let Ok(c) = cmd { events.push(c); } else { return Ok(()); }
                         }
-                        recv(play_queue_rx) -> frame => {
-                            if let Ok(f) = frame {
-                                Some(crate::media::presenter_state::PresenterEvent::FrameDecoded(f))
-                            } else {
-                                None
-                            }
+                        recv(play_queue_rx) -> f_res => {
+                            if let Ok(f) = f_res {
+                                match &mut state {
+                                    PresenterState::Seeking { target_frame_idx, sequence_id, resume_playing_after } => {
+                                        if f.sequence_id() == *sequence_id {
+                                            if let Some(target_idx) = *target_frame_idx {
+                                                let f_idx = f.frame_idx();
+                                                let _ = frame_tx.try_send(f.clone());
+                                                if f_idx >= target_idx {
+                                                    *target_frame_idx = None;
+                                                }
+                                            }
+                                            if *resume_playing_after {
+                                                state = PresenterState::Playing;
+                                                sync_engine.reset();
+                                                let _ = decoder_cmd_tx.send(MediaCommand::Play);
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            } else { return Ok(()); }
                         }
                     }
                 }
                 _ => {
-                    // Playing (no wakeup scheduled): check channels
                     crossbeam_channel::select! {
                         recv(background_rx) -> cmd => {
-                            if let Ok(c) = cmd {
-                                Some(crate::media::presenter_state::PresenterEvent::Command(c))
-                            } else {
-                                None
-                            }
+                            if let Ok(c) = cmd { events.push(c); } else { return Ok(()); }
                         }
-                        recv(play_queue_rx) -> frame => {
-                            if let Ok(f) = frame {
-                                Some(crate::media::presenter_state::PresenterEvent::FrameDecoded(f))
-                            } else {
-                                None
-                            }
+                        recv(play_queue_rx) -> f_res => {
+                            if let Ok(f) = f_res {
+                                lookahead_queue.push_back(f);
+                            } else { return Ok(()); }
                         }
-                        // Add a small default timeout if we are playing to keep checking/pacing
-                        default(std::time::Duration::from_millis(2)) => {
-                            Some(crate::media::presenter_state::PresenterEvent::Wakeup)
-                        }
+                        default(std::time::Duration::from_millis(2)) => {}
                     }
-                }
-            }
-        };
-
-        // If channel is disconnected/shutdown event resulted in None, we can exit or process it
-        let event = match event {
-            Some(ev) => ev,
-            None => break,
-        };
-
-        // Reset the active wakeup before stepping the state machine
-        active_wakeup = None;
-
-        // Step the state machine
-        let actions = sm.step(event);
-
-        // Process output actions
-        for action in actions {
-            match action {
-                crate::media::presenter_state::PresenterAction::ClearLookaheadQueue => {
-                    while play_queue_rx.try_recv().is_ok() {}
-                }
-                crate::media::presenter_state::PresenterAction::SendDecoderCommand(cmd) => {
-                    let is_shutdown = matches!(cmd, MediaCommand::Shutdown);
-                    let _ = decoder_cmd_tx.send(cmd);
-                    if is_shutdown {
-                        return Ok(());
-                    }
-                }
-                crate::media::presenter_state::PresenterAction::DispatchFrame(frame) => {
-                    let _ = frame_tx.try_send(frame);
-                }
-                crate::media::presenter_state::PresenterAction::ScheduleWakeup(duration) => {
-                    active_wakeup = Some(duration);
                 }
             }
         }
-    }
 
-    Ok(())
-}
+        active_wakeup = None;
 
-struct ChannelFrameSink {
-    tx: crossbeam_channel::Sender<DecodedFrame>,
-}
-impl crate::media::decoder_state::FrameSink for ChannelFrameSink {
-    fn try_push(&mut self, frame: DecodedFrame) -> Result<(), DecodedFrame> {
-        self.tx.try_send(frame).map_err(|e| match e {
-            crossbeam_channel::TrySendError::Full(f) => f,
-            crossbeam_channel::TrySendError::Disconnected(f) => f,
-        })
-    }
-    fn len(&self) -> usize {
-        self.tx.len()
-    }
-}
+        for cmd in events {
+            match cmd {
+                MediaCommand::Shutdown => {
+                    let _ = decoder_cmd_tx.send(MediaCommand::Shutdown);
+                    return Ok(());
+                }
+                MediaCommand::Play => {
+                    state = PresenterState::Playing;
+                    lookahead_queue.clear();
+                    current_frame = None;
+                    sync_engine.reset();
+                    while play_queue_rx.try_recv().is_ok() {}
+                    let _ = decoder_cmd_tx.send(MediaCommand::Play);
+                }
+                MediaCommand::PlayUnpaced { sequence_id } => {
+                    if sequence_id == 999999 { continue; } // hack skip
+                    state = PresenterState::PlayingUnpaced { sequence_id };
+                    lookahead_queue.clear();
+                    current_frame = None;
+                    while play_queue_rx.try_recv().is_ok() {}
+                    let _ = decoder_cmd_tx.send(MediaCommand::PlayUnpaced { sequence_id });
+                }
+                MediaCommand::Pause => {
+                    state = PresenterState::Paused;
+                    lookahead_queue.clear();
+                    current_frame = None;
+                    while play_queue_rx.try_recv().is_ok() {}
+                    let _ = decoder_cmd_tx.send(MediaCommand::Pause);
+                }
+                MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled } => {
+                    let resume_playing_after = match state {
+                        PresenterState::Playing | PresenterState::PlayingUnpaced { .. } => true,
+                        PresenterState::Seeking { resume_playing_after: r, .. } => r,
+                        PresenterState::Paused => false,
+                    };
+                    state = PresenterState::Seeking {
+                        target_frame_idx: Some(frame_index),
+                        sequence_id,
+                        resume_playing_after,
+                    };
+                    current_frame = None;
+                    lookahead_queue.clear();
+                    while play_queue_rx.try_recv().is_ok() {}
+                    let _ = decoder_cmd_tx.send(MediaCommand::Seek {
+                        frame_index,
+                        keyframe_only,
+                        sequence_id,
+                        audio_enabled,
+                    });
+                }
+            }
+        }
 
-struct RingbufAudioSink {
-    audio_tx: ringbuf::wrap::CachingProd<std::sync::Arc<ringbuf::SharedRb<ringbuf::storage::Heap<(f32, u64)>>>>,
-    tags_tx: ringbuf::wrap::CachingProd<std::sync::Arc<ringbuf::SharedRb<ringbuf::storage::Heap<(u64, u64, u64)>>>>,
-}
-impl crate::media::decoder_state::AudioSink for RingbufAudioSink {
-    fn try_push_slice(&mut self, data: &[f32], generation: u64) -> usize {
-        let mut pushed = 0;
-        for &sample in data {
-            if self.audio_tx.try_push((sample, generation)).is_ok() {
-                pushed += 1;
+        // Evaluate frames presentation loop
+        loop {
+            if current_frame.is_none() {
+                if matches!(state, PresenterState::Playing | PresenterState::PlayingUnpaced { .. }) {
+                    current_frame = lookahead_queue.pop_front();
+                }
+            }
+
+            if let Some(frame) = &current_frame {
+                match state {
+                    PresenterState::Playing => {
+                        let pts_sec = frame.pts_sec();
+                        match sync_engine.evaluate_frame(pts_sec) {
+                            Ok(crate::media::sync::SyncAction::Present) => {
+                                last_wait_frame = None;
+                                let f = current_frame.take().unwrap();
+                                let _ = frame_tx.try_send(f);
+                            }
+                            Ok(crate::media::sync::SyncAction::Wait(remaining)) => {
+                                let f_idx = frame.frame_idx();
+                                let count = match last_wait_frame {
+                                    Some((idx, c)) if idx == f_idx => c + 1,
+                                    _ => 1,
+                                };
+                                last_wait_frame = Some((f_idx, count));
+                                active_wakeup = Some(remaining);
+                                break;
+                            }
+                            Err(_) => {
+                                last_wait_frame = None;
+                                let f = current_frame.take().unwrap();
+                                let _ = frame_tx.try_send(f);
+                            }
+                        }
+                    }
+                    PresenterState::PlayingUnpaced { .. } => {
+                        let f = current_frame.take().unwrap();
+                        let _ = frame_tx.try_send(f);
+                    }
+                    _ => {
+                        break;
+                    }
+                }
             } else {
                 break;
             }
         }
-        pushed
-    }
-    fn vacant_len(&self) -> usize {
-        self.audio_tx.vacant_len()
-    }
-    fn push_tag(&mut self, generation: u64, idx: u64, pts_us: u64) {
-        let _ = self.tags_tx.try_push((generation, idx, pts_us));
     }
 }
 
@@ -357,7 +418,7 @@ fn run_decoder_thread(
 ) -> Result<(), anyhow::Error> {
     let mut input = ffmpeg_next::format::input(&path)?;
 
-    let (video_stream_idx, video_time_base_f64, video_start_time, video_decoder) = {
+    let (video_stream_index, video_time_base_f64, video_start_time, video_decoder) = {
         let video_stream = input
             .streams()
             .best(ffmpeg_next::media::Type::Video)
@@ -372,10 +433,8 @@ fn run_decoder_thread(
         };
         let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(video_stream.parameters())?;
 
-        // Determine hardware acceleration pathways and attempt to create a HW device context
         unsafe {
             let mut hw_device_ctx: *mut ffmpeg_next::sys::AVBufferRef = std::ptr::null_mut();
-            
             #[cfg(target_os = "macos")]
             let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
             #[cfg(target_os = "windows")]
@@ -383,28 +442,16 @@ fn run_decoder_thread(
             #[cfg(target_os = "linux")]
             let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI;
 
-            let res = ffmpeg_next::sys::av_hwdevice_ctx_create(
-                &mut hw_device_ctx,
-                hw_type,
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                0,
-            );
-
+            let res = ffmpeg_next::sys::av_hwdevice_ctx_create(&mut hw_device_ctx, hw_type, std::ptr::null(), std::ptr::null_mut(), 0);
             if res == 0 && !hw_device_ctx.is_null() {
-                println!("Successfully initialized hardware acceleration context: {:?}", hw_type);
                 (*codec_ctx.as_mut_ptr()).hw_device_ctx = ffmpeg_next::sys::av_buffer_ref(hw_device_ctx);
                 ffmpeg_next::sys::av_buffer_unref(&mut hw_device_ctx);
-            } else {
-                println!("Failed to initialize hardware acceleration context, falling back to CPU decoding");
             }
         }
-
-        let decoder = codec_ctx.decoder().video()?;
-        (idx, time_base_f64, start_time, decoder)
+        (idx, time_base_f64, start_time, codec_ctx.decoder().video()?)
     };
 
-    let (audio_stream_idx_opt, has_audio_stream, audio_pipeline_opt) = {
+    let (audio_stream_index_opt, has_audio_stream, mut audio_pipeline_opt) = {
         if let Some(stream) = input.streams().best(ffmpeg_next::media::Type::Audio) {
             let idx = stream.index();
             let audio_codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())?;
@@ -424,7 +471,7 @@ fn run_decoder_thread(
         }
     };
 
-    let video_pipeline = {
+    let mut video_pipeline = {
         let adapter = Box::new(crate::media::ffmpeg_adapter::FfmpegDecoderAdapter::new(
             video_decoder,
             video_time_base_f64,
@@ -434,115 +481,130 @@ fn run_decoder_thread(
         crate::media::decoder_pipeline::VideoDecoderPipeline::new(adapter, keyframes.clone())
     };
 
-    let video_sink = Box::new(ChannelFrameSink {
-        tx: play_queue_tx.clone(),
-    });
-
-    let audio_sink: Option<Box<dyn crate::media::decoder_state::AudioSink>> = if has_audio_stream {
-        Some(Box::new(RingbufAudioSink {
-            audio_tx,
-            tags_tx,
-        }))
+    let mut video_sink = crate::media::sinks::CrossbeamFrameSink::new(play_queue_tx, 20);
+    let mut audio_sink_opt = if has_audio_stream {
+        Some(crate::media::sinks::CrossbeamAudioSink::new(audio_tx, tags_tx, master_clock.clone(), 2048))
     } else {
         None
     };
-
-    let mut sm = crate::media::decoder_state::DecoderStateMachine::new(
-        video_pipeline,
-        audio_pipeline_opt,
-        master_clock,
-        video_sink,
-        audio_sink,
-        keyframes,
-        keyframes_pts,
-        fps,
-        video_stream_idx,
-        audio_stream_idx_opt,
-        has_audio_stream,
-    );
+    let mut audio_enabled = true;
 
     let mut packets_iter = input.packets();
     let mut pending_cmd: Option<MediaCommand> = None;
+    let mut seek_demuxer_pts: Option<i64> = None;
 
     loop {
-        // Query incoming commands
+        video_sink.flush();
+        if let Some(sink) = audio_sink_opt.as_mut() {
+            sink.flush();
+        }
+
+        let is_decoding_active = video_pipeline.is_active();
+
         let cmd_opt = pending_cmd.take().or_else(|| {
-            if !sm.is_decoding_active() {
+            if !is_decoding_active {
                 decoder_cmd_rx.recv().ok()
             } else {
                 decoder_cmd_rx.try_recv().ok()
             }
         });
 
-        let mut events = Vec::new();
         if let Some(cmd) = cmd_opt {
-            if matches!(cmd, MediaCommand::Shutdown) {
-                return Ok(());
-            }
-            events.push(crate::media::decoder_state::DecoderEvent::Command(cmd));
-        } else if sm.is_decoding_active() {
-            events.push(crate::media::decoder_state::DecoderEvent::Wakeup);
-        }
+            match cmd {
+                MediaCommand::Shutdown => {
+                    return Ok(());
+                }
+                MediaCommand::Play => {
+                    if !audio_enabled {
+                        audio_enabled = true;
+                        master_clock.set_has_audio(has_audio_stream && audio_enabled);
+                        if let Some(audio_pipeline) = audio_pipeline_opt.as_mut() {
+                            let current_frame = video_pipeline.fallback_frame_idx;
+                            audio_pipeline.handle_seek(current_frame as f64 / fps);
+                            master_clock.inc_playback_generation();
+                        }
+                    }
+                    video_pipeline.play();
+                }
+                MediaCommand::PlayUnpaced { sequence_id } => {
+                    audio_enabled = false;
+                    master_clock.set_has_audio(false);
+                    video_pipeline.play_unpaced(sequence_id);
+                }
+                MediaCommand::Pause => {
+                    video_pipeline.pause();
+                }
+                MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled: ae } => {
+                    audio_enabled = ae;
+                    master_clock.set_has_audio(has_audio_stream && audio_enabled);
+                    
+                    video_sink.clear();
+                    if let Some(sink) = audio_sink_opt.as_mut() {
+                        sink.clear();
+                    }
 
-        let mut did_work = false;
-        for event in events {
-            let actions = sm.step(event);
-            for action in actions {
-                match action {
-                    crate::media::decoder_state::DecoderAction::DemuxNextPacket => {
-                        did_work = true;
-                        if let Some(packet_res) = packets_iter.next() {
-                            let (stream, packet) = packet_res;
-                            let sub_actions = sm.step(crate::media::decoder_state::DecoderEvent::PacketDemuxed {
-                                packet,
-                                stream_index: stream.index(),
-                            });
-                            for sub in sub_actions {
-                                if let crate::media::decoder_state::DecoderAction::SeekDemuxer { pts } = sub {
-                                    drop(packets_iter);
-                                    unsafe {
-                                        let _ = ffmpeg_next::ffi::avformat_seek_file(
-                                            input.as_mut_ptr(),
-                                            video_stream_idx as i32,
-                                            i64::MIN,
-                                            pts,
-                                            pts,
-                                            0,
-                                        );
-                                    }
-                                    packets_iter = input.packets();
-                                }
-                            }
-                        } else {
-                            std::thread::sleep(std::time::Duration::from_millis(10));
+                    let handled = video_pipeline.seek(frame_index, keyframe_only, sequence_id, audio_enabled);
+
+                    if let Some(audio_pipeline) = audio_pipeline_opt.as_mut() {
+                        if audio_enabled {
+                            audio_pipeline.handle_seek(frame_index as f64 / fps);
+                            master_clock.inc_playback_generation();
                         }
                     }
-                    crate::media::decoder_state::DecoderAction::SeekDemuxer { pts } => {
-                        did_work = true;
-                        drop(packets_iter);
-                        unsafe {
-                            let _ = ffmpeg_next::ffi::avformat_seek_file(
-                                input.as_mut_ptr(),
-                                video_stream_idx as i32,
-                                i64::MIN,
-                                pts,
-                                pts,
-                                0,
-                            );
+
+                    if handled {
+                        if let Some(frame) = video_pipeline.get_cached_frame(frame_index) {
+                            video_sink.push(std::iter::once(frame));
                         }
-                        packets_iter = input.packets();
-                    }
-                    crate::media::decoder_state::DecoderAction::ScheduleWakeup(duration) => {
-                        did_work = true;
-                        std::thread::sleep(duration);
+                    } else {
+                        let target_kf = get_nearest_keyframe(&keyframes, frame_index);
+                        let kf_pts = keyframes.binary_search(&target_kf)
+                            .map(|idx| keyframes_pts[idx])
+                            .unwrap_or(0);
+                        seek_demuxer_pts = Some(kf_pts);
                     }
                 }
             }
         }
 
-        // Active, but maybe queues are full, so let's sleep a tiny bit to be friendly
-        if sm.is_decoding_active() && pending_cmd.is_none() && !did_work {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        if let Some(pts) = seek_demuxer_pts.take() {
+            let _ = input.seek(pts, 0..pts);
+            packets_iter = input.packets();
+        }
+
+        if video_pipeline.is_active() {
+            let audio_needs_frames = if let (true, Some(sink)) = (audio_enabled, audio_sink_opt.as_ref()) {
+                sink.needs_audio()
+            } else {
+                false
+            };
+            
+            let queue_needs_frames = video_sink.needs_frames() || audio_needs_frames;
+            
+            if queue_needs_frames {
+                if let Some(packet_res) = packets_iter.next() {
+                    let (stream, packet) = packet_res;
+                    let stream_index = stream.index();
+                    if stream_index == video_stream_index {
+                        if let Ok(frames) = video_pipeline.process_packet(&packet) {
+                            video_sink.push(frames);
+                        }
+                    } else if Some(stream_index) == audio_stream_index_opt && audio_enabled {
+                        if let Some(audio_pipeline) = audio_pipeline_opt.as_mut() {
+                            if let Some(pts) = packet.pts() {
+                                audio_pipeline.update_current_time_from_pts(pts);
+                            }
+                            if audio_pipeline.send_packet(&packet).is_ok() {
+                                if let Ok(chunks) = audio_pipeline.receive_samples() {
+                                    if let Some(sink) = audio_sink_opt.as_mut() {
+                                        sink.push(chunks);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
