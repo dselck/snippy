@@ -3,7 +3,7 @@ use std::thread;
 
 #[derive(Debug, Clone)]
 pub enum ThumbnailCommand {
-    Request { frames: Vec<usize> },
+    Request { frames: Vec<usize>, height: u32 },
     Clear,
 }
 
@@ -69,21 +69,8 @@ pub fn spawn_thumbnail_decoder(
             16.0 / 9.0
         };
 
-        let thumb_height = 72;
-        let thumb_width = (thumb_height as f32 * aspect_ratio).round() as u32;
-
-        let mut scaler = match ffmpeg_next::software::scaling::context::Context::get(
-            decoder.format(),
-            decoder.width(),
-            decoder.height(),
-            ffmpeg_next::format::Pixel::RGBA,
-            thumb_width,
-            thumb_height,
-            ffmpeg_next::software::scaling::flag::Flags::BILINEAR,
-        ) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
+        let mut current_height: Option<u32> = None;
+        let mut scaler: Option<ffmpeg_next::software::scaling::context::Context> = None;
 
         while let Ok(cmd) = cmd_rx.recv() {
             match cmd {
@@ -91,7 +78,31 @@ pub fn spawn_thumbnail_decoder(
                     // Drain pending commands
                     while cmd_rx.try_recv().is_ok() {}
                 }
-                ThumbnailCommand::Request { frames } => {
+                ThumbnailCommand::Request { frames, height } => {
+                    // Recreate scaler if requested height changes
+                    if current_height != Some(height) {
+                        let thumb_width = (height as f32 * aspect_ratio).round() as u32;
+                        if let Ok(s) = ffmpeg_next::software::scaling::context::Context::get(
+                            decoder.format(),
+                            decoder.width(),
+                            decoder.height(),
+                            ffmpeg_next::format::Pixel::RGBA,
+                            thumb_width,
+                            height,
+                            ffmpeg_next::software::scaling::flag::Flags::BILINEAR,
+                        ) {
+                            scaler = Some(s);
+                            current_height = Some(height);
+                        }
+                    }
+
+                    let current_scaler = match scaler.as_mut() {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let active_height = current_height.unwrap_or(72);
+                    let active_width = (active_height as f32 * aspect_ratio).round() as u32;
+
                     for target_frame in frames {
                         // Check if a Clear command has arrived
                         let mut aborted = false;
@@ -155,11 +166,11 @@ pub fn spawn_thumbnail_decoder(
 
                                             if frame_idx >= target_frame {
                                                 let mut scaled_frame = ffmpeg_next::util::frame::Video::empty();
-                                                if scaler.run(&frame, &mut scaled_frame).is_ok() {
+                                                if current_scaler.run(&frame, &mut scaled_frame).is_ok() {
                                                     let _ = resp_tx.send(ThumbnailResponse {
                                                         frame_idx,
-                                                        width: thumb_width,
-                                                        height: thumb_height,
+                                                        width: active_width,
+                                                        height: active_height,
                                                         rgba_data: scaled_frame.data(0).to_vec(),
                                                     });
                                                     frame_found = true;
@@ -200,7 +211,7 @@ mod tests {
         let (cmd_tx, resp_rx, handle) = spawn_thumbnail_decoder(test_file, keyframes, keyframes_pts, 60.0);
         
         // Request frames 0 and 60
-        cmd_tx.send(ThumbnailCommand::Request { frames: vec![0, 60] }).unwrap();
+        cmd_tx.send(ThumbnailCommand::Request { frames: vec![0, 60], height: 72 }).unwrap();
         
         // We expect to receive two thumbnail responses within 5 seconds
         let resp1 = resp_rx.recv_timeout(Duration::from_secs(5)).unwrap();

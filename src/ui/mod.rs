@@ -889,7 +889,11 @@ impl eframe::App for MainApp {
                     // Send request batch if present
                     if !requested_frames.is_empty() {
                         if let Some(tx) = self.playback.thumbnail_tx.as_ref() {
-                            let _ = tx.send(crate::media::ThumbnailCommand::Request { frames: requested_frames });
+                            let clamped_height = (inner_height.round() as u32).clamp(30, 256);
+                            let _ = tx.send(crate::media::ThumbnailCommand::Request { 
+                                frames: requested_frames, 
+                                height: clamped_height 
+                            });
                         }
                     }
 
