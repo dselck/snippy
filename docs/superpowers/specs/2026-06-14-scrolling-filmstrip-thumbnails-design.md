@@ -35,11 +35,8 @@ We define the message types for communicating with the background thumbnail deco
 
 ```rust
 pub enum ThumbnailCommand {
-    /// Open a new video file context.
-    Open { path: String },
-    
-    /// Request a set of frame indices to decode.
-    Request { frames: Vec<usize> },
+    /// Request a set of frame indices to decode with a target height.
+    Request { frames: Vec<usize>, height: u32 },
     
     /// Clear the pending request queue and abort any in-flight decoding.
     Clear,

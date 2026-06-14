@@ -54,10 +54,27 @@ pub fn spawn_thumbnail_decoder(
             0.0
         };
 
-        let codec_ctx = match ffmpeg_next::codec::context::Context::from_parameters(stream.parameters()) {
+        let mut codec_ctx = match ffmpeg_next::codec::context::Context::from_parameters(stream.parameters()) {
             Ok(ctx) => ctx,
             Err(_) => return,
         };
+
+        unsafe {
+            let mut hw_device_ctx: *mut ffmpeg_next::sys::AVBufferRef = std::ptr::null_mut();
+            #[cfg(target_os = "macos")]
+            let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
+            #[cfg(target_os = "windows")]
+            let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
+            #[cfg(target_os = "linux")]
+            let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI;
+
+            let res = ffmpeg_next::sys::av_hwdevice_ctx_create(&mut hw_device_ctx, hw_type, std::ptr::null(), std::ptr::null_mut(), 0);
+            if res == 0 && !hw_device_ctx.is_null() {
+                (*codec_ctx.as_mut_ptr()).hw_device_ctx = ffmpeg_next::sys::av_buffer_ref(hw_device_ctx);
+                ffmpeg_next::sys::av_buffer_unref(&mut hw_device_ctx);
+            }
+        }
+
         let mut decoder = match codec_ctx.decoder().video() {
             Ok(dec) => dec,
             Err(_) => return,
@@ -69,58 +86,32 @@ pub fn spawn_thumbnail_decoder(
             16.0 / 9.0
         };
 
-        let mut current_height: Option<u32> = None;
         let mut scaler: Option<ffmpeg_next::software::scaling::context::Context> = None;
 
-        while let Ok(cmd) = cmd_rx.recv() {
+        let mut current_cmd = None;
+        loop {
+            let cmd = if let Some(c) = current_cmd.take() {
+                c
+            } else {
+                match cmd_rx.recv() {
+                    Ok(c) => c,
+                    Err(_) => break, // Channel closed
+                }
+            };
+
             match cmd {
                 ThumbnailCommand::Clear => {
                     // Drain pending commands
-                    while cmd_rx.try_recv().is_ok() {}
+                    while let Ok(_) = cmd_rx.try_recv() {}
                 }
                 ThumbnailCommand::Request { frames, height } => {
-                    // Recreate scaler if requested height changes
-                    if current_height != Some(height) {
-                        let thumb_width = (height as f32 * aspect_ratio).round() as u32;
-                        if let Ok(s) = ffmpeg_next::software::scaling::context::Context::get(
-                            decoder.format(),
-                            decoder.width(),
-                            decoder.height(),
-                            ffmpeg_next::format::Pixel::RGBA,
-                            thumb_width,
-                            height,
-                            ffmpeg_next::software::scaling::flag::Flags::BILINEAR,
-                        ) {
-                            scaler = Some(s);
-                            current_height = Some(height);
-                        }
-                    }
-
-                    let current_scaler = match scaler.as_mut() {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                    let active_height = current_height.unwrap_or(72);
-                    let active_width = (active_height as f32 * aspect_ratio).round() as u32;
-
                     for target_frame in frames {
-                        // Check if a Clear command has arrived
-                        let mut aborted = false;
-                        loop {
-                            match cmd_rx.try_recv() {
-                                Ok(ThumbnailCommand::Clear) => {
-                                    aborted = true;
-                                    break;
-                                }
-                                Ok(ThumbnailCommand::Request { .. }) => {
-                                    // Skip outdated requests
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        if aborted {
+                        // Check if a new command has arrived
+                        if let Ok(new_cmd) = cmd_rx.try_recv() {
+                            current_cmd = Some(new_cmd);
                             break;
                         }
+                        let mut aborted = false;
 
                         let target_kf = get_nearest_keyframe(&keyframes, target_frame);
                         let kf_idx = keyframes.binary_search(&target_kf).unwrap_or(0);
@@ -138,7 +129,8 @@ pub fn spawn_thumbnail_decoder(
 
                             while let Some((stream_ref, packet)) = packets_iter.next() {
                                 // Preemption check inside decoding loop
-                                if cmd_rx.try_recv().is_ok() {
+                                if let Ok(new_cmd) = cmd_rx.try_recv() {
+                                    current_cmd = Some(new_cmd);
                                     aborted = true;
                                     break;
                                 }
@@ -165,13 +157,70 @@ pub fn spawn_thumbnail_decoder(
                                             fallback_frame_idx = frame_idx + 1;
 
                                             if frame_idx >= target_frame {
+                                                let actual_frame = if frame.format() == ffmpeg_next::format::Pixel::VIDEOTOOLBOX || frame.format() == ffmpeg_next::format::Pixel::D3D11 {
+                                                    let mut sw_frame = ffmpeg_next::util::frame::Video::empty();
+                                                    let ret = unsafe {
+                                                        ffmpeg_next::sys::av_hwframe_transfer_data(
+                                                            sw_frame.as_mut_ptr(),
+                                                            frame.as_ptr(),
+                                                            0,
+                                                        )
+                                                    };
+                                                    if ret < 0 {
+                                                        frame.clone()
+                                                    } else {
+                                                        sw_frame
+                                                    }
+                                                } else {
+                                                    frame.clone()
+                                                };
+
+                                                let scaler_ctx = match scaler.as_mut() {
+                                                    Some(s) if s.input().format == actual_frame.format()
+                                                        && s.input().width == actual_frame.width()
+                                                        && s.input().height == actual_frame.height()
+                                                        && s.output().height == height => s,
+                                                    _ => {
+                                                        let thumb_width = (height as f32 * aspect_ratio).round() as u32;
+                                                        if let Ok(new_s) = ffmpeg_next::software::scaling::context::Context::get(
+                                                            actual_frame.format(),
+                                                            actual_frame.width(),
+                                                            actual_frame.height(),
+                                                            ffmpeg_next::format::Pixel::RGBA,
+                                                            thumb_width,
+                                                            height,
+                                                            ffmpeg_next::software::scaling::flag::Flags::BILINEAR,
+                                                        ) {
+                                                            scaler = Some(new_s);
+                                                            scaler.as_mut().unwrap()
+                                                        } else {
+                                                            break;
+                                                        }
+                                                    }
+                                                };
+
                                                 let mut scaled_frame = ffmpeg_next::util::frame::Video::empty();
-                                                if current_scaler.run(&frame, &mut scaled_frame).is_ok() {
+                                                if scaler_ctx.run(&actual_frame, &mut scaled_frame).is_ok() {
+                                                    let w = scaled_frame.width() as usize;
+                                                    let h = scaled_frame.height() as usize;
+                                                    let stride = scaled_frame.stride(0) as usize;
+                                                    let data = scaled_frame.data(0);
+                                                    let mut rgba_data = Vec::with_capacity(w * h * 4);
+                                                    for y in 0..h {
+                                                        let start = y * stride;
+                                                        let end = start + w * 4;
+                                                        if let Some(row) = data.get(start..end) {
+                                                            rgba_data.extend_from_slice(row);
+                                                        } else {
+                                                            break;
+                                                        }
+                                                    }
+
                                                     let _ = resp_tx.send(ThumbnailResponse {
                                                         frame_idx,
-                                                        width: active_width,
-                                                        height: active_height,
-                                                        rgba_data: scaled_frame.data(0).to_vec(),
+                                                        width: w as u32,
+                                                        height: h as u32,
+                                                        rgba_data,
                                                     });
                                                     frame_found = true;
                                                 }
@@ -210,18 +259,48 @@ mod tests {
         
         let (cmd_tx, resp_rx, handle) = spawn_thumbnail_decoder(test_file, keyframes, keyframes_pts, 60.0);
         
-        // Request frames 0 and 60
-        cmd_tx.send(ThumbnailCommand::Request { frames: vec![0, 60], height: 72 }).unwrap();
+        // Request frames 0 and 60 with height 31 to trigger potential stride padding issues
+        cmd_tx.send(ThumbnailCommand::Request { frames: vec![0, 60], height: 31 }).unwrap();
         
         // We expect to receive two thumbnail responses within 5 seconds
         let resp1 = resp_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(resp1.height, 72);
-        assert!(resp1.rgba_data.len() > 0);
+        assert_eq!(resp1.height, 31);
+        assert_eq!(resp1.rgba_data.len(), (resp1.width * resp1.height * 4) as usize);
         
         let resp2 = resp_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(resp2.height, 72);
+        assert_eq!(resp2.height, 31);
+        assert_eq!(resp2.rgba_data.len(), (resp2.width * resp2.height * 4) as usize);
         
         // Cleanup
+        drop(cmd_tx);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn test_thumbnail_decoder_preemption() {
+        let test_file = format!("{}/test-files/bbb_sunflower_2160p_60fps_normal.mp4", env!("CARGO_MANIFEST_DIR"));
+        let keyframes = vec![0, 60, 120];
+        let keyframes_pts = vec![0, 60 * 1000, 120 * 1000];
+        
+        let (cmd_tx, resp_rx, handle) = spawn_thumbnail_decoder(test_file, keyframes, keyframes_pts, 60.0);
+        
+        // Send a request for multiple frames
+        cmd_tx.send(ThumbnailCommand::Request { frames: vec![0, 60, 120], height: 31 }).unwrap();
+        // Immediately send a new request to preempt the first one
+        cmd_tx.send(ThumbnailCommand::Request { frames: vec![120], height: 31 }).unwrap();
+        
+        let mut got_120 = false;
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            if let Ok(resp) = resp_rx.recv_timeout(Duration::from_millis(100)) {
+                if resp.frame_idx == 120 {
+                    got_120 = true;
+                    break;
+                }
+            }
+        }
+        assert!(got_120, "Should have received response for the second request");
+        
         drop(cmd_tx);
         let _ = handle.join();
     }

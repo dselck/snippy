@@ -58,7 +58,7 @@ pub struct MainApp {
     pub decode_fps: f32,
 
     pub thumbnail_cache: std::collections::HashMap<usize, egui::TextureHandle>,
-    pub in_flight_requests: std::collections::HashSet<usize>,
+    pub in_flight_requests: std::collections::HashMap<usize, std::time::Instant>,
     pub is_dragging_filmstrip: bool,
     pub last_zoom_level: f32,
     pub last_thumbnail_height: f32,
@@ -110,7 +110,7 @@ impl MainApp {
             decode_fps_last_reset: std::time::Instant::now(),
             decode_fps: 0.0,
             thumbnail_cache: std::collections::HashMap::new(),
-            in_flight_requests: std::collections::HashSet::new(),
+            in_flight_requests: std::collections::HashMap::new(),
             is_dragging_filmstrip: false,
             last_zoom_level: 0.0,
             last_thumbnail_height: 0.0,
@@ -772,10 +772,11 @@ impl eframe::App for MainApp {
                     let sprocket_height = 8.0;
                     let inner_height = (filmstrip_height - (sprocket_height * 2.0)).max(10.0);
 
-                    // Check if inner_height has changed significantly
-                    let height_diff = (inner_height - self.last_thumbnail_height).abs();
-                    if height_diff > 4.0 {
-                        self.last_thumbnail_height = inner_height;
+                    // Bucket the thumbnail height to increments of 64 pixels to prevent constant cache clearing on resize
+                    let bucketed_height = (((inner_height / 64.0).round() as u32) * 64).clamp(64, 256) as f32;
+
+                    if (bucketed_height - self.last_thumbnail_height).abs() > 0.01 {
+                        self.last_thumbnail_height = bucketed_height;
                         self.thumbnail_cache.clear();
                         self.in_flight_requests.clear();
                         if let Some(tx) = self.playback.thumbnail_tx.as_ref() {
@@ -840,7 +841,26 @@ impl eframe::App for MainApp {
                     let right_bound = -scroll_offset_x + total_width as f64;
                     let first_k = (left_bound / step_width as f64).floor() as isize;
                     let last_k = (right_bound / step_width as f64).ceil() as isize;
-                    
+
+                    // Collect all frames in the active zone (visible +/- 2 padding)
+                    let padding = 2;
+                    let start_k = (first_k - padding).max(0);
+                    let end_k = last_k + padding;
+                    let mut active_zone_frames = std::collections::HashSet::new();
+                    for k in start_k..=end_k {
+                        let target_time = k as f64 * interval;
+                        if target_time > duration_sec { break; }
+                        let target_frame = (target_time * fps).round() as usize;
+                        if target_frame >= total_frames { continue; }
+                        active_zone_frames.insert(target_frame);
+                    }
+
+                    // Clean up in-flight requests that are out of zone or timed out (> 2 seconds)
+                    let now = std::time::Instant::now();
+                    self.in_flight_requests.retain(|frame_idx, request_time| {
+                        active_zone_frames.contains(frame_idx) && now.duration_since(*request_time) < std::time::Duration::from_secs(2)
+                    });
+
                     let mut requested_frames = Vec::new();
 
                     for k in first_k..=last_k {
@@ -878,11 +898,11 @@ impl eframe::App for MainApp {
                                     Color32::from_rgb(45, 43, 75),
                                 );
                             }
-                            
-                            // Request frame if not in flight
-                            if !self.in_flight_requests.contains(&target_frame) {
+
+                            // Request first-priority visible frames if they are not in flight or cached
+                            if !self.thumbnail_cache.contains_key(&target_frame) && !self.in_flight_requests.contains_key(&target_frame) {
                                 requested_frames.push(target_frame);
-                                self.in_flight_requests.insert(target_frame);
+                                self.in_flight_requests.insert(target_frame, now);
                             }
                         }
                         
@@ -899,10 +919,18 @@ impl eframe::App for MainApp {
                         }
                     }
 
+                    // Request other non-visible but in-zone frames
+                    for target_frame in &active_zone_frames {
+                        if !self.thumbnail_cache.contains_key(target_frame) && !self.in_flight_requests.contains_key(target_frame) {
+                            requested_frames.push(*target_frame);
+                            self.in_flight_requests.insert(*target_frame, now);
+                        }
+                    }
+
                     // Send request batch if present
                     if !requested_frames.is_empty() {
                         if let Some(tx) = self.playback.thumbnail_tx.as_ref() {
-                            let clamped_height = (inner_height.round() as u32).clamp(30, 256);
+                            let clamped_height = bucketed_height as u32;
                             let _ = tx.send(crate::media::ThumbnailCommand::Request { 
                                 frames: requested_frames, 
                                 height: clamped_height 
