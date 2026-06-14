@@ -56,6 +56,11 @@ pub struct MainApp {
     pub decode_fps_frame_count: usize,
     pub decode_fps_last_reset: std::time::Instant,
     pub decode_fps: f32,
+
+    pub thumbnail_cache: std::collections::HashMap<usize, egui::TextureHandle>,
+    pub in_flight_requests: std::collections::HashSet<usize>,
+    pub is_dragging_filmstrip: bool,
+    pub last_zoom_level: f32,
 }
 
 impl MainApp {
@@ -87,9 +92,6 @@ impl MainApp {
             playback.load_video(demo_path);
         }
 
-        
-
-
         Self {
             video_path: Some(demo_path.to_string()),
             playback,
@@ -106,6 +108,10 @@ impl MainApp {
             decode_fps_frame_count: 0,
             decode_fps_last_reset: std::time::Instant::now(),
             decode_fps: 0.0,
+            thumbnail_cache: std::collections::HashMap::new(),
+            in_flight_requests: std::collections::HashSet::new(),
+            is_dragging_filmstrip: false,
+            last_zoom_level: 0.0,
         }
     }
 
@@ -676,6 +682,33 @@ impl eframe::App for MainApp {
             ctx.request_repaint();
         }
 
+        // Polling decoded thumbnails
+        if let Some(rx) = self.playback.thumbnail_rx.as_ref() {
+            while let Ok(resp) = rx.try_recv() {
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                    [resp.width as usize, resp.height as usize],
+                    &resp.rgba_data,
+                );
+                let texture_handle = ctx.load_texture(
+                    format!("thumb_{}", resp.frame_idx),
+                    color_image,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.thumbnail_cache.insert(resp.frame_idx, texture_handle);
+                self.in_flight_requests.remove(&resp.frame_idx);
+            }
+        }
+
+        // Inside App::ui, detect zoom change:
+        let has_zoomed = (self.zoom_level - self.last_zoom_level).abs() > 0.01;
+        if has_zoomed {
+            self.last_zoom_level = self.zoom_level;
+            self.in_flight_requests.clear();
+            if let Some(tx) = self.playback.thumbnail_tx.as_ref() {
+                let _ = tx.send(crate::media::ThumbnailCommand::Clear);
+            }
+        }
+
         // 2. Bottom Panel: Timeline and Waveform Deck (Full width)
         egui::Panel::bottom("timeline_deck")
             .resizable(true)
@@ -734,32 +767,21 @@ impl eframe::App for MainApp {
                     painter.rect_filled(filmstrip_rect, 6.0, Color32::from_rgb(12, 11, 20));
                     painter.rect_stroke(filmstrip_rect, 6.0, egui::Stroke::new(1.0, Color32::from_rgb(26, 25, 43)), egui::StrokeKind::Inside);
 
-                    let thumbnail_spacing = 6.0;
                     let sprocket_height = 8.0;
                     let inner_height = (filmstrip_height - (sprocket_height * 2.0)).max(10.0);
-                    let thumbnail_width = inner_height * 16.0 / 9.0;
-
-                    // Calculate number of odd thumbnails that fit
-                    let mut n = ((total_width + thumbnail_spacing) / (thumbnail_width + thumbnail_spacing)) as usize;
-                    if n.is_multiple_of(2) { n = n.saturating_sub(1); }
-                    let num_thumbnails = n.max(3);
-                    let num_gaps = num_thumbnails - 1;
-
-                    let occupied_width = num_thumbnails as f32 * thumbnail_width + num_gaps as f32 * thumbnail_spacing;
-                    let left_margin = (total_width - occupied_width) * 0.5;
 
                     let inner_rect = egui::Rect::from_min_max(
-                        egui::pos2(filmstrip_rect.left() + left_margin, filmstrip_rect.top() + sprocket_height),
-                        egui::pos2(filmstrip_rect.left() + left_margin + occupied_width, filmstrip_rect.bottom() - sprocket_height),
+                        egui::pos2(filmstrip_rect.left(), filmstrip_rect.top() + sprocket_height),
+                        egui::pos2(filmstrip_rect.right(), filmstrip_rect.bottom() - sprocket_height),
                     );
 
-                    // Draw sprockets on top and bottom margins (matching the actual thumbnails row width)
+                    // Draw sprockets on top and bottom margins (stretching full width)
                     let sprocket_width = 8.0;
                     let sprocket_h = 5.0;
-                    let num_sprockets = ((occupied_width / 16.0) as usize).max(5);
-                    let sprocket_gap = (occupied_width - (sprocket_width * num_sprockets as f32)) / (num_sprockets - 1) as f32;
+                    let num_sprockets = ((total_width / 16.0) as usize).max(5);
+                    let sprocket_gap = (total_width - (sprocket_width * num_sprockets as f32)) / (num_sprockets - 1) as f32;
                     for s in 0..num_sprockets {
-                        let sx = inner_rect.left() + s as f32 * (sprocket_width + sprocket_gap);
+                        let sx = filmstrip_rect.left() + s as f32 * (sprocket_width + sprocket_gap);
                         
                         // Top sprocket hole
                         let top_sprocket_rect = egui::Rect::from_min_size(
@@ -776,92 +798,118 @@ impl eframe::App for MainApp {
                         painter.rect_filled(bottom_sprocket_rect, 1.0, Color32::from_rgb(24, 23, 40));
                     }
 
-                    // Calculate frame delta step exponentially
-                    let max_delta = (self.playback.total_frames() as f32 / num_gaps as f32).max(1.0);
-                    let delta_f = (max_delta.ln() * (1.0 - self.zoom_level)).exp();
-                    let delta = (delta_f as usize).max(1);
+                    // Calculate logarithmic delta step
+                    let fps = self.playback.video_fps();
+                    let total_frames = self.playback.total_frames();
+                    let duration_sec = total_frames as f64 / fps;
+                    
+                    // Interpolate time delta represented by a single thumbnail step
+                    // Zoom level 0.0 -> 30s. Zoom level 1.0 -> 1/fps s (1 frame)
+                    let min_interval = 1.0 / fps;
+                    let max_interval = 30.0;
+                    let interval = max_interval * (min_interval / max_interval).powf(self.zoom_level as f64);
+                    
+                    // Step spacing logic
+                    let spacing_x = 6.0;
+                    let thumb_height = inner_height; // Dynamically scale to fit filmstrip height
+                    let aspect_ratio = 16.0 / 9.0;
+                    let actual_thumb_width = thumb_height * aspect_ratio;
+                    let step_width = actual_thumb_width + spacing_x;
+                    let pixels_per_second = step_width as f64 / interval;
 
-                    for i in 0..num_thumbnails {
-                        let offset_idx = i as isize - (num_thumbnails / 2) as isize;
-                        let target_frame = self.playback.current_frame() as isize + offset_idx * delta as isize;
+                    // Stationary Playhead Center position
+                    let playhead_x = total_width * 0.5;
+                    let current_time_sec = self.playback.current_frame() as f64 / fps;
+                    let scroll_offset_x = playhead_x as f64 - (current_time_sec * pixels_per_second);
 
-                        let tx = inner_rect.left() + i as f32 * (thumbnail_width + thumbnail_spacing);
+                    // Compute indices of visible step slots
+                    let left_bound = -scroll_offset_x - actual_thumb_width as f64;
+                    let right_bound = -scroll_offset_x + total_width as f64;
+                    let first_k = (left_bound / step_width as f64).floor() as isize;
+                    let last_k = (right_bound / step_width as f64).ceil() as isize;
+                    
+                    let mut requested_frames = Vec::new();
+
+                    for k in first_k..=last_k {
+                        if k < 0 { continue; }
+                        let target_time = k as f64 * interval;
+                        if target_time > duration_sec { break; }
+                        let target_frame = (target_time * fps).round() as usize;
+                        if target_frame >= total_frames { continue; }
+
+                        let tx = scroll_offset_x + (k as f64 * step_width as f64);
                         let thub_rect = egui::Rect::from_min_size(
-                            egui::pos2(tx, inner_rect.top()),
-                            egui::vec2(thumbnail_width, inner_height),
+                            egui::pos2(tx as f32, inner_rect.top()),
+                            egui::vec2(actual_thumb_width, thumb_height),
                         );
 
-                        if target_frame >= 0 && target_frame <= self.playback.total_frames() as isize {
-                            let is_center = offset_idx == 0;
-                            
-                            let bg_color = if is_center {
-                                Color32::from_rgb(33, 31, 54)
-                            } else {
-                                Color32::from_rgb(18, 17, 28)
-                            };
-                            let border_color = if is_center {
-                                Color32::from_rgb(236, 72, 153) // Electric pink border for center playhead
-                            } else {
-                                Color32::from_rgb(45, 43, 75)
-                            };
-                            painter.rect_filled(thub_rect, 4.0, bg_color);
-                            painter.rect_stroke(thub_rect, 4.0, egui::Stroke::new(if is_center { 1.5 } else { 1.0 }, border_color), egui::StrokeKind::Inside);
-
-                            // Color graphic procedural thumbnail
-                            let hash_val = target_frame as usize;
-                            let bar_color = Color32::from_rgb(
-                                ((hash_val * 37) % 120 + 30) as u8,
-                                ((hash_val * 59) % 120 + 30) as u8,
-                                ((hash_val * 97) % 120 + 60) as u8,
+                        // Handle rendering
+                        if let Some(texture) = self.thumbnail_cache.get(&target_frame) {
+                            // Draw decoded thumbnail image
+                            painter.image(
+                                texture.id(),
+                                thub_rect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                Color32::WHITE,
                             );
-                            
-                            // Don't draw preview rectangle if it is too small
-                            if inner_height > 18.0 {
-                                let content_rect = egui::Rect::from_min_max(
-                                    egui::pos2(thub_rect.left() + 3.0, thub_rect.top() + 3.0),
-                                    egui::pos2(thub_rect.right() - 3.0, thub_rect.bottom() - 13.0),
-                                );
-                                painter.rect_filled(content_rect, 2.0, bar_color);
-                            }
-
-                            // Underlay text code (timecode) - hide if too small
-                            if inner_height > 12.0 {
-                                let time_text = self.frame_to_time(target_frame as usize);
-                                painter.text(
-                                    egui::pos2(thub_rect.center().x, thub_rect.bottom() - 6.0),
-                                    egui::Align2::CENTER_CENTER,
-                                    time_text,
-                                    egui::FontId::monospace(8.0),
-                                    Color32::from_rgb(148, 163, 184),
-                                );
-                            }
-
-                            // Handle click interaction to center this frame
-                            let response_id = ui.make_persistent_id(format!("filmstrip_th_{}", i));
-                            let th_response = ui.interact(thub_rect, response_id, egui::Sense::click());
-                            if th_response.clicked() {
-                                self.playback.set_playing(false);
-                                self.playback.seek_internal(target_frame as usize, false, true);
-                            }
                         } else {
-                            // Out of bounds thumbnail placeholder
-                            painter.rect_filled(thub_rect, 4.0, Color32::from_rgb(8, 8, 14));
-                            painter.rect_stroke(thub_rect, 4.0, egui::Stroke::new(1.0, Color32::from_rgb(20, 19, 32)), egui::StrokeKind::Inside);
-                            
+                            // Placeholder loading card
+                            painter.rect_filled(thub_rect, 4.0, Color32::from_rgb(18, 17, 28));
+                            painter.rect_stroke(thub_rect, 4.0, egui::Stroke::new(1.0, Color32::from_rgb(45, 43, 75)), egui::StrokeKind::Inside);
                             if inner_height > 12.0 {
                                 painter.text(
                                     thub_rect.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    "OUT",
+                                    "LOADING",
                                     egui::FontId::proportional(9.0),
                                     Color32::from_rgb(45, 43, 75),
                                 );
                             }
+                            
+                            // Request frame if not in flight
+                            if !self.in_flight_requests.contains(&target_frame) {
+                                requested_frames.push(target_frame);
+                                self.in_flight_requests.insert(target_frame);
+                            }
+                        }
+                        
+                        // Underlay timecode
+                        if inner_height > 12.0 {
+                            let time_text = self.frame_to_time(target_frame);
+                            painter.text(
+                                egui::pos2(thub_rect.center().x, thub_rect.bottom() + 10.0),
+                                egui::Align2::CENTER_CENTER,
+                                time_text,
+                                egui::FontId::monospace(8.0),
+                                Color32::from_rgb(148, 163, 184),
+                            );
+                        }
+                    }
+
+                    // Send request batch if present
+                    if !requested_frames.is_empty() {
+                        if let Some(tx) = self.playback.thumbnail_tx.as_ref() {
+                            let _ = tx.send(crate::media::ThumbnailCommand::Request { frames: requested_frames });
+                        }
+                    }
+
+                    // Step 5: Drag-to-Scrub Mouse Interaction
+                    let response_id = ui.make_persistent_id("filmstrip_viewport_interact");
+                    let filmstrip_response = ui.interact(filmstrip_rect, response_id, egui::Sense::click_and_drag());
+                    
+                    if filmstrip_response.dragged() || filmstrip_response.clicked() {
+                        self.playback.set_playing(false);
+                        if let Some(pointer_pos) = filmstrip_response.interact_pointer_pos() {
+                            let dx_pixels = pointer_pos.x - playhead_x as f32;
+                            let dt_seconds = dx_pixels as f64 / pixels_per_second;
+                            let target_time = current_time_sec + dt_seconds;
+                            let target_frame = (target_time * fps).round().max(0.0).min(total_frames as f64 - 1.0) as usize;
+                            self.playback.seek_internal(target_frame, false, true);
                         }
                     }
 
                     // Vertical Center Playhead line over the filmstrip
-                    let center_x = inner_rect.center().x;
+                    let center_x = playhead_x;
                     painter.line_segment(
                         [egui::pos2(center_x, filmstrip_rect.top() - 2.0), egui::pos2(center_x, filmstrip_rect.bottom() + 2.0)],
                         egui::Stroke::new(2.0, Color32::from_rgb(236, 72, 153)),
@@ -892,9 +940,10 @@ impl eframe::App for MainApp {
                     );
 
                     // Synced frame calculations matching filmstrip
-                    let half_width = num_thumbnails / 2;
-                    let start_frame = self.playback.current_frame() as isize - half_width as isize * delta as isize;
-                    let visible_range_width = (2 * half_width * delta) as f32;
+                    let total_width_d = total_width as f64;
+                    let visible_duration = total_width_d / pixels_per_second;
+                    let visible_range_width = (visible_duration * fps) as f32;
+                    let start_frame = ((current_time_sec - (total_width_d * 0.5) / pixels_per_second) * fps) as isize;
 
                     let frame_to_x = |frame: usize| -> f32 {
                         let pct = (frame as isize - start_frame) as f32 / visible_range_width;
