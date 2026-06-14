@@ -124,6 +124,12 @@ pub struct Stats {
     pub samples: Vec<Duration>,
 }
 
+impl Default for Stats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Stats {
     pub fn new() -> Self {
         Self {
@@ -437,8 +443,8 @@ impl ProfilingGuard {
 impl Drop for ProfilingGuard {
     fn drop(&mut self) {
         #[cfg(unix)]
-        if let Some(guard) = self.guard.take() {
-            if let Ok(report) = guard.report().build() {
+        if let Some(guard) = self.guard.take()
+            && let Ok(report) = guard.report().build() {
                 let dir = std::path::Path::new("target/profile");
                 let _ = std::fs::create_dir_all(dir);
                 let file_name = format!("{}_flamegraph.svg", self.name);
@@ -451,6 +457,5 @@ impl Drop for ProfilingGuard {
                     }
                 }
             }
-        }
     }
 }

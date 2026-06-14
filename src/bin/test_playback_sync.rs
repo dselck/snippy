@@ -171,14 +171,13 @@ fn main() -> Result<(), anyhow::Error> {
     let mut post_seek_frames = vec![];
     let post_start_time = std::time::Instant::now();
     while post_start_time.elapsed() < Duration::from_secs(4) {
-        if let Ok(frame) = frame_rx.recv_timeout(Duration::from_millis(200)) {
-            if frame.sequence_id() == 2 {
+        if let Ok(frame) = frame_rx.recv_timeout(Duration::from_millis(200))
+            && frame.sequence_id() == 2 {
                 post_seek_frames.push(frame.frame_idx());
                 if post_seek_frames.len() >= 3 {
                     break;
                 }
             }
-        }
     }
     println!("Post-seek frames received: {:?}", post_seek_frames);
     assert!(post_seek_frames.len() >= 3, "Playback should automatically resume, decoding subsequent frames!");
@@ -231,14 +230,13 @@ fn main() -> Result<(), anyhow::Error> {
     let mut double_post_seek_frames = vec![];
     let post_start_time = std::time::Instant::now();
     while post_start_time.elapsed() < Duration::from_secs(4) {
-        if let Ok(frame) = frame_rx.recv_timeout(Duration::from_millis(200)) {
-            if frame.sequence_id() == 4 {
+        if let Ok(frame) = frame_rx.recv_timeout(Duration::from_millis(200))
+            && frame.sequence_id() == 4 {
                 double_post_seek_frames.push(frame.frame_idx());
                 if double_post_seek_frames.len() >= 3 {
                     break;
                 }
             }
-        }
     }
     println!("Double post-seek frames received: {:?}", double_post_seek_frames);
     assert!(double_post_seek_frames.len() >= 3, "Playback should automatically resume after double seek!");
@@ -254,15 +252,14 @@ fn main() -> Result<(), anyhow::Error> {
     let mut received_target = false;
     let start_time = std::time::Instant::now();
     while start_time.elapsed() < Duration::from_secs(5) {
-        if let Ok(frame) = frame_rx.recv_timeout(Duration::from_millis(100)) {
-            if frame.sequence_id() == 5 {
+        if let Ok(frame) = frame_rx.recv_timeout(Duration::from_millis(100))
+            && frame.sequence_id() == 5 {
                 println!("Received paused seek frame: index={}", frame.frame_idx());
                 if frame.frame_idx() == 45 {
                     received_target = true;
                     break;
                 }
             }
-        }
     }
     assert!(received_target, "Should receive precise seek target frame 45 when paused, not stop at keyframe!");
 

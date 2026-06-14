@@ -10,6 +10,12 @@ pub struct GopCache {
     pub frames: HashMap<usize, CachedFrame>,
 }
 
+impl Default for GopCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GopCache {
     pub fn new() -> Self {
         Self {

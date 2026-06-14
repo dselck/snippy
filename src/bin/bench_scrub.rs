@@ -166,7 +166,7 @@ fn run_scenario(
     println!(
         "    seeks: {}  median: {}",
         latency.count(),
-        latency.median().map_or("—".into(), |d| Stats::fmt_duration(d)),
+        latency.median().map_or("—".into(), Stats::fmt_duration),
     );
 
     report.add(scenario.name, latency);

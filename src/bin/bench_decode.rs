@@ -8,7 +8,7 @@
 //!   SNIPPY_BENCH_VIDEO=path/to/clip.mp4 cargo run --release --bin bench_decode
 
 use snippy2::bench::{format_video_info, BenchReport, MediaTestRig, Stats, TestMediaLocator};
-use snippy2::media::{DecodedFrame, MediaCommand};
+use snippy2::media::MediaCommand;
 use std::time::{Duration, Instant};
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -25,8 +25,7 @@ fn reset_to_start(rig: &MediaTestRig) -> Result<(), anyhow::Error> {
 /// Begin playback from the current position.
 fn start_playback(rig: &MediaTestRig, start_secs: f64) -> Result<(), anyhow::Error> {
     rig.master_clock.set_position(start_secs);
-    rig.send(MediaCommand::Play)?;
-    rig.master_clock.play();
+    rig.send(MediaCommand::PlayUnpaced { sequence_id: 1 })?;
     Ok(())
 }
 
@@ -35,8 +34,8 @@ fn start_playback(rig: &MediaTestRig, start_secs: f64) -> Result<(), anyhow::Err
 fn collect_frames_for(
     rig: &MediaTestRig,
     duration: Duration,
-) -> (Vec<DecodedFrame>, Stats) {
-    let mut frames: Vec<DecodedFrame> = Vec::new();
+) -> (Vec<usize>, Stats) {
+    let mut frames: Vec<usize> = Vec::new();
     let mut intervals = Stats::new();
     let deadline = Instant::now() + duration;
     let mut last_recv = Instant::now();
@@ -50,7 +49,7 @@ fn collect_frames_for(
                 intervals.push(now - last_recv);
             }
             last_recv = now;
-            frames.push(frame);
+            frames.push(frame.frame_idx());
         }
     }
     (frames, intervals)
@@ -256,7 +255,7 @@ fn gop_boundary_spikes(
     for (i, sample) in intervals.samples.iter().enumerate() {
         if *sample > threshold {
             // The frame that was slow to arrive is frames[i+1].
-            let frame_idx = frames[i + 1].frame_idx();
+            let frame_idx = frames[i + 1];
             spike_locations.push((frame_idx, *sample));
             spike_count += 1;
         }

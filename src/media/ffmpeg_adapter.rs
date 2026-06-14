@@ -38,9 +38,17 @@ impl DecoderAdapter for FfmpegDecoderAdapter {
         let mut frame = ffmpeg_next::util::frame::Video::empty();
         match self.video_decoder.receive_frame(&mut frame) {
             Ok(_) => {
-                let pts_sec = match frame.pts() {
-                    Some(pts_val) => pts_val as f64 * self.time_base_f64 - self.video_start_time,
-                    None => self.fallback_frame_idx as f64 / self.fps,
+                let pts_sec = if let Some(timestamp) = frame.timestamp() {
+                    timestamp as f64 * self.time_base_f64 - self.video_start_time
+                } else if let Some(pts) = frame.pts() {
+                    pts as f64 * self.time_base_f64 - self.video_start_time
+                } else {
+                    let pkt_dts = unsafe { (*frame.as_ptr()).pkt_dts };
+                    if pkt_dts != ffmpeg_next::sys::AV_NOPTS_VALUE {
+                        pkt_dts as f64 * self.time_base_f64 - self.video_start_time
+                    } else {
+                        self.fallback_frame_idx as f64 / self.fps
+                    }
                 };
                 let frame_idx = (pts_sec * self.fps).round() as usize;
                 self.fallback_frame_idx = frame_idx + 1;
@@ -147,7 +155,8 @@ impl DecoderAdapter for FfmpegDecoderAdapter {
         }
     }
 
-    fn flush(&mut self) {
+    fn flush(&mut self, fallback_frame_idx: usize) {
         self.video_decoder.flush();
+        self.fallback_frame_idx = fallback_frame_idx;
     }
 }

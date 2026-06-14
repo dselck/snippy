@@ -53,6 +53,12 @@ pub struct PlaybackSession {
     is_scrubbing: bool,
 }
 
+impl Default for PlaybackSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PlaybackSession {
     pub fn current_frame(&self) -> usize {
         self.current_frame
@@ -273,28 +279,24 @@ impl PlaybackSession {
                 frames_received += 1;
             }
 
-            if let Some(frame) = &self.latest_frame {
-                if got_frame {
+            if let Some(frame) = &self.latest_frame
+                && got_frame {
                     let frame_idx = frame.frame_idx();
                     
-                    if self.in_flight_seek_seq.map_or(false, |seq| frame.sequence_id() >= seq) {
+                    if self.in_flight_seek_seq.is_some_and(|seq| frame.sequence_id() >= seq) {
                         self.in_flight_seek_seq = None;
                         
-                        if let Some(desired) = self.desired_scrub_frame.take() {
-                            if self.last_sent_seek_frame != Some(desired) {
+                        if let Some(desired) = self.desired_scrub_frame.take()
+                            && self.last_sent_seek_frame != Some(desired) {
                                 self.seek_internal(desired, true, false);
                                 self.in_flight_seek_seq = Some(self.latest_sequence_id);
                             }
-                        }
                     }
 
-                    if !self.is_playing {
-                        self.current_frame = frame_idx;
-                    } else if self.in_flight_seek_seq.is_none() {
+                    if !self.is_playing || self.in_flight_seek_seq.is_none() {
                         self.current_frame = frame_idx;
                     }
                 }
-            }
         }
         
         if self.current_frame >= self.total_frames {
@@ -364,16 +366,14 @@ impl PlaybackSession {
                 }
             }
             InputEvent::ArrowLeftDown => {
-                if let ArrowSeekState::SteppingLeft { held_since } = self.arrow_seek_state {
-                    if held_since.elapsed() >= Duration::from_millis(250) {
-                        if self.in_flight_seek_seq.is_none() {
+                if let ArrowSeekState::SteppingLeft { held_since } = self.arrow_seek_state
+                    && held_since.elapsed() >= Duration::from_millis(250)
+                        && self.in_flight_seek_seq.is_none() {
                             self.is_playing = false;
                             let target_frame = self.current_frame.saturating_sub(1);
                             self.seek_internal(target_frame, false, false);
                             self.in_flight_seek_seq = Some(self.latest_sequence_id);
                         }
-                    }
-                }
             }
             InputEvent::ArrowLeftReleased => {
                 if matches!(self.arrow_seek_state, ArrowSeekState::SteppingLeft { .. }) {
@@ -393,9 +393,9 @@ impl PlaybackSession {
                 }
             }
             InputEvent::ArrowRightDown => {
-                if let ArrowSeekState::SteppingRight { held_since, unpaced_started } = self.arrow_seek_state {
-                    if held_since.elapsed() >= Duration::from_millis(250) {
-                        if !unpaced_started {
+                if let ArrowSeekState::SteppingRight { held_since, unpaced_started } = self.arrow_seek_state
+                    && held_since.elapsed() >= Duration::from_millis(250)
+                        && !unpaced_started {
                             self.latest_sequence_id += 1;
                             if let Some(tx) = &self.media_tx {
                                 let _ = tx.send(MediaCommand::PlayUnpaced { sequence_id: self.latest_sequence_id });
@@ -405,13 +405,14 @@ impl PlaybackSession {
                                 unpaced_started: true,
                             };
                         }
-                    }
-                }
             }
             InputEvent::ArrowRightReleased => {
                 if let ArrowSeekState::SteppingRight { unpaced_started, .. } = self.arrow_seek_state {
                     if unpaced_started {
-                        self.set_playing(false);
+                        if let Some(tx) = &self.media_tx {
+                            let _ = tx.send(MediaCommand::Pause);
+                        }
+                        self.is_playing = false;
                         if let Some(ae) = &self.audio_engine {
                             ae.master_clock.reset(self.current_frame as f64 / self.video_fps);
                         }
@@ -427,7 +428,9 @@ impl PlaybackSession {
                 self.scrub_to(target_frame);
             }
             InputEvent::ScrubDragEnd => {
-                let target = self.latest_frame.as_ref().map(|f| f.frame_idx()).unwrap_or(self.current_frame);
+                let target = self.desired_scrub_frame.unwrap_or(
+                    self.latest_frame.as_ref().map(|f| f.frame_idx()).unwrap_or(self.current_frame)
+                );
                 self.current_frame = target;
                 self.is_playing = self.was_playing_before_scrub;
                 self.in_flight_seek_seq = None;
@@ -484,5 +487,64 @@ mod tests {
 
         session.handle_input(InputEvent::ArrowRightReleased);
         assert!(!session.is_stepping());
+    }
+
+    #[test]
+    fn test_arrow_seek_stop_sends_pause() {
+        let mut session = PlaybackSession::new();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        session.media_tx = Some(tx);
+
+        session.handle_input(InputEvent::ArrowRightPressed);
+        
+        // Emulate holding for 250ms+
+        session.arrow_seek_state = ArrowSeekState::SteppingRight {
+            held_since: Instant::now() - Duration::from_millis(300),
+            unpaced_started: false,
+        };
+
+        session.handle_input(InputEvent::ArrowRightDown);
+        
+        // Consume the Seek command from ArrowRightPressed
+        let _seek_cmd = rx.try_recv().unwrap();
+
+        // Assert PlayUnpaced was sent
+        let cmd = rx.try_recv().unwrap();
+        assert!(matches!(cmd, MediaCommand::PlayUnpaced { .. }));
+
+        // Now release
+        session.handle_input(InputEvent::ArrowRightReleased);
+        
+        // Assert Pause was sent
+        let cmd2 = rx.try_recv().unwrap();
+        assert!(matches!(cmd2, MediaCommand::Pause));
+        assert!(!session.is_playing());
+    }
+
+    #[test]
+    fn test_scrub_end_uses_desired_frame() {
+        let mut session = PlaybackSession::new();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        session.media_tx = Some(tx);
+
+        session.handle_input(InputEvent::ScrubDragStart);
+        
+        // Simulate dragging to frame 150
+        session.in_flight_seek_seq = Some(1);
+        session.handle_input(InputEvent::ScrubDragUpdate { target_frame: 150 });
+        assert_eq!(session.desired_scrub_frame, Some(150));
+
+        // Now release drag
+        session.handle_input(InputEvent::ScrubDragEnd);
+        
+        // Verify it sought exactly to 150
+        let cmd = rx.try_recv().unwrap();
+        match cmd {
+            MediaCommand::Seek { frame_index, keyframe_only, .. } => {
+                assert_eq!(frame_index, 150);
+                assert_eq!(keyframe_only, false);
+            }
+            _ => panic!("Expected Seek command"),
+        }
     }
 }

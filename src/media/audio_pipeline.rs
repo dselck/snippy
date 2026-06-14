@@ -68,9 +68,17 @@ impl AudioDecoderPipeline {
         
         while self.decoder.receive_frame(&mut frame).is_ok() {
             let duration_sec = frame.samples() as f64 / frame.rate() as f64;
-            let pts_sec = match frame.pts() {
-                Some(pts) => pts as f64 * self.audio_tb_f64,
-                None => self.current_audio_time,
+            let pts_sec = if let Some(timestamp) = frame.timestamp() {
+                timestamp as f64 * self.audio_tb_f64
+            } else if let Some(pts) = frame.pts() {
+                pts as f64 * self.audio_tb_f64
+            } else {
+                let pkt_dts = unsafe { (*frame.as_ptr()).pkt_dts };
+                if pkt_dts != ffmpeg_next::sys::AV_NOPTS_VALUE {
+                    pkt_dts as f64 * self.audio_tb_f64
+                } else {
+                    self.current_audio_time
+                }
             };
             self.current_audio_time = pts_sec + duration_sec;
 

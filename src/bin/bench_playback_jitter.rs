@@ -58,7 +58,7 @@ fn main() -> Result<(), anyhow::Error> {
 
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if let Some(_) = rig.recv_frame(remaining.min(Duration::from_millis(100))) {
+        if rig.recv_frame(remaining.min(Duration::from_millis(100))).is_some() {
             frame_arrival_times.push(Instant::now());
         }
     }

@@ -20,6 +20,10 @@ _Avoid_: Tauri, WebView, frontend
 The central timer for playback synchronization. It is driven by the ground-truth presentation timestamps (PTS) of the audio samples currently played by the hardware (using tags propagated from FFmpeg decoder outputs), falling back to a system monotonic timer if no audio stream is present. All synchronization decisions are based on these ground-truth FFmpeg timestamps.
 _Avoid_: System timer, wall clock, nominal frame rate approximations
 
+**Presentation Timestamp (PTS)**:
+The precise time at which a decoded frame (video or audio) should be presented to the user, defined relative to the start of the media stream. It is sourced from the best-effort metadata computed by the media engine, falling back to decoding order timestamps or nominal frame index approximations only when container-level timing is unavailable.
+_Avoid_: Frame time, stream index time, playhead position.
+
 **Audio Output**:
 The native audio playback interface managed via `cpal` that consumes PCM samples.
 _Avoid_: Web Audio, audio channel
@@ -85,5 +89,13 @@ A deep thread shell inside the Media Engine that orchestrates FFmpeg packet demu
 _Avoid_: DecoderStateMachine, Demuxer thread
 
 **FrameSink / AudioSink**:
-Adapter seams that sit inside the DecoderStateMachine, providing pure, non-blocking interfaces for pushing decoded frames and audio samples to downstream queues. These eliminate nested blocking control flow in the thread shell.
+Real-time adapter seams that sit inside the DecoderStateMachine, providing pure, non-blocking interfaces for pushing decoded frames and audio samples to downstream queues. These eliminate nested blocking control flow in the thread shell.
 _Avoid_: Queue adapters, senders
+
+**Backpressure Boundary**:
+The mechanism that restricts the presenter thread's lookahead queue from growing without bound, forcing the background decoder thread to pause when the player queue fills up.
+_Avoid_: Unbounded caching, unconstrained queueing
+
+**Microsecond Seek Target**:
+The rescaled target timestamp (in microseconds, using `AV_TIME_BASE`) passed to the input container during a seek operation, converting it from the stream-specific timebase to prevent seeking errors.
+_Avoid_: Raw packet PTS seeks, unscaled seeks

@@ -87,7 +87,10 @@ impl MainApp {
             playback.load_video(demo_path);
         }
 
-        let app = Self {
+        
+
+
+        Self {
             video_path: Some(demo_path.to_string()),
             playback,
             in_marker: None,
@@ -103,10 +106,7 @@ impl MainApp {
             decode_fps_frame_count: 0,
             decode_fps_last_reset: std::time::Instant::now(),
             decode_fps: 0.0,
-        };
-
-
-        app
+        }
     }
 
     fn frame_to_time(&self, frame: usize) -> String {
@@ -124,11 +124,11 @@ fn configure_fonts(ctx: &egui::Context) {
     // Install Outfit-Regular and Outfit-Medium
     fonts.font_data.insert(
         "outfit_regular".to_owned(),
-        egui::FontData::from_static(include_bytes!("../../resources/fonts/Outfit-Regular.ttf")),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../../resources/fonts/Outfit-Regular.ttf"))),
     );
     fonts.font_data.insert(
         "outfit_medium".to_owned(),
-        egui::FontData::from_static(include_bytes!("../../resources/fonts/Outfit-Medium.ttf")),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../../resources/fonts/Outfit-Medium.ttf"))),
     );
 
     // Set Outfit as the default proportional font
@@ -145,7 +145,7 @@ fn configure_fonts(ctx: &egui::Context) {
 }
 
 fn configure_theme(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     
     // Custom Slate/Indigo Dark Palette
     let panel_bg = Color32::from_rgb(8, 8, 14);       // Deep space black
@@ -167,35 +167,35 @@ fn configure_theme(ctx: &egui::Context) {
     visuals.widgets.inactive.bg_fill = Color32::from_rgb(24, 23, 40);
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border_color);
     visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text_normal);
-    visuals.widgets.inactive.rounding = 6.0.into();
-
+    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+ 
     visuals.widgets.hovered.bg_fill = Color32::from_rgb(38, 36, 64);
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent_purple);
     visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, Color32::WHITE);
-    visuals.widgets.hovered.rounding = 6.0.into();
-
+    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+ 
     visuals.widgets.active.bg_fill = accent_purple;
     visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent_hover);
     visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, Color32::WHITE);
-    visuals.widgets.active.rounding = 6.0.into();
+    visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
 
     // Selection styling
     visuals.selection.bg_fill = accent_purple;
     visuals.selection.stroke = egui::Stroke::new(1.0, accent_hover);
 
     // Global layout roundings
-    visuals.window_rounding = 12.0.into();
+    visuals.window_corner_radius = egui::CornerRadius::same(12);
     visuals.window_shadow = egui::epaint::Shadow {
-        offset: egui::vec2(0.0, 8.0),
-        blur: 15.0,
-        spread: 0.0,
+        offset: [0, 8],
+        blur: 15,
+        spread: 0,
         color: Color32::from_black_alpha(40),
     };
 
     style.visuals = visuals;
     style.spacing.item_spacing = egui::vec2(10.0, 10.0);
     style.spacing.button_padding = egui::vec2(12.0, 8.0);
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }
 
 fn draw_playback_icon(painter: &egui::Painter, rect: egui::Rect, icon: &PlaybackIcon, color: Color32) {
@@ -593,8 +593,8 @@ impl MainApp {
         }
 
         // 3. Draw active selection range (current in/out markers) on the track
-        if let (Some(inf), Some(outf)) = (self.in_marker, self.out_marker) {
-            if inf < outf {
+        if let (Some(inf), Some(outf)) = (self.in_marker, self.out_marker)
+            && inf < outf {
                 let left_pct = inf as f32 / self.playback.total_frames() as f32;
                 let right_pct = outf as f32 / self.playback.total_frames() as f32;
                 let left_x = rect.left() + left_pct * rect.width();
@@ -610,7 +610,6 @@ impl MainApp {
                     Color32::from_rgb(59, 130, 246), // Active selection color (electric blue)
                 );
             }
-        }
 
         // 4. Always draw circular playhead handle (always visible)
         let fraction = (self.playback.current_frame() as f32 / self.playback.total_frames() as f32).clamp(0.0, 1.0);
@@ -626,14 +625,13 @@ impl MainApp {
         if response.drag_started() || response.clicked() {
             self.playback.handle_input(media::InputEvent::ScrubDragStart);
         }
-        if response.dragged() || response.clicked() {
-            if let Some(mouse_pos) = response.interact_pointer_pos() {
+        if (response.dragged() || response.clicked())
+            && let Some(mouse_pos) = response.interact_pointer_pos() {
                 let rel_x = (mouse_pos.x - rect.left()).clamp(0.0, rect.width());
                 let pct = rel_x / rect.width();
                 let target_frame = (pct * self.playback.total_frames() as f32) as usize;
                 self.playback.handle_input(media::InputEvent::ScrubDragUpdate { target_frame });
             }
-        }
         if response.drag_stopped() || response.clicked() {
             self.playback.handle_input(media::InputEvent::ScrubDragEnd);
         }
@@ -643,7 +641,8 @@ impl MainApp {
 }
 
 impl eframe::App for MainApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx();
         let mut prev_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
         let mut next_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
         let mut prev_down = ctx.input(|i| i.key_down(egui::Key::ArrowLeft));
@@ -678,14 +677,14 @@ impl eframe::App for MainApp {
         }
 
         // 2. Bottom Panel: Timeline and Waveform Deck (Full width)
-        egui::TopBottomPanel::bottom("timeline_deck")
+        egui::Panel::bottom("timeline_deck")
             .resizable(true)
-            .default_height(self.timeline_height)
-            .height_range(100.0..=250.0)
-            .frame(egui::Frame::none()
+            .default_size(self.timeline_height)
+            .size_range(100.0..=250.0)
+            .frame(egui::Frame::NONE
                 .fill(Color32::from_rgb(8, 8, 14))
-                .inner_margin(egui::Margin::symmetric(16.0, 12.0)))
-            .show(ctx, |ui| {
+                .inner_margin(egui::Margin::symmetric(16, 12)))
+            .show_inside(ui, |ui| {
                 ui.vertical(|ui| {
                     // Timeline Time Indicators & Zoom Controls
                     ui.horizontal(|ui| {
@@ -733,7 +732,7 @@ impl eframe::App for MainApp {
                     let painter = ui.painter_at(filmstrip_rect);
                     // Draw filmstrip track card background
                     painter.rect_filled(filmstrip_rect, 6.0, Color32::from_rgb(12, 11, 20));
-                    painter.rect_stroke(filmstrip_rect, 6.0, egui::Stroke::new(1.0, Color32::from_rgb(26, 25, 43)));
+                    painter.rect_stroke(filmstrip_rect, 6.0, egui::Stroke::new(1.0, Color32::from_rgb(26, 25, 43)), egui::StrokeKind::Inside);
 
                     let thumbnail_spacing = 6.0;
                     let sprocket_height = 8.0;
@@ -742,7 +741,7 @@ impl eframe::App for MainApp {
 
                     // Calculate number of odd thumbnails that fit
                     let mut n = ((total_width + thumbnail_spacing) / (thumbnail_width + thumbnail_spacing)) as usize;
-                    if n % 2 == 0 { n = n.saturating_sub(1); }
+                    if n.is_multiple_of(2) { n = n.saturating_sub(1); }
                     let num_thumbnails = n.max(3);
                     let num_gaps = num_thumbnails - 1;
 
@@ -806,7 +805,7 @@ impl eframe::App for MainApp {
                                 Color32::from_rgb(45, 43, 75)
                             };
                             painter.rect_filled(thub_rect, 4.0, bg_color);
-                            painter.rect_stroke(thub_rect, 4.0, egui::Stroke::new(if is_center { 1.5 } else { 1.0 }, border_color));
+                            painter.rect_stroke(thub_rect, 4.0, egui::Stroke::new(if is_center { 1.5 } else { 1.0 }, border_color), egui::StrokeKind::Inside);
 
                             // Color graphic procedural thumbnail
                             let hash_val = target_frame as usize;
@@ -847,7 +846,7 @@ impl eframe::App for MainApp {
                         } else {
                             // Out of bounds thumbnail placeholder
                             painter.rect_filled(thub_rect, 4.0, Color32::from_rgb(8, 8, 14));
-                            painter.rect_stroke(thub_rect, 4.0, egui::Stroke::new(1.0, Color32::from_rgb(20, 19, 32)));
+                            painter.rect_stroke(thub_rect, 4.0, egui::Stroke::new(1.0, Color32::from_rgb(20, 19, 32)), egui::StrokeKind::Inside);
                             
                             if inner_height > 12.0 {
                                 painter.text(
@@ -889,6 +888,7 @@ impl eframe::App for MainApp {
                         4.0,
                         Color32::from_rgb(14, 13, 23),
                         egui::Stroke::new(1.0, Color32::from_rgb(26, 25, 43)),
+                        egui::StrokeKind::Inside,
                     );
 
                     // Synced frame calculations matching filmstrip
@@ -1049,14 +1049,13 @@ impl eframe::App for MainApp {
                     if wave_response.drag_started() || wave_response.clicked() {
                         self.playback.handle_input(media::InputEvent::ScrubDragStart);
                     }
-                    if wave_response.dragged() || wave_response.clicked() {
-                        if let Some(mouse_pos) = wave_response.interact_pointer_pos() {
+                    if (wave_response.dragged() || wave_response.clicked())
+                        && let Some(mouse_pos) = wave_response.interact_pointer_pos() {
                             let rel_x = (mouse_pos.x - wave_rect.left()).clamp(0.0, wave_rect.width());
                             let pct = rel_x / wave_rect.width();
                             let target_frame = (pct * self.playback.total_frames() as f32) as usize;
                             self.playback.handle_input(media::InputEvent::ScrubDragUpdate { target_frame });
                         }
-                    }
                     if wave_response.drag_stopped() || wave_response.clicked() {
                         self.playback.handle_input(media::InputEvent::ScrubDragEnd);
                     }
@@ -1066,14 +1065,14 @@ impl eframe::App for MainApp {
         // Egui's TopBottomPanel automatically persists the resized height in its internal memory.
         // We do not update self.timeline_height here to avoid a layout feedback loop.
 
-        egui::SidePanel::right("sidebar_deck")
+        egui::Panel::right("sidebar_deck")
             .resizable(false)
-            .default_width(300.0)
-            .frame(egui::Frame::none()
+            .default_size(300.0)
+            .frame(egui::Frame::NONE
                 .fill(Color32::from_rgb(11, 10, 18))
                 .stroke(egui::Stroke::new(1.0, Color32::from_rgb(22, 21, 38)))
-                .inner_margin(egui::Margin::same(16.0)))
-            .show(ctx, |ui| {
+                .inner_margin(egui::Margin::same(16)))
+            .show_inside(ui, |ui| {
                 ui.vertical(|ui| {
                     // Title: [snippets] ✂ and Inline Toggle Switch
                     ui.horizontal(|ui| {
@@ -1179,10 +1178,10 @@ impl eframe::App for MainApp {
 
         // 4. Central Panel: The Video Viewport Deck (Remaining center space)
         egui::CentralPanel::default()
-            .frame(egui::Frame::none()
+            .frame(egui::Frame::NONE
                 .fill(Color32::from_rgb(8, 8, 14))
-                .inner_margin(egui::Margin::same(16.0)))
-            .show(ctx, |ui| {
+                .inner_margin(egui::Margin::same(16)))
+            .show_inside(ui, |ui| {
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(4.0, 0.0);
@@ -1255,8 +1254,8 @@ impl eframe::App for MainApp {
                                 PlaybackIcon::LoadVideo,
                                 false,
                                 "Load video file",
-                            ).clicked() {
-                                if let Some(path) = rfd::FileDialog::new()
+                            ).clicked()
+                                && let Some(path) = rfd::FileDialog::new()
                                     .add_filter("Video", &["mp4", "mkv", "avi", "mov"])
                                     .pick_file()
                                 {
@@ -1266,7 +1265,6 @@ impl eframe::App for MainApp {
                                     self.in_marker = None;
                                     self.out_marker = None;
                                 }
-                            }
                         });
                     });
                     
@@ -1276,10 +1274,10 @@ impl eframe::App for MainApp {
                     let controls_height = 80.0; // Expanded to accommodate progress slider
                     let canvas_height = ui.available_height() - controls_height - 10.0;
 
-                    egui::Frame::none()
+                    egui::Frame::NONE
                         .fill(Color32::from_rgb(12, 11, 20))
                         .stroke(egui::Stroke::new(1.0, Color32::from_rgb(26, 25, 43)))
-                        .rounding(8.0)
+                        .corner_radius(8.0)
                         .show(ui, |ui| {
                             let available_space = egui::vec2(ui.available_width(), canvas_height);
                             let (rect, _response) = ui.allocate_exact_size(
@@ -1352,6 +1350,7 @@ impl eframe::App for MainApp {
                                 rect,
                                 8.0,
                                 egui::Stroke::new(1.0, Color32::from_rgba_premultiplied(99, 102, 241, 10)),
+                                egui::StrokeKind::Inside,
                             );
 
                             // Draw floating HUD overlay if enabled
@@ -1364,12 +1363,12 @@ impl eframe::App for MainApp {
                                     egui::pos2(rect.right() - margin, rect.top() + hud_height + margin),
                                 );
                                 
-                                ui.allocate_ui_at_rect(hud_rect, |ui| {
-                                    egui::Frame::none()
+                                ui.scope_builder(egui::UiBuilder::new().max_rect(hud_rect), |ui| {
+                                    egui::Frame::NONE
                                         .fill(Color32::from_rgba_unmultiplied(15, 17, 28, 235))
                                         .stroke(egui::Stroke::new(1.0, Color32::from_rgb(63, 66, 97)))
-                                        .rounding(8.0)
-                                        .inner_margin(10.0)
+                                        .corner_radius(8.0)
+                                        .inner_margin(egui::Margin::same(10))
                                         .show(ui, |ui| {
                                             ui.vertical(|ui| {
                                                 ui.horizontal(|ui| {
@@ -1452,7 +1451,7 @@ impl eframe::App for MainApp {
                                                 
                                                 let plot_painter = ui.painter_at(plot_rect);
                                                 plot_painter.rect_filled(plot_rect, 4.0, Color32::from_rgb(11, 13, 25));
-                                                plot_painter.rect_stroke(plot_rect, 4.0, egui::Stroke::new(1.0, Color32::from_rgb(39, 42, 68)));
+                                                plot_painter.rect_stroke(plot_rect, 4.0, egui::Stroke::new(1.0, Color32::from_rgb(39, 42, 68)), egui::StrokeKind::Inside);
                                                 
                                                 let zero_y = plot_rect.center().y;
                                                 plot_painter.line_segment(
@@ -1577,9 +1576,9 @@ impl eframe::App for MainApp {
                             });
                         });
 
-                        if clicked {
-                            if let (Some(inf), Some(outf)) = (self.in_marker, self.out_marker) {
-                                if inf < outf {
+                        if clicked
+                            && let (Some(inf), Some(outf)) = (self.in_marker, self.out_marker)
+                                && inf < outf {
                                     self.ranges.push(ExportRange {
                                         id: self.next_range_id,
                                         in_frame: inf,
@@ -1587,8 +1586,6 @@ impl eframe::App for MainApp {
                                     });
                                     self.next_range_id += 1;
                                 }
-                            }
-                        }
                     });
                 });
             });
@@ -1642,11 +1639,11 @@ impl eframe::egui_wgpu::CallbackTrait for YuvCallback {
         vec![]
     }
 
-    fn paint<'a>(
-        &'a self,
+    fn paint(
+        &self,
         info: egui::PaintCallbackInfo,
-        render_pass: &mut eframe::wgpu::RenderPass<'a>,
-        callback_resources: &'a eframe::egui_wgpu::CallbackResources,
+        render_pass: &mut eframe::wgpu::RenderPass<'static>,
+        callback_resources: &eframe::egui_wgpu::CallbackResources,
     ) {
         let viewport = info.viewport_in_pixels();
         let _clip_rect = info.clip_rect_in_pixels();

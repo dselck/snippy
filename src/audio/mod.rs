@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::{storage::Heap, traits::*, CachingProd, SharedRb};
 use std::sync::Arc;
@@ -21,7 +22,7 @@ impl AudioEngine {
             .ok_or_else(|| anyhow::anyhow!("No default output audio device found"))?;
 
         let config = device.default_output_config()?;
-        let sample_rate = config.sample_rate().0;
+        let sample_rate = config.sample_rate();
         let channels = config.channels() as usize;
 
         // Create a thread-safe ring buffer for sending decoded float samples to CPAL

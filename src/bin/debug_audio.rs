@@ -39,6 +39,6 @@ fn main() {
         println!("TAG: gen={}, idx={}, pts_us={}", tag_generation, idx, pts);
     }
     let mut num_samples = 0;
-    while let Some(_) = audio_cons.try_pop() { num_samples += 1; }
+    while audio_cons.try_pop().is_some() { num_samples += 1; }
     println!("Audio samples in queue: {}", num_samples);
 }

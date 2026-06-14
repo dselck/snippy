@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity, clippy::too_many_arguments)]
 use crossbeam_channel::{Receiver, Sender};
 use std::path::Path;
 use std::sync::Arc;
@@ -212,37 +213,50 @@ fn run_decoding_loop(
         if let Some(timeout) = active_wakeup {
             let wait_timeout = timeout.min(std::time::Duration::from_millis(10));
             if wait_timeout > std::time::Duration::from_millis(1) {
-                crossbeam_channel::select! {
-                    recv(background_rx) -> cmd => {
-                        if let Ok(c) = cmd { events.push(c); } else { return Ok(()); }
-                    }
-                    recv(play_queue_rx) -> frame => {
-                        if let Ok(f) = frame { events.push(MediaCommand::PlayUnpaced { sequence_id: 999999 }); /* hack to pass frame */
-                            match &mut state {
-                                PresenterState::Playing | PresenterState::PlayingUnpaced { .. } => {
-                                    lookahead_queue.push_back(f);
-                                }
-                                PresenterState::Seeking { target_frame_idx, sequence_id, resume_playing_after } => {
-                                    if f.sequence_id() == *sequence_id {
-                                        if let Some(target_idx) = *target_frame_idx {
-                                            let f_idx = f.frame_idx();
-                                            let _ = frame_tx.try_send(f.clone());
-                                            if f_idx >= target_idx {
-                                                *target_frame_idx = None;
+                if lookahead_queue.len() < 4 {
+                    crossbeam_channel::select! {
+                        recv(background_rx) -> cmd => {
+                            if let Ok(c) = cmd { events.push(c); } else { return Ok(()); }
+                        }
+                        recv(play_queue_rx) -> frame => {
+                            if let Ok(f) = frame { events.push(MediaCommand::PlayUnpaced { sequence_id: 999999 }); /* hack to pass frame */
+                                match &mut state {
+                                    PresenterState::Playing | PresenterState::PlayingUnpaced { .. } => {
+                                        lookahead_queue.push_back(f);
+                                    }
+                                    PresenterState::Seeking { target_frame_idx, sequence_id, resume_playing_after } => {
+                                        if f.sequence_id() == *sequence_id {
+                                            if let Some(target_idx) = *target_frame_idx {
+                                                let f_idx = f.frame_idx();
+                                                let _ = frame_tx.try_send(f.clone());
+                                                if f_idx >= target_idx {
+                                                    *target_frame_idx = None;
+                                                }
+                                            }
+                                            if target_frame_idx.is_none() {
+                                                if *resume_playing_after {
+                                                    state = PresenterState::Playing;
+                                                    sync_engine.reset();
+                                                    let _ = decoder_cmd_tx.send(MediaCommand::Play);
+                                                } else {
+                                                    state = PresenterState::Paused;
+                                                }
                                             }
                                         }
-                                        if *resume_playing_after {
-                                            state = PresenterState::Playing;
-                                            sync_engine.reset();
-                                            let _ = decoder_cmd_tx.send(MediaCommand::Play);
-                                        }
                                     }
+                                    PresenterState::Paused => {}
                                 }
-                                PresenterState::Paused => {}
-                            }
-                        } else { return Ok(()); }
+                            } else { return Ok(()); }
+                        }
+                        default(wait_timeout) => {}
                     }
-                    default(wait_timeout) => {}
+                } else {
+                    crossbeam_channel::select! {
+                        recv(background_rx) -> cmd => {
+                            if let Ok(c) = cmd { events.push(c); } else { return Ok(()); }
+                        }
+                        default(wait_timeout) => {}
+                    }
                 }
             }
         } else {
@@ -259,40 +273,49 @@ fn run_decoding_loop(
                         }
                         recv(play_queue_rx) -> f_res => {
                             if let Ok(f) = f_res {
-                                match &mut state {
-                                    PresenterState::Seeking { target_frame_idx, sequence_id, resume_playing_after } => {
-                                        if f.sequence_id() == *sequence_id {
-                                            if let Some(target_idx) = *target_frame_idx {
-                                                let f_idx = f.frame_idx();
-                                                let _ = frame_tx.try_send(f.clone());
-                                                if f_idx >= target_idx {
-                                                    *target_frame_idx = None;
-                                                }
+                                if let PresenterState::Seeking { target_frame_idx, sequence_id, resume_playing_after } = &mut state
+                                    && f.sequence_id() == *sequence_id {
+                                        if let Some(target_idx) = *target_frame_idx {
+                                            let f_idx = f.frame_idx();
+                                            let _ = frame_tx.try_send(f.clone());
+                                            if f_idx >= target_idx {
+                                                *target_frame_idx = None;
                                             }
+                                        }
+                                        if target_frame_idx.is_none() {
                                             if *resume_playing_after {
                                                 state = PresenterState::Playing;
                                                 sync_engine.reset();
                                                 let _ = decoder_cmd_tx.send(MediaCommand::Play);
+                                            } else {
+                                                state = PresenterState::Paused;
                                             }
                                         }
                                     }
-                                    _ => {}
-                                }
                             } else { return Ok(()); }
                         }
                     }
                 }
                 _ => {
-                    crossbeam_channel::select! {
-                        recv(background_rx) -> cmd => {
-                            if let Ok(c) = cmd { events.push(c); } else { return Ok(()); }
+                    if lookahead_queue.len() < 4 {
+                        crossbeam_channel::select! {
+                            recv(background_rx) -> cmd => {
+                                if let Ok(c) = cmd { events.push(c); } else { return Ok(()); }
+                            }
+                            recv(play_queue_rx) -> f_res => {
+                                if let Ok(f) = f_res {
+                                    lookahead_queue.push_back(f);
+                                } else { return Ok(()); }
+                            }
+                            default(std::time::Duration::from_millis(2)) => {}
                         }
-                        recv(play_queue_rx) -> f_res => {
-                            if let Ok(f) = f_res {
-                                lookahead_queue.push_back(f);
-                            } else { return Ok(()); }
+                    } else {
+                        crossbeam_channel::select! {
+                            recv(background_rx) -> cmd => {
+                                if let Ok(c) = cmd { events.push(c); } else { return Ok(()); }
+                            }
+                            default(std::time::Duration::from_millis(2)) => {}
                         }
-                        default(std::time::Duration::from_millis(2)) => {}
                     }
                 }
             }
@@ -323,11 +346,19 @@ fn run_decoding_loop(
                     let _ = decoder_cmd_tx.send(MediaCommand::PlayUnpaced { sequence_id });
                 }
                 MediaCommand::Pause => {
-                    state = PresenterState::Paused;
-                    lookahead_queue.clear();
-                    current_frame = None;
-                    while play_queue_rx.try_recv().is_ok() {}
-                    let _ = decoder_cmd_tx.send(MediaCommand::Pause);
+                    match &mut state {
+                        PresenterState::Seeking { resume_playing_after, .. } => {
+                            *resume_playing_after = false;
+                            let _ = decoder_cmd_tx.send(MediaCommand::Pause);
+                        }
+                        _ => {
+                            state = PresenterState::Paused;
+                            lookahead_queue.clear();
+                            current_frame = None;
+                            while play_queue_rx.try_recv().is_ok() {}
+                            let _ = decoder_cmd_tx.send(MediaCommand::Pause);
+                        }
+                    }
                 }
                 MediaCommand::Seek { frame_index, keyframe_only, sequence_id, audio_enabled } => {
                     let resume_playing_after = match state {
@@ -355,11 +386,10 @@ fn run_decoding_loop(
 
         // Evaluate frames presentation loop
         loop {
-            if current_frame.is_none() {
-                if matches!(state, PresenterState::Playing | PresenterState::PlayingUnpaced { .. }) {
+            if current_frame.is_none()
+                && matches!(state, PresenterState::Playing | PresenterState::PlayingUnpaced { .. }) {
                     current_frame = lookahead_queue.pop_front();
                 }
-            }
 
             if let Some(frame) = &current_frame {
                 match state {
@@ -545,12 +575,11 @@ fn run_decoder_thread(
 
                     let handled = video_pipeline.seek(frame_index, keyframe_only, sequence_id, audio_enabled);
 
-                    if let Some(audio_pipeline) = audio_pipeline_opt.as_mut() {
-                        if audio_enabled {
+                    if let Some(audio_pipeline) = audio_pipeline_opt.as_mut()
+                        && audio_enabled {
                             audio_pipeline.handle_seek(frame_index as f64 / fps);
                             master_clock.inc_playback_generation();
                         }
-                    }
 
                     if handled {
                         if let Some(frame) = video_pipeline.get_cached_frame(frame_index) {
@@ -568,7 +597,8 @@ fn run_decoder_thread(
         }
 
         if let Some(pts) = seek_demuxer_pts.take() {
-            let _ = input.seek(pts, 0..pts);
+            let pts_us = (pts as f64 * video_time_base_f64 * 1_000_000.0).round() as i64;
+            let _ = input.seek(pts_us, ..pts_us);
             packets_iter = input.packets();
         }
 
@@ -581,30 +611,26 @@ fn run_decoder_thread(
             
             let queue_needs_frames = video_sink.needs_frames() || audio_needs_frames;
             
-            if queue_needs_frames {
-                if let Some(packet_res) = packets_iter.next() {
+            if queue_needs_frames
+                && let Some(packet_res) = packets_iter.next() {
                     let (stream, packet) = packet_res;
                     let stream_index = stream.index();
                     if stream_index == video_stream_index {
                         if let Ok(frames) = video_pipeline.process_packet(&packet) {
                             video_sink.push(frames);
                         }
-                    } else if Some(stream_index) == audio_stream_index_opt && audio_enabled {
-                        if let Some(audio_pipeline) = audio_pipeline_opt.as_mut() {
+                    } else if Some(stream_index) == audio_stream_index_opt && audio_enabled
+                        && let Some(audio_pipeline) = audio_pipeline_opt.as_mut() {
                             if let Some(pts) = packet.pts() {
                                 audio_pipeline.update_current_time_from_pts(pts);
                             }
-                            if audio_pipeline.send_packet(&packet).is_ok() {
-                                if let Ok(chunks) = audio_pipeline.receive_samples() {
-                                    if let Some(sink) = audio_sink_opt.as_mut() {
+                            if audio_pipeline.send_packet(&packet).is_ok()
+                                && let Ok(chunks) = audio_pipeline.receive_samples()
+                                    && let Some(sink) = audio_sink_opt.as_mut() {
                                         sink.push(chunks);
                                     }
-                                }
-                            }
                         }
-                    }
                 }
-            }
         }
     }
 }

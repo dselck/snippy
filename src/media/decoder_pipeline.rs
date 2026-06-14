@@ -11,7 +11,7 @@ pub enum DecodeError {
 pub trait DecoderAdapter {
     fn send_packet(&mut self, packet: &Packet) -> Result<(), DecodeError>;
     fn receive_frame(&mut self) -> Result<Option<DecodedFrame>, DecodeError>;
-    fn flush(&mut self);
+    fn flush(&mut self, fallback_frame_idx: usize);
 }
 
 pub struct VideoDecoderPipeline {
@@ -135,7 +135,7 @@ impl VideoDecoderPipeline {
         self.play_mode = false;
         self.seek_target_frame = Some(frame_index);
         
-        self.adapter.flush();
+        self.adapter.flush(target_kf);
         
         self.decode_more = true;
         self.last_decoded_frame = None;
@@ -204,5 +204,138 @@ impl VideoDecoderPipeline {
         }
         
         Ok(frames)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MockDecoderAdapter {
+        fallback_frame_idx: usize,
+        has_frame: bool,
+        is_gpu: bool,
+    }
+
+    impl DecoderAdapter for MockDecoderAdapter {
+        fn send_packet(&mut self, _packet: &ffmpeg_next::Packet) -> Result<(), DecodeError> {
+            self.has_frame = true;
+            Ok(())
+        }
+
+        fn receive_frame(&mut self) -> Result<Option<DecodedFrame>, DecodeError> {
+            if !self.has_frame {
+                return Ok(None);
+            }
+            self.has_frame = false;
+            let pts_sec = self.fallback_frame_idx as f64 / 24.0;
+            let frame_idx = (pts_sec * 24.0).round() as usize;
+            self.fallback_frame_idx = frame_idx + 1;
+
+            if self.is_gpu {
+                Ok(Some(DecodedFrame::Gpu {
+                    frame_idx,
+                    descriptor: crate::media::types::GpuFrameDescriptor::CVPixelBuffer(std::ptr::null()),
+                    sequence_id: 0,
+                    pts_sec,
+                    color_space: ffmpeg_next::color::Space::Unspecified,
+                    color_range: ffmpeg_next::color::Range::Unspecified,
+                }))
+            } else {
+                Ok(Some(DecodedFrame::Cpu {
+                    frame_idx,
+                    planes: std::sync::Arc::new(crate::media::types::YuvPlanes::default()),
+                    sequence_id: 0,
+                    pts_sec,
+                    color_space: ffmpeg_next::color::Space::Unspecified,
+                    color_range: ffmpeg_next::color::Range::Unspecified,
+                }))
+            }
+        }
+
+        fn flush(&mut self, fallback_frame_idx: usize) {
+            self.fallback_frame_idx = fallback_frame_idx;
+        }
+    }
+
+    fn run_seek_backward_bug_frame_by_frame(is_gpu: bool) {
+        let adapter = Box::new(MockDecoderAdapter { fallback_frame_idx: 0, has_frame: false, is_gpu });
+        let keyframes = vec![0, 50, 100];
+        let mut pipeline = VideoDecoderPipeline::new(adapter, keyframes);
+
+        // 1. Simulate normal playback up to frame 60
+        pipeline.play();
+        let packet = unsafe { std::mem::zeroed() };
+        for i in 0..60 {
+            let frames = pipeline.process_packet(&packet).unwrap();
+            assert!(!frames.is_empty());
+            assert_eq!(frames[0].frame_idx(), i);
+        }
+
+        // 2. Pause and then seek backward to frame 49 (cross GOP boundary to force cache miss)
+        pipeline.pause();
+        // Seek backward to 49. Nearest keyframe is 0.
+        let handled = pipeline.seek(49, false, 1, false);
+        assert!(!handled, "Should require a hard seek");
+
+        // The first frame decoded from the keyframe position (0) should be physically frame 0.
+        // With the fix, the adapter's fallback_frame_idx is correctly reset to 0 on flush,
+        // so it continues decoding sequentially and returns frame 49.
+        let mut decoded_frames = Vec::new();
+        // We need to send packets to drive decoding from 0 to 49.
+        for _ in 0..=49 {
+            let frames = pipeline.process_packet(&packet).unwrap();
+            decoded_frames.extend(frames);
+        }
+        
+        assert!(!decoded_frames.is_empty());
+        assert_eq!(decoded_frames.last().unwrap().frame_idx(), 49, "Asserting fixed behavior: seeks backwards correctly");
+    }
+
+    #[test]
+    fn test_seek_backward_bug_frame_by_frame_cpu() {
+        run_seek_backward_bug_frame_by_frame(false);
+    }
+
+    #[test]
+    fn test_seek_backward_bug_frame_by_frame_gpu() {
+        run_seek_backward_bug_frame_by_frame(true);
+    }
+
+    fn run_scrub_forward_stuck_bug(is_gpu: bool) {
+        let adapter = Box::new(MockDecoderAdapter { fallback_frame_idx: 0, has_frame: false, is_gpu });
+        let keyframes = vec![0, 50, 100];
+        let mut pipeline = VideoDecoderPipeline::new(adapter, keyframes);
+
+        // 1. Play slightly to frame 5
+        pipeline.play();
+        let packet = unsafe { std::mem::zeroed() };
+        for i in 0..5 {
+            let frames = pipeline.process_packet(&packet).unwrap();
+            assert!(!frames.is_empty());
+            assert_eq!(frames[0].frame_idx(), i);
+        }
+
+        // 2. Scrub forward to frame 80 (keyframe_only = true)
+        pipeline.pause();
+        let handled = pipeline.seek(80, true, 2, false);
+        assert!(!handled);
+
+        // Demuxer seeks to nearest keyframe (50). The first decoded frame is physically 50.
+        // With the fix, the adapter's fallback_frame_idx is reset to 50, so it computes index 50
+        // and returns it (keyframe_only is true).
+        let frames = pipeline.process_packet(&packet).unwrap();
+        assert!(!frames.is_empty());
+        assert_eq!(frames[0].frame_idx(), 50, "Asserting fixed behavior: scrubbing returns keyframe 50");
+    }
+
+    #[test]
+    fn test_scrub_forward_stuck_bug_cpu() {
+        run_scrub_forward_stuck_bug(false);
+    }
+
+    #[test]
+    fn test_scrub_forward_stuck_bug_gpu() {
+        run_scrub_forward_stuck_bug(true);
     }
 }
