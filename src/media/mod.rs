@@ -23,6 +23,8 @@ pub use crate::media::types::*;
 pub use crate::media::cache::*;
 pub mod session;
 pub use crate::media::session::*;
+pub mod thumbnails;
+pub use thumbnails::*;
 
 pub use crate::media::decoder_pipeline::*;
 pub use crate::media::ffmpeg_adapter::*;
