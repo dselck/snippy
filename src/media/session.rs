@@ -51,11 +51,21 @@ pub struct PlaybackSession {
 
     arrow_seek_state: ArrowSeekState,
     is_scrubbing: bool,
+
+    pub(crate) thumbnail_tx: Option<Sender<crate::media::ThumbnailCommand>>,
+    pub(crate) thumbnail_rx: Option<Receiver<crate::media::ThumbnailResponse>>,
+    thumbnail_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Default for PlaybackSession {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for PlaybackSession {
+    fn drop(&mut self) {
+        self.shutdown_thumbnail_thread();
     }
 }
 
@@ -105,10 +115,24 @@ impl PlaybackSession {
             audio_consumer: None,
             arrow_seek_state: ArrowSeekState::Idle,
             is_scrubbing: false,
+            thumbnail_tx: None,
+            thumbnail_rx: None,
+            thumbnail_thread: None,
         }
     }
 
+    pub fn shutdown_thumbnail_thread(&mut self) {
+        if let Some(tx) = self.thumbnail_tx.take() {
+            drop(tx);
+        }
+        if let Some(handle) = self.thumbnail_thread.take() {
+            let _ = handle.join();
+        }
+        self.thumbnail_rx = None;
+    }
+
     pub fn load_video(&mut self, path: &str) {
+        self.shutdown_thumbnail_thread();
         if let Ok(mut ae) = AudioEngine::new() {
             let channels = ae.channels;
             let audio_tx = ae.tx.take().unwrap();
@@ -131,11 +155,22 @@ impl PlaybackSession {
                 self.total_frames = meta.total_frames;
                 self.media_tx = Some(engine.tx.clone());
                 self.media_engine = Some(engine);
-                self.metadata = Some(meta);
+                self.metadata = Some(meta.clone());
                 self.frame_rx = Some(frame_rx);
                 self.master_clock = Some(master_clock);
                 self.audio_engine = Some(ae);
                 self.audio_consumer = None;
+
+                let (t_tx, t_rx, t_handle) = crate::media::spawn_thumbnail_decoder(
+                    path.to_string(),
+                    meta.keyframes.clone(),
+                    meta.keyframes_pts.clone(),
+                    meta.fps,
+                );
+                self.thumbnail_tx = Some(t_tx);
+                self.thumbnail_rx = Some(t_rx);
+                self.thumbnail_thread = Some(t_handle);
+
                 self.seek_internal(0, false, true);
             }
         } else {
@@ -255,11 +290,22 @@ impl PlaybackSession {
                 self.total_frames = meta.total_frames;
                 self.media_tx = Some(engine.tx.clone());
                 self.media_engine = Some(engine);
-                self.metadata = Some(meta);
+                self.metadata = Some(meta.clone());
                 self.frame_rx = Some(frame_rx);
                 self.master_clock = Some(master_clock);
                 self.audio_engine = None;
                 self.audio_consumer = Some(audio_consumer);
+
+                let (t_tx, t_rx, t_handle) = crate::media::spawn_thumbnail_decoder(
+                    path.to_string(),
+                    meta.keyframes.clone(),
+                    meta.keyframes_pts.clone(),
+                    meta.fps,
+                );
+                self.thumbnail_tx = Some(t_tx);
+                self.thumbnail_rx = Some(t_rx);
+                self.thumbnail_thread = Some(t_handle);
+
                 self.seek_internal(0, false, true);
             }
         }
