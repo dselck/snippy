@@ -61,6 +61,7 @@ pub struct MainApp {
     pub in_flight_requests: std::collections::HashSet<usize>,
     pub is_dragging_filmstrip: bool,
     pub last_zoom_level: f32,
+    pub last_thumbnail_height: f32,
 }
 
 impl MainApp {
@@ -112,6 +113,7 @@ impl MainApp {
             in_flight_requests: std::collections::HashSet::new(),
             is_dragging_filmstrip: false,
             last_zoom_level: 0.0,
+            last_thumbnail_height: 0.0,
         }
     }
 
@@ -769,6 +771,17 @@ impl eframe::App for MainApp {
 
                     let sprocket_height = 8.0;
                     let inner_height = (filmstrip_height - (sprocket_height * 2.0)).max(10.0);
+
+                    // Check if inner_height has changed significantly
+                    let height_diff = (inner_height - self.last_thumbnail_height).abs();
+                    if height_diff > 4.0 {
+                        self.last_thumbnail_height = inner_height;
+                        self.thumbnail_cache.clear();
+                        self.in_flight_requests.clear();
+                        if let Some(tx) = self.playback.thumbnail_tx.as_ref() {
+                            let _ = tx.send(crate::media::ThumbnailCommand::Clear);
+                        }
+                    }
 
                     let inner_rect = egui::Rect::from_min_max(
                         egui::pos2(filmstrip_rect.left(), filmstrip_rect.top() + sprocket_height),
