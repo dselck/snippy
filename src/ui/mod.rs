@@ -3,6 +3,8 @@ pub mod yuv_renderer;
 use crate::media;
 use eframe::egui;
 use eframe::egui::Color32;
+use lru::LruCache;
+use std::num::NonZeroUsize;
 
 
 pub struct ExportRange {
@@ -57,7 +59,8 @@ pub struct MainApp {
     pub decode_fps_last_reset: std::time::Instant,
     pub decode_fps: f32,
 
-    pub thumbnail_cache: std::collections::HashMap<usize, egui::TextureHandle>,
+    pub thumbnail_cache: LruCache<usize, egui::TextureHandle>,
+    pub thumbnails_dirty: bool,
     pub in_flight_requests: std::collections::HashMap<usize, std::time::Instant>,
     pub is_dragging_filmstrip: bool,
     pub last_zoom_level: f32,
@@ -109,7 +112,8 @@ impl MainApp {
             decode_fps_frame_count: 0,
             decode_fps_last_reset: std::time::Instant::now(),
             decode_fps: 0.0,
-            thumbnail_cache: std::collections::HashMap::new(),
+            thumbnail_cache: LruCache::new(NonZeroUsize::new(300).unwrap()),
+            thumbnails_dirty: true,
             in_flight_requests: std::collections::HashMap::new(),
             is_dragging_filmstrip: false,
             last_zoom_level: 0.0,
@@ -691,24 +695,25 @@ impl eframe::App for MainApp {
                     [resp.width as usize, resp.height as usize],
                     &resp.rgba_data,
                 );
-                let texture_handle = ctx.load_texture(
-                    format!("thumb_{}", resp.frame_idx),
+                // Load once — TextureHandle is Arc-backed; clones share one GPU allocation.
+                let texture = ctx.load_texture(
+                    format!("thumb_{}", resp.served_frames.first().copied().unwrap_or(0)),
                     color_image,
                     egui::TextureOptions::LINEAR,
                 );
-                self.thumbnail_cache.insert(resp.frame_idx, texture_handle);
-                self.in_flight_requests.remove(&resp.frame_idx);
+                for frame_idx in &resp.served_frames {
+                    self.thumbnail_cache.put(*frame_idx, texture.clone());
+                    self.in_flight_requests.remove(frame_idx);
+                }
             }
         }
 
-        // Inside App::ui, detect zoom change:
+        // Detect zoom change — LRU handles eviction naturally; no cache wipe needed.
         let has_zoomed = (self.zoom_level - self.last_zoom_level).abs() > 0.01;
         if has_zoomed {
             self.last_zoom_level = self.zoom_level;
             self.in_flight_requests.clear();
-            if let Some(tx) = self.playback.thumbnail_tx.as_ref() {
-                let _ = tx.send(crate::media::ThumbnailCommand::Clear);
-            }
+            self.thumbnails_dirty = true;
         }
 
         // 2. Bottom Panel: Timeline and Waveform Deck (Full width)
@@ -777,11 +782,8 @@ impl eframe::App for MainApp {
 
                     if (bucketed_height - self.last_thumbnail_height).abs() > 0.01 {
                         self.last_thumbnail_height = bucketed_height;
-                        self.thumbnail_cache.clear();
                         self.in_flight_requests.clear();
-                        if let Some(tx) = self.playback.thumbnail_tx.as_ref() {
-                            let _ = tx.send(crate::media::ThumbnailCommand::Clear);
-                        }
+                        self.thumbnails_dirty = true;
                     }
 
                     let inner_rect = egui::Rect::from_min_max(
@@ -842,27 +844,10 @@ impl eframe::App for MainApp {
                     let first_k = (left_bound / step_width as f64).floor() as isize;
                     let last_k = (right_bound / step_width as f64).ceil() as isize;
 
-                    // Collect all frames in the active zone (visible +/- 2 padding)
-                    let padding = 2;
-                    let start_k = (first_k - padding).max(0);
-                    let end_k = last_k + padding;
-                    let mut active_zone_frames = std::collections::HashSet::new();
-                    for k in start_k..=end_k {
-                        let target_time = k as f64 * interval;
-                        if target_time > duration_sec { break; }
-                        let target_frame = (target_time * fps).round() as usize;
-                        if target_frame >= total_frames { continue; }
-                        active_zone_frames.insert(target_frame);
-                    }
-
-                    // Clean up in-flight requests that are out of zone or timed out (> 2 seconds)
                     let now = std::time::Instant::now();
-                    self.in_flight_requests.retain(|frame_idx, request_time| {
-                        active_zone_frames.contains(frame_idx) && now.duration_since(*request_time) < std::time::Duration::from_secs(2)
-                    });
 
-                    let mut requested_frames = Vec::new();
-
+                    // --- Render visible slots, collect uncached frame indices ---
+                    let mut visible_frames: Vec<usize> = Vec::new();
                     for k in first_k..=last_k {
                         if k < 0 { continue; }
                         let target_time = k as f64 * interval;
@@ -870,13 +855,12 @@ impl eframe::App for MainApp {
                         let target_frame = (target_time * fps).round() as usize;
                         if target_frame >= total_frames { continue; }
 
-                        let tx = scroll_offset_x + (k as f64 * step_width as f64);
+                        let tx_px = scroll_offset_x + (k as f64 * step_width as f64);
                         let thub_rect = egui::Rect::from_min_size(
-                            egui::pos2(tx as f32, inner_rect.top()),
+                            egui::pos2(tx_px as f32, inner_rect.top()),
                             egui::vec2(actual_thumb_width, thumb_height),
                         );
 
-                        // Handle rendering
                         if let Some(texture) = self.thumbnail_cache.get(&target_frame) {
                             // Draw decoded thumbnail image
                             painter.image(
@@ -898,14 +882,12 @@ impl eframe::App for MainApp {
                                     Color32::from_rgb(45, 43, 75),
                                 );
                             }
-
-                            // Request first-priority visible frames if they are not in flight or cached
-                            if !self.thumbnail_cache.contains_key(&target_frame) && !self.in_flight_requests.contains_key(&target_frame) {
-                                requested_frames.push(target_frame);
+                            if !self.in_flight_requests.contains_key(&target_frame) {
+                                visible_frames.push(target_frame);
                                 self.in_flight_requests.insert(target_frame, now);
                             }
                         }
-                        
+
                         // Underlay timecode
                         if inner_height > 12.0 {
                             let time_text = self.frame_to_time(target_frame);
@@ -919,23 +901,41 @@ impl eframe::App for MainApp {
                         }
                     }
 
-                    // Request other non-visible but in-zone frames
-                    for target_frame in &active_zone_frames {
-                        if !self.thumbnail_cache.contains_key(target_frame) && !self.in_flight_requests.contains_key(target_frame) {
-                            requested_frames.push(*target_frame);
-                            self.in_flight_requests.insert(*target_frame, now);
-                        }
+                    // --- Collect padding frame slots (±2 beyond visible) ---
+                    let padding = 2isize;
+                    let mut padding_frames: Vec<usize> = Vec::new();
+                    for k in ((first_k - padding).max(0)..first_k)
+                        .chain((last_k + 1)..=(last_k + padding))
+                    {
+                        if k < 0 { continue; }
+                        let target_time = k as f64 * interval;
+                        if target_time > duration_sec { continue; }
+                        let target_frame = (target_time * fps).round() as usize;
+                        if target_frame >= total_frames { continue; }
+                        if self.thumbnail_cache.peek(&target_frame).is_some() { continue; }
+                        if self.in_flight_requests.contains_key(&target_frame) { continue; }
+                        padding_frames.push(target_frame);
+                        self.in_flight_requests.insert(target_frame, now);
                     }
 
-                    // Send request batch if present
-                    if !requested_frames.is_empty() {
+                    // --- Expire timed-out in-flight requests (allow retry after 2s) ---
+                    self.in_flight_requests.retain(|_, t| now.duration_since(*t) < std::time::Duration::from_secs(2));
+
+                    // --- Dirty flag: set if there is uncached work to dispatch ---
+                    if !visible_frames.is_empty() || !padding_frames.is_empty() {
+                        self.thumbnails_dirty = true;
+                    }
+
+                    // --- Send ONE request batch per dirty repaint (debounce) ---
+                    if self.thumbnails_dirty {
                         if let Some(tx) = self.playback.thumbnail_tx.as_ref() {
-                            let clamped_height = bucketed_height as u32;
-                            let _ = tx.send(crate::media::ThumbnailCommand::Request { 
-                                frames: requested_frames, 
-                                height: clamped_height 
+                            let _ = tx.send(crate::media::ThumbnailCommand::Request {
+                                visible_frames,
+                                padding_frames,
+                                height: bucketed_height as u32,
                             });
                         }
+                        self.thumbnails_dirty = false;
                     }
 
                     // Step 5: Drag-to-Scrub Mouse Interaction

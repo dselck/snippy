@@ -54,7 +54,7 @@ pub struct PlaybackSession {
 
     pub(crate) thumbnail_tx: Option<Sender<crate::media::ThumbnailCommand>>,
     pub(crate) thumbnail_rx: Option<Receiver<crate::media::ThumbnailResponse>>,
-    thumbnail_thread: Option<thread::JoinHandle<()>>,
+    thumbnail_threads: Vec<thread::JoinHandle<()>>,
 }
 
 impl Default for PlaybackSession {
@@ -117,18 +117,17 @@ impl PlaybackSession {
             is_scrubbing: false,
             thumbnail_tx: None,
             thumbnail_rx: None,
-            thumbnail_thread: None,
+            thumbnail_threads: Vec::new(),
         }
     }
 
     pub fn shutdown_thumbnail_thread(&mut self) {
-        if let Some(tx) = self.thumbnail_tx.take() {
-            drop(tx);
-        }
-        if let Some(handle) = self.thumbnail_thread.take() {
+        // Dropping the sender signals the coordinator to exit.
+        drop(self.thumbnail_tx.take());
+        self.thumbnail_rx = None;
+        for handle in self.thumbnail_threads.drain(..) {
             let _ = handle.join();
         }
-        self.thumbnail_rx = None;
     }
 
     pub fn load_video(&mut self, path: &str) {
@@ -161,7 +160,7 @@ impl PlaybackSession {
                 self.audio_engine = Some(ae);
                 self.audio_consumer = None;
 
-                let (t_tx, t_rx, t_handle) = crate::media::spawn_thumbnail_decoder(
+                let (t_tx, t_rx, t_handles) = crate::media::spawn_thumbnail_decoder_pool(
                     path.to_string(),
                     meta.keyframes.clone(),
                     meta.keyframes_pts.clone(),
@@ -169,7 +168,7 @@ impl PlaybackSession {
                 );
                 self.thumbnail_tx = Some(t_tx);
                 self.thumbnail_rx = Some(t_rx);
-                self.thumbnail_thread = Some(t_handle);
+                self.thumbnail_threads = t_handles;
 
                 self.seek_internal(0, false, true);
             }
@@ -296,7 +295,7 @@ impl PlaybackSession {
                 self.audio_engine = None;
                 self.audio_consumer = Some(audio_consumer);
 
-                let (t_tx, t_rx, t_handle) = crate::media::spawn_thumbnail_decoder(
+                let (t_tx, t_rx, t_handles) = crate::media::spawn_thumbnail_decoder_pool(
                     path.to_string(),
                     meta.keyframes.clone(),
                     meta.keyframes_pts.clone(),
@@ -304,7 +303,7 @@ impl PlaybackSession {
                 );
                 self.thumbnail_tx = Some(t_tx);
                 self.thumbnail_rx = Some(t_rx);
-                self.thumbnail_thread = Some(t_handle);
+                self.thumbnail_threads = t_handles;
 
                 self.seek_internal(0, false, true);
             }

@@ -99,3 +99,15 @@ _Avoid_: Unbounded caching, unconstrained queueing
 **Microsecond Seek Target**:
 The rescaled target timestamp (in microseconds, using `AV_TIME_BASE`) passed to the input container during a seek operation, converting it from the stream-specific timebase to prevent seeking errors.
 _Avoid_: Raw packet PTS seeks, unscaled seeks
+
+**Thumbnail Decoder Pool**:
+The set of N independent background threads that decode thumbnail GOPs in parallel, each owning its own FFmpeg input context and decoder state.
+_Avoid_: Shared decoder, single thumbnail thread
+
+**GOP Work Item**:
+A unit of work dispatched to a Thumbnail Decoder Pool worker: one keyframe seek target plus the list of `target_frames` to harvest in a single forward decode pass.
+_Avoid_: Thumbnail task, decode job
+
+**Thumbnail LRU Cache**:
+The bounded `LruCache<usize, TextureHandle>` in the UI thread that evicts least-recently-accessed thumbnails when the entry count exceeds 300.
+_Avoid_: Thumbnail HashMap, texture store
