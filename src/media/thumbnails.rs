@@ -71,9 +71,6 @@ fn group_frames_by_gop(
         .collect()
 }
 
-// TODO(config): expose THUMBNAIL_DECODER_THREADS as a user-configurable setting.
-const THUMBNAIL_DECODER_THREADS: usize = 4;
-
 /// Spawns a coordinator thread plus N independent worker threads.
 /// Returns the command sender, response receiver, and all thread handles.
 pub fn spawn_thumbnail_decoder_pool(
@@ -81,6 +78,8 @@ pub fn spawn_thumbnail_decoder_pool(
     keyframes: Vec<usize>,
     keyframes_pts: Vec<i64>,
     fps: f64,
+    thread_count: usize,
+    hw_accel: bool,
 ) -> (Sender<ThumbnailCommand>, Receiver<ThumbnailResponse>, Vec<thread::JoinHandle<()>>) {
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<ThumbnailCommand>();
     let (resp_tx, resp_rx) = crossbeam_channel::bounded::<ThumbnailResponse>(200);
@@ -94,17 +93,17 @@ pub fn spawn_thumbnail_decoder_pool(
     let work_queue: Arc<crossbeam_queue::SegQueue<GopWorkItem>> =
         Arc::new(crossbeam_queue::SegQueue::new());
 
-    let mut handles: Vec<thread::JoinHandle<()>> = Vec::with_capacity(THUMBNAIL_DECODER_THREADS + 1);
+    let mut handles: Vec<thread::JoinHandle<()>> = Vec::with_capacity(thread_count + 1);
 
     // Spawn N worker threads first (each owns its own FFmpeg context).
-    for _ in 0..THUMBNAIL_DECODER_THREADS {
+    for _ in 0..thread_count {
         let work_queue = Arc::clone(&work_queue);
         let generation = Arc::clone(&generation);
         let shutdown = Arc::clone(&shutdown);
         let resp_tx = resp_tx.clone();
         let path = path.clone();
         handles.push(thread::spawn(move || {
-            worker_thread(path, fps, work_queue, generation, shutdown, resp_tx);
+            worker_thread(path, fps, work_queue, generation, shutdown, resp_tx, hw_accel);
         }));
     }
 
@@ -168,6 +167,7 @@ fn worker_thread(
     generation: Arc<AtomicU64>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     resp_tx: Sender<ThumbnailResponse>,
+    hw_accel: bool,
 ) {
     // Each worker owns its own independent FFmpeg input context and decoder.
     let mut input = match ffmpeg_next::format::input(&path) {
@@ -204,21 +204,23 @@ fn worker_thread(
         Ok(c) => c,
         Err(_) => return,
     };
-    unsafe {
-        let mut hw_device_ctx: *mut ffmpeg_next::sys::AVBufferRef = std::ptr::null_mut();
-        #[cfg(target_os = "macos")]
-        let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
-        #[cfg(target_os = "windows")]
-        let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
-        #[cfg(target_os = "linux")]
-        let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI;
-        let res = ffmpeg_next::sys::av_hwdevice_ctx_create(
-            &mut hw_device_ctx, hw_type, std::ptr::null(), std::ptr::null_mut(), 0,
-        );
-        if res == 0 && !hw_device_ctx.is_null() {
-            (*codec_ctx.as_mut_ptr()).hw_device_ctx =
-                ffmpeg_next::sys::av_buffer_ref(hw_device_ctx);
-            ffmpeg_next::sys::av_buffer_unref(&mut hw_device_ctx);
+    if hw_accel {
+        unsafe {
+            let mut hw_device_ctx: *mut ffmpeg_next::sys::AVBufferRef = std::ptr::null_mut();
+            #[cfg(target_os = "macos")]
+            let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
+            #[cfg(target_os = "windows")]
+            let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
+            #[cfg(target_os = "linux")]
+            let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI;
+            let res = ffmpeg_next::sys::av_hwdevice_ctx_create(
+                &mut hw_device_ctx, hw_type, std::ptr::null(), std::ptr::null_mut(), 0,
+            );
+            if res == 0 && !hw_device_ctx.is_null() {
+                (*codec_ctx.as_mut_ptr()).hw_device_ctx =
+                    ffmpeg_next::sys::av_buffer_ref(hw_device_ctx);
+                ffmpeg_next::sys::av_buffer_unref(&mut hw_device_ctx);
+            }
         }
     }
     let mut decoder = match codec_ctx.decoder().video() {
@@ -386,7 +388,7 @@ mod tests {
         let keyframes_pts = vec![0, 60 * 1000, 120 * 1000];
 
         let (cmd_tx, resp_rx, _handles) = spawn_thumbnail_decoder_pool(
-            test_file, keyframes, keyframes_pts, 60.0,
+            test_file, keyframes, keyframes_pts, 60.0, 1, false,
         );
 
         cmd_tx.send(ThumbnailCommand::Request {
@@ -418,7 +420,7 @@ mod tests {
         let keyframes_pts = vec![0, 60 * 1000, 120 * 1000];
 
         let (cmd_tx, resp_rx, _handles) = spawn_thumbnail_decoder_pool(
-            test_file, keyframes, keyframes_pts, 60.0,
+            test_file, keyframes, keyframes_pts, 60.0, 1, false,
         );
 
         // Large request immediately preempted by a focused one.
