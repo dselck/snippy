@@ -55,6 +55,8 @@ pub struct PlaybackSession {
     pub(crate) thumbnail_tx: Option<Sender<crate::media::ThumbnailCommand>>,
     pub(crate) thumbnail_rx: Option<Receiver<crate::media::ThumbnailResponse>>,
     thumbnail_threads: Vec<thread::JoinHandle<()>>,
+    loudness_profile: Vec<Option<f32>>,
+    loudness_rx: Option<crossbeam_channel::Receiver<(usize, f32)>>,
 }
 
 impl Default for PlaybackSession {
@@ -118,6 +120,8 @@ impl PlaybackSession {
             thumbnail_tx: None,
             thumbnail_rx: None,
             thumbnail_threads: Vec::new(),
+            loudness_profile: Vec::new(),
+            loudness_rx: None,
         }
     }
 
@@ -130,7 +134,7 @@ impl PlaybackSession {
         }
     }
 
-    pub fn load_video(&mut self, path: &str) {
+    pub fn load_video(&mut self, path: &str, settings: &crate::settings::Settings) {
         self.shutdown_thumbnail_thread();
         if let Ok(mut ae) = AudioEngine::new() {
             let channels = ae.channels;
@@ -139,6 +143,7 @@ impl PlaybackSession {
             let master_clock = ae.master_clock.clone();
             let (frame_tx, frame_rx) = crossbeam_channel::bounded(30);
             let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+            let (loudness_tx, loudness_rx) = crossbeam_channel::unbounded::<(usize, f32)>();
             
             if let Ok((engine, meta)) = MediaEngine::new(
                 path,
@@ -149,6 +154,9 @@ impl PlaybackSession {
                 tags_tx,
                 cmd_rx,
                 master_clock.clone(),
+                loudness_tx,
+                settings.hardware.playback_hw_accel,
+                settings.advanced.presenter_lookahead_depth,
             ) {
                 self.video_fps = meta.fps;
                 self.total_frames = meta.total_frames;
@@ -159,12 +167,16 @@ impl PlaybackSession {
                 self.master_clock = Some(master_clock);
                 self.audio_engine = Some(ae);
                 self.audio_consumer = None;
+                self.loudness_profile = vec![None; meta.total_frames * 4];
+                self.loudness_rx = Some(loudness_rx);
 
                 let (t_tx, t_rx, t_handles) = crate::media::spawn_thumbnail_decoder_pool(
                     path.to_string(),
                     meta.keyframes.clone(),
                     meta.keyframes_pts.clone(),
                     meta.fps,
+                    settings.thumbnails.decoder_threads,
+                    settings.hardware.thumbnails_hw_accel,
                 );
                 self.thumbnail_tx = Some(t_tx);
                 self.thumbnail_rx = Some(t_rx);
@@ -274,6 +286,7 @@ impl PlaybackSession {
 
             let (frame_tx, frame_rx) = crossbeam_channel::bounded(30);
             let (_cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+            let (loudness_tx, loudness_rx) = crossbeam_channel::unbounded::<(usize, f32)>();
 
             if let Ok((engine, meta)) = MediaEngine::new(
                 path,
@@ -284,6 +297,9 @@ impl PlaybackSession {
                 tags_tx,
                 cmd_rx,
                 master_clock.clone(),
+                loudness_tx,
+                settings.hardware.playback_hw_accel,
+                settings.advanced.presenter_lookahead_depth,
             ) {
                 self.video_fps = meta.fps;
                 self.total_frames = meta.total_frames;
@@ -294,12 +310,16 @@ impl PlaybackSession {
                 self.master_clock = Some(master_clock);
                 self.audio_engine = None;
                 self.audio_consumer = Some(audio_consumer);
+                self.loudness_profile = vec![None; meta.total_frames * 4];
+                self.loudness_rx = Some(loudness_rx);
 
                 let (t_tx, t_rx, t_handles) = crate::media::spawn_thumbnail_decoder_pool(
                     path.to_string(),
                     meta.keyframes.clone(),
                     meta.keyframes_pts.clone(),
                     meta.fps,
+                    settings.thumbnails.decoder_threads,
+                    settings.hardware.thumbnails_hw_accel,
                 );
                 self.thumbnail_tx = Some(t_tx);
                 self.thumbnail_rx = Some(t_rx);
@@ -349,7 +369,22 @@ impl PlaybackSession {
             self.set_playing(false);
         }
         
+        // Drain loudness side-channel — write each bucket at most once
+        if let Some(rx) = &self.loudness_rx {
+            while let Ok((bucket_idx, rms)) = rx.try_recv() {
+                if let Some(slot) = self.loudness_profile.get_mut(bucket_idx) {
+                    if slot.is_none() {
+                        *slot = Some(rms);
+                    }
+                }
+            }
+        }
+        
         (self.latest_frame.as_ref(), frames_received)
+    }
+
+    pub fn loudness_profile(&self) -> &[Option<f32>] {
+        &self.loudness_profile
     }
 
     pub fn set_playing(&mut self, play: bool) {

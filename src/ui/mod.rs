@@ -1,6 +1,8 @@
 pub mod yuv_renderer;
 
 use crate::media;
+use crate::notifications::{Notification, NotificationKind, NotificationQueue};
+use crate::settings::Settings;
 use eframe::egui;
 use eframe::egui::Color32;
 use lru::LruCache;
@@ -44,8 +46,7 @@ pub struct MainApp {
 
     // Channels & Playback
 
-    // Mock Audio Loudness Profile (for visual layout)
-    pub loudness_profile: Vec<f32>,
+
 
     // Filmstrip Zoom Level (0.0 = fully zoomed out, 1.0 = fully zoomed in)
     pub zoom_level: f32,
@@ -65,6 +66,13 @@ pub struct MainApp {
     pub is_dragging_filmstrip: bool,
     pub last_zoom_level: f32,
     pub last_thumbnail_height: f32,
+
+    // Settings & Notifications
+    pub settings: Settings,
+    pub notifications: NotificationQueue,
+    pub show_settings_modal: bool,
+    /// Scratch copy of settings edited inside the modal; committed on close.
+    pub pending_settings: Settings,
 }
 
 impl MainApp {
@@ -80,20 +88,29 @@ impl MainApp {
             ));
         }
 
-        // Generate a mock loudness profile to show a beautiful timeline waveform
-        let mut loudness = Vec::with_capacity(300);
-        for i in 0..300 {
-            let sine = (i as f32 * 0.15).sin().abs();
-            let noise = (i as f32 * 0.45).cos().abs() * 0.3;
-            let val = (sine * 0.7 + noise * 0.3) * 0.8;
-            loudness.push(val.clamp(0.05, 1.0));
+
+
+        // Load settings from disk; push any load error as a Notification.
+        let (settings, load_err) = Settings::load();
+        let mut notifications = NotificationQueue::new();
+        if let Some(err) = load_err {
+            notifications.push(Notification::error(err.message()));
         }
+
+        // Derive initial zoom level from the default Zoom Interval in settings.
+        // Use a placeholder fps of 30 until a file is loaded (zoom will be reset on load).
+        let initial_zoom = settings.default_zoom_level(30.0);
+
+        // Thumbnail LRU capacity from settings.
+        let lru_cap = NonZeroUsize::new(settings.thumbnails.lru_cache_size.max(1)).unwrap();
+
+        let pending_settings = settings.clone();
 
         let mut playback = crate::media::PlaybackSession::new();
 
         let demo_path = "workspace_demo_reel.mp4";
         if std::path::Path::new(demo_path).exists() {
-            playback.load_video(demo_path);
+            playback.load_video(demo_path, &settings);
         }
 
         Self {
@@ -104,29 +121,248 @@ impl MainApp {
             ranges: vec![],
             next_range_id: 1,
             cut_mode: false,
-            loudness_profile: loudness,
-            zoom_level: 0.0,
+            zoom_level: initial_zoom,
             timeline_height: 145.0,
             show_debug_hud: false,
             drift_history: std::collections::VecDeque::with_capacity(60),
             decode_fps_frame_count: 0,
             decode_fps_last_reset: std::time::Instant::now(),
             decode_fps: 0.0,
-            thumbnail_cache: LruCache::new(NonZeroUsize::new(300).unwrap()),
+            thumbnail_cache: LruCache::new(lru_cap),
             thumbnails_dirty: true,
             in_flight_requests: std::collections::HashMap::new(),
             is_dragging_filmstrip: false,
-            last_zoom_level: 0.0,
+            last_zoom_level: initial_zoom,
             last_thumbnail_height: 0.0,
+            settings,
+            notifications,
+            show_settings_modal: false,
+            pending_settings,
         }
     }
 
     fn frame_to_time(&self, frame: usize) -> String {
         let total_seconds = frame as f64 / self.playback.video_fps();
-        let minutes = (total_seconds / 60.0).floor() as usize;
+        let hours = (total_seconds / 3600.0).floor() as usize;
+        let minutes = ((total_seconds % 3600.0) / 60.0).floor() as usize;
         let seconds = total_seconds.floor() as usize % 60;
         let centiseconds = ((total_seconds - total_seconds.floor()) * 100.0).floor() as usize;
-        format!("{:02}:{:02}.{:02}", minutes, seconds, centiseconds)
+        format!("{:02}:{:02}:{:02}.{:02}", hours, minutes, seconds, centiseconds)
+    }
+
+    fn draw_settings_modal(&mut self, ctx: &egui::Context) {
+        use crate::settings::ZoomUnit;
+
+        let accent   = Color32::from_rgb(99, 102, 241);
+        let muted    = Color32::from_rgb(130, 130, 160);
+        let warn_col = Color32::from_rgb(200, 150, 50);
+        let card_bg  = Color32::from_rgb(15, 14, 25);
+        let sep_col  = Color32::from_rgb(33, 31, 54);
+
+        // Restart-required check: settings that only take effect after media reload.
+        let needs_restart = self.pending_settings.hardware.playback_hw_accel   != self.settings.hardware.playback_hw_accel
+            || self.pending_settings.hardware.thumbnails_hw_accel != self.settings.hardware.thumbnails_hw_accel
+            || self.pending_settings.thumbnails.decoder_threads   != self.settings.thumbnails.decoder_threads
+            || self.pending_settings.thumbnails.lru_cache_size    != self.settings.thumbnails.lru_cache_size
+            || self.pending_settings.advanced.presenter_lookahead_depth != self.settings.advanced.presenter_lookahead_depth;
+
+        let mut close_modal = false;
+
+        egui::Window::new("Settings")
+            .id(egui::Id::new("settings_modal"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size([480.0, 560.0])
+            .frame(egui::Frame::window(&ctx.global_style()).fill(Color32::from_rgb(10, 10, 18)).stroke(egui::Stroke::new(1.0, sep_col)))
+            .show(ctx, |ui| {
+                ui.set_width(480.0);
+
+                // Title row
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("⚙  Settings").size(18.0).color(Color32::WHITE).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(egui::RichText::new("⌘,").size(12.0).color(muted));
+                    });
+                });
+                ui.add_space(4.0);
+                ui.add(egui::Separator::default().spacing(1.0));
+                ui.add_space(8.0);
+
+                egui::ScrollArea::vertical().max_height(440.0).show(ui, |ui| {
+                    // ── Playback ──────────────────────────────────────────
+                    ui.label(egui::RichText::new("Playback").size(13.0).color(accent).strong());
+                    egui::Frame::NONE.fill(card_bg).corner_radius(8.0).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+                        ui.set_width(452.0);
+                        // Label + percentage on the same row
+                        ui.horizontal(|ui| {
+                            ui.label("Volume");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(egui::RichText::new(format!("{:.0}%", self.pending_settings.playback.volume * 100.0)).color(muted).size(12.0));
+                            });
+                        });
+                        // egui Sliders use spacing.slider_width from the style rather than
+                        // respecting add_sized. Capture available_width then override the style
+                        // inside a scope so only this slider is affected.
+                        let slider_width = ui.available_width();
+                        ui.scope(|ui| {
+                            ui.style_mut().spacing.slider_width = slider_width;
+                            ui.add(egui::Slider::new(&mut self.pending_settings.playback.volume, 0.0..=1.0).show_value(false));
+                        });
+                        // Volume applies live
+                        self.settings.playback.volume = self.pending_settings.playback.volume;
+                    });
+                    ui.add_space(12.0);
+
+                    // ── Hardware ──────────────────────────────────────────
+                    ui.label(egui::RichText::new("Hardware").size(13.0).color(accent).strong());
+                    egui::Frame::NONE.fill(card_bg).corner_radius(8.0).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+                        ui.set_width(452.0);
+                        // Master HW accel toggle writes both fields simultaneously
+                        let both_on = self.pending_settings.hardware.playback_hw_accel && self.pending_settings.hardware.thumbnails_hw_accel;
+                        let mut master = both_on;
+                        if ui.checkbox(&mut master, "Use hardware acceleration").changed() {
+                            self.pending_settings.hardware.playback_hw_accel = master;
+                            self.pending_settings.hardware.thumbnails_hw_accel = master;
+                        }
+                        ui.label(egui::RichText::new("Uses VideoToolbox on macOS, D3D11 on Windows, VAAPI on Linux.").size(11.0).color(muted));
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Advanced: playback_hw_accel / thumbnails_hw_accel can be set independently in the config file.").size(10.0).color(muted));
+                        if needs_restart {
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("⚠  Changes take effect after reloading the file.").size(11.0).color(warn_col));
+                        }
+                    });
+                    ui.add_space(12.0);
+
+                    // ── Appearance ────────────────────────────────────────
+                    ui.label(egui::RichText::new("Appearance").size(13.0).color(accent).strong());
+                    egui::Frame::NONE.fill(card_bg).corner_radius(8.0).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+                        ui.set_width(452.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Theme");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(egui::RichText::new("Dark").color(muted).size(12.0));
+                            });
+                        });
+                        ui.label(egui::RichText::new("Additional themes coming soon.").size(11.0).color(muted));
+                    });
+                    ui.add_space(12.0);
+
+                    // ── Timeline ──────────────────────────────────────────
+                    ui.label(egui::RichText::new("Timeline").size(13.0).color(accent).strong());
+                    egui::Frame::NONE.fill(card_bg).corner_radius(8.0).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+                        ui.set_width(452.0);
+                        // Label and controls all on one row
+                        ui.horizontal(|ui| {
+                            ui.label("Default zoom interval");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                egui::ComboBox::from_id_salt("default_zoom_unit")
+                                    .selected_text(self.pending_settings.timeline.default_zoom_unit.label())
+                                    .width(80.0)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut self.pending_settings.timeline.default_zoom_unit, ZoomUnit::Seconds, "seconds");
+                                        ui.selectable_value(&mut self.pending_settings.timeline.default_zoom_unit, ZoomUnit::Frames, "frames");
+                                    });
+                                ui.add(egui::DragValue::new(&mut self.pending_settings.timeline.default_zoom_value).range(0.001..=9999.0).speed(0.1).max_decimals(2));
+                            });
+                        });
+                        ui.label(egui::RichText::new("Min/max zoom and curve shape are set in the config file.").size(11.0).color(muted));
+                    });
+                    ui.add_space(12.0);
+
+                    // ── General ───────────────────────────────────────────
+                    ui.label(egui::RichText::new("General").size(13.0).color(accent).strong());
+                    egui::Frame::NONE.fill(card_bg).corner_radius(8.0).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
+                        ui.set_width(452.0);
+                        ui.label("Default open directory");
+
+                        // Build a meaningful hint showing the actual OS default path
+                        let os_default_hint = dirs::document_dir()
+                            .or_else(dirs::home_dir)
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "OS default".to_string());
+
+                        // Row: TextEdit + Browse button at matched height
+                        ui.horizontal(|ui| {
+                            let btn_height = 28.0;
+                            let text_width = ui.available_width() - 80.0; // leave room for button
+                            ui.add_sized(
+                                [text_width, btn_height],
+                                egui::TextEdit::singleline(&mut self.pending_settings.general.default_open_directory)
+                                    .hint_text(&os_default_hint),
+                            );
+                            if ui.add_sized([72.0, btn_height], egui::Button::new("Browse…")).clicked() {
+                                let start_dir = if self.pending_settings.general.default_open_directory.is_empty() {
+                                    dirs::home_dir()
+                                } else {
+                                    Some(std::path::PathBuf::from(&self.pending_settings.general.default_open_directory))
+                                };
+                                let mut dlg = rfd::FileDialog::new();
+                                if let Some(d) = start_dir { dlg = dlg.set_directory(d); }
+                                if let Some(dir) = dlg.pick_folder() {
+                                    self.pending_settings.general.default_open_directory = dir.to_string_lossy().to_string();
+                                }
+                            }
+                        });
+
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("Recent files").size(12.0).color(Color32::from_rgb(200, 200, 210)));
+                        if self.pending_settings.general.recent_files.is_empty() {
+                            ui.label(egui::RichText::new("No recent files.").size(11.0).color(muted));
+                        } else {
+                            for path in &self.pending_settings.general.recent_files {
+                                let short = std::path::Path::new(path)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| path.clone());
+                                ui.label(egui::RichText::new(format!("• {short}")).size(11.0).color(muted));
+                            }
+                            if ui.small_button("Clear recent files").clicked() {
+                                self.pending_settings.general.recent_files.clear();
+                            }
+                        }
+                    });
+                    ui.add_space(12.0);
+
+                    // ── Advanced / Config file ────────────────────────────
+                    ui.add(egui::Separator::default().spacing(1.0));
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Advanced settings are configured directly in the settings file.").size(11.0).color(muted));
+                    if let Some(path) = crate::settings::config_path() {
+                        let path_str = path.display().to_string();
+                        ui.add_space(2.0);
+                        ui.label(egui::RichText::new(&path_str).size(10.5).color(muted).monospace());
+                        if ui.small_button("Open in editor").clicked() {
+                            let _ = open::that(&path_str);
+                        }
+                    } else {
+                        ui.label(egui::RichText::new("Config path unavailable on this system.").size(11.0).color(muted));
+                    }
+                }); // end ScrollArea
+
+                ui.add_space(8.0);
+                ui.add(egui::Separator::default().spacing(1.0));
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let done_btn = egui::Button::new(egui::RichText::new("Done").color(Color32::WHITE))
+                            .fill(accent)
+                            .corner_radius(6.0);
+                        if ui.add(done_btn).clicked() {
+                            close_modal = true;
+                        }
+                    });
+                });
+            });
+
+        if close_modal {
+            // Commit pending settings → live settings
+            self.settings = self.pending_settings.clone();
+            self.settings.save();
+            self.show_settings_modal = false;
+        }
     }
 }
 
@@ -623,7 +859,73 @@ impl MainApp {
                 );
             }
 
-        // 4. Always draw circular playhead handle (always visible)
+        // 4. Draw In / Out marker flags (each independent — shown even if only one is set)
+        let marker_line_h = rect.height() + 6.0; // extends slightly above/below the hit rect
+        let flag_w = 6.0;   // width of the L-shaped bracket cap
+        let flag_h = 5.0;   // height of the bracket cap
+        let label_font = egui::FontId::monospace(9.0);
+
+        // Helper: draw one marker flag + floating timecode label.
+        // `side` = -1.0 for In (cap extends right), +1.0 for Out (cap extends left).
+        let draw_marker = |painter: &egui::Painter,
+                           frame: usize,
+                           color: Color32,
+                           label: &str,
+                           side: f32| {
+            let pct = (frame as f32 / self.playback.total_frames() as f32).clamp(0.0, 1.0);
+            let mx = rect.left() + pct * rect.width();
+            let top_y = rect.center().y - marker_line_h * 0.5;
+            let bot_y = rect.center().y + marker_line_h * 0.5;
+
+            // Vertical line
+            painter.line_segment(
+                [egui::pos2(mx, top_y), egui::pos2(mx, bot_y)],
+                egui::Stroke::new(1.5, color),
+            );
+
+            // Bracket cap (top horizontal arm)
+            painter.line_segment(
+                [egui::pos2(mx, top_y), egui::pos2(mx + side * flag_w, top_y)],
+                egui::Stroke::new(1.5, color),
+            );
+            // Bracket cap (short vertical arm on the end)
+            painter.line_segment(
+                [
+                    egui::pos2(mx + side * flag_w, top_y),
+                    egui::pos2(mx + side * flag_w, top_y + flag_h),
+                ],
+                egui::Stroke::new(1.5, color),
+            );
+
+            // Floating timecode label above the marker line
+            // Align left for In, right for Out so they don't overlap the line
+            let label_align = if side > 0.0 {
+                egui::Align2::RIGHT_BOTTOM
+            } else {
+                egui::Align2::LEFT_BOTTOM
+            };
+            painter.text(
+                egui::pos2(mx + side * 2.0, top_y - 2.0),
+                label_align,
+                label,
+                label_font.clone(),
+                color,
+            );
+        };
+
+        // In marker — amber yellow, bracket opens rightward
+        if let Some(inf) = self.in_marker {
+            let label = format!("[ {}", self.frame_to_time(inf));
+            draw_marker(&painter, inf, Color32::from_rgb(251, 191, 36), &label, 1.0);
+        }
+
+        // Out marker — orange, bracket opens leftward
+        if let Some(outf) = self.out_marker {
+            let label = format!("{} ]", self.frame_to_time(outf));
+            draw_marker(&painter, outf, Color32::from_rgb(249, 115, 22), &label, -1.0);
+        }
+
+        // 5. Always draw circular playhead handle (always visible)
         let fraction = (self.playback.current_frame() as f32 / self.playback.total_frames() as f32).clamp(0.0, 1.0);
         let progress_width = rect.width() * fraction;
         let handle_x = rect.left() + progress_width;
@@ -654,7 +956,7 @@ impl MainApp {
 
 impl eframe::App for MainApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx();
+        let ctx = ui.ctx().clone();
         let mut prev_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
         let mut next_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
         let mut prev_down = ctx.input(|i| i.key_down(egui::Key::ArrowLeft));
@@ -665,6 +967,15 @@ impl eframe::App for MainApp {
         let ctrl_d = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::D);
         if ctx.input_mut(|i| i.consume_shortcut(&ctrl_d)) {
             self.show_debug_hud = !self.show_debug_hud;
+        }
+
+        // ⌘, (macOS) / Ctrl+, (other) opens Settings
+        let settings_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::Comma);
+        if ctx.input_mut(|i| i.consume_shortcut(&settings_shortcut)) {
+            if !self.show_settings_modal {
+                self.pending_settings = self.settings.clone();
+                self.show_settings_modal = true;
+            }
         }
 
         // Receive frames from the Media Engine
@@ -714,6 +1025,45 @@ impl eframe::App for MainApp {
             self.last_zoom_level = self.zoom_level;
             self.in_flight_requests.clear();
             self.thumbnails_dirty = true;
+        }
+
+        // --- Notification banners ---
+        // Collect data first so the rendering closure doesn't hold a live borrow on self.notifications.
+        let notif_data: Vec<(Color32, Color32, &'static str, String)> = self
+            .notifications
+            .items
+            .iter()
+            .map(|n| {
+                let (bg, border, icon) = match n.kind {
+                    NotificationKind::Error   => (Color32::from_rgb(60, 15, 15), Color32::from_rgb(200, 50, 50), "✕ "),
+                    NotificationKind::Warning => (Color32::from_rgb(50, 35, 5),  Color32::from_rgb(200, 150, 50), "⚠ "),
+                    NotificationKind::Info    => (Color32::from_rgb(10, 25, 50), Color32::from_rgb(80, 140, 220), "ℹ "),
+                };
+                (bg, border, icon, n.message.clone())
+            })
+            .collect();
+        let mut dismiss_idx: Option<usize> = None;
+        for (idx, (bg, border, icon, message)) in notif_data.iter().enumerate() {
+            egui::Panel::top(format!("notif_{idx}"))
+                .frame(egui::Frame::NONE.fill(*bg).stroke(egui::Stroke::new(1.0, *border)).inner_margin(egui::Margin::symmetric(14, 8)))
+                .show_inside(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("{}{}", icon, message)).color(Color32::from_rgb(230, 230, 230)).size(13.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("✕").on_hover_text("Dismiss").clicked() {
+                                dismiss_idx = Some(idx);
+                            }
+                        });
+                    });
+                });
+        }
+        if let Some(idx) = dismiss_idx {
+            self.notifications.dismiss(idx);
+        }
+
+        // --- Settings modal ---
+        if self.show_settings_modal {
+            self.draw_settings_modal(&ctx);
         }
 
         // 2. Bottom Panel: Timeline and Waveform Deck (Full width)
@@ -819,11 +1169,9 @@ impl eframe::App for MainApp {
                     let total_frames = self.playback.total_frames();
                     let duration_sec = total_frames as f64 / fps;
                     
-                    // Interpolate time delta represented by a single thumbnail step
-                    // Zoom level 0.0 -> 30s. Zoom level 1.0 -> 1/fps s (1 frame)
-                    let min_interval = 1.0 / fps;
-                    let max_interval = 30.0;
-                    let interval = max_interval * (min_interval / max_interval).powf(self.zoom_level as f64);
+                    // Interpolate time delta represented by a single thumbnail step.
+                    // Bounds and curve shape are driven by Settings (see [timeline] group).
+                    let interval = self.settings.zoom_level_to_interval(self.zoom_level, fps);
                     
                     // Step spacing logic
                     let spacing_x = 6.0;
@@ -870,17 +1218,37 @@ impl eframe::App for MainApp {
                                 Color32::WHITE,
                             );
                         } else {
-                            // Placeholder loading card
+                            // Placeholder loading card with animated spinner
                             painter.rect_filled(thub_rect, 4.0, Color32::from_rgb(18, 17, 28));
                             painter.rect_stroke(thub_rect, 4.0, egui::Stroke::new(1.0, Color32::from_rgb(45, 43, 75)), egui::StrokeKind::Inside);
-                            if inner_height > 12.0 {
-                                painter.text(
-                                    thub_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "LOADING",
-                                    egui::FontId::proportional(9.0),
-                                    Color32::from_rgb(45, 43, 75),
-                                );
+                            if inner_height > 16.0 {
+                                // Spinning arc: one full revolution every 1.2 s
+                                let t = ui.ctx().input(|i| i.time) as f32;
+                                let angle = t * (2.0 * std::f32::consts::PI / 1.2);
+                                let center = thub_rect.center();
+                                let r = (thub_rect.size().min_elem() * 0.22).max(4.0);
+                                let arc_fraction = 0.65_f32;
+                                let n_segments = 20usize;
+                                let arc_color = Color32::from_rgb(110, 90, 160);
+                                let points: Vec<egui::Pos2> = (0..=n_segments)
+                                    .map(|k| {
+                                        let a = angle
+                                            + k as f32 / n_segments as f32
+                                                * arc_fraction
+                                                * std::f32::consts::TAU;
+                                        egui::pos2(
+                                            center.x + r * a.cos(),
+                                            center.y + r * a.sin(),
+                                        )
+                                    })
+                                    .collect();
+                                for seg in points.windows(2) {
+                                    painter.line_segment(
+                                        [seg[0], seg[1]],
+                                        egui::Stroke::new(1.5, arc_color),
+                                    );
+                                }
+                                ui.ctx().request_repaint();
                             }
                             if !self.in_flight_requests.contains_key(&target_frame) {
                                 visible_frames.push(target_frame);
@@ -888,11 +1256,12 @@ impl eframe::App for MainApp {
                             }
                         }
 
-                        // Underlay timecode
+                        // Underlay timecode — drawn with the unclipped panel painter so it
+                        // appears in the ruler strip below the filmstrip rect.
                         if inner_height > 12.0 {
                             let time_text = self.frame_to_time(target_frame);
-                            painter.text(
-                                egui::pos2(thub_rect.center().x, thub_rect.bottom() + 10.0),
+                            ui.painter().text(
+                                egui::pos2(thub_rect.center().x, filmstrip_rect.bottom() + 10.0),
                                 egui::Align2::CENTER_CENTER,
                                 time_text,
                                 egui::FontId::monospace(8.0),
@@ -995,58 +1364,110 @@ impl eframe::App for MainApp {
                         wave_rect.left() + pct * wave_rect.width()
                     };
 
-                    // Render mock waveform loudness bars zoomed in sync
-                    let bar_count = self.loudness_profile.len();
-                    let bar_width = wave_rect.width() / bar_count as f32;
+                    // Render real loudness profile bars — one bar per pixel column
+                    let loudness = self.playback.loudness_profile();
+                    let total_buckets = loudness.len();
+                    let bar_count = wave_rect.width() as usize;
+                    let bar_width = 1.0_f32;
                     let middle_y = wave_rect.center().y;
+
+                    // Track contiguous unloaded x-spans for the loading overlay
+                    let mut loading_span_start: Option<f32> = None;
 
                     for i in 0..bar_count {
                         let pct = i as f32 / bar_count as f32;
-                        let frame_idx_isize = start_frame + (pct * visible_range_width) as isize;
-                        let frame_idx = frame_idx_isize.clamp(0, self.playback.total_frames() as isize) as usize;
-                        let out_of_bounds = frame_idx_isize < 0 || frame_idx_isize > self.playback.total_frames() as isize;
+                        let frame_idx_isize =
+                            start_frame + (pct * visible_range_width) as isize;
+                        let out_of_bounds = frame_idx_isize < 0
+                            || frame_idx_isize > self.playback.total_frames() as isize;
 
-                        let amplitude = if out_of_bounds {
-                            0.02
+                        let bucket_idx = if out_of_bounds {
+                            None
                         } else {
-                            let profile_idx = ((frame_idx as f32 / self.playback.total_frames() as f32) * (self.loudness_profile.len() - 1) as f32) as usize;
-                            self.loudness_profile[profile_idx.clamp(0, self.loudness_profile.len() - 1)]
+                            let fi = frame_idx_isize as usize;
+                            let bi = fi * 4;
+                            if bi < total_buckets { Some(bi) } else { None }
                         };
 
-                        let bar_h = amplitude * (wave_rect.height() - 6.0);
-                        let x = wave_rect.left() + i as f32 * bar_width;
+                        let amplitude_opt = bucket_idx.and_then(|bi| loudness[bi]);
 
-                        let inside_active_selection = match (self.in_marker, self.out_marker) {
-                            (Some(inf), Some(outf)) => frame_idx >= inf && frame_idx <= outf,
-                            _ => false,
-                        };
-
-                        let inside_queued_range = self.ranges.iter().any(|r| frame_idx >= r.in_frame && frame_idx <= r.out_frame);
-
-                        let bar_color = if out_of_bounds {
-                            Color32::from_rgb(20, 19, 32)
-                        } else if inside_active_selection {
-                            Color32::from_rgb(59, 130, 246)
-                        } else if inside_queued_range {
-                            if self.cut_mode {
-                                Color32::from_rgb(239, 68, 68)
-                            } else {
-                                Color32::from_rgb(16, 185, 129)
+                        match amplitude_opt {
+                            None => {
+                                if loading_span_start.is_none() {
+                                    loading_span_start =
+                                        Some(wave_rect.left() + i as f32 * bar_width);
+                                }
+                                continue;
                             }
-                        } else {
-                            if self.cut_mode {
-                                Color32::from_rgb(12, 55, 35)
-                            } else {
-                                Color32::from_rgb(85, 30, 30)
-                            }
-                        };
+                            Some(amplitude) => {
+                                // Flush any accumulated loading span
+                                if let Some(lx) = loading_span_start.take() {
+                                    let rx = wave_rect.left() + i as f32 * bar_width;
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(lx, wave_rect.top() + 1.0),
+                                            egui::pos2(rx, wave_rect.bottom() - 1.0),
+                                        ),
+                                        0.0,
+                                        Color32::from_rgba_premultiplied(55, 35, 75, 45),
+                                    );
+                                }
 
-                        painter.line_segment(
-                            [
-                                egui::pos2(x + bar_width * 0.5, middle_y - bar_h * 0.5),
-                                egui::pos2(x + bar_width * 0.5, middle_y + bar_h * 0.5),
-                            ],
-                            egui::Stroke::new(bar_width * 0.75, bar_color),
+                                let frame_idx = frame_idx_isize.clamp(
+                                    0,
+                                    self.playback.total_frames() as isize,
+                                ) as usize;
+                                let bar_h = amplitude * (wave_rect.height() - 6.0);
+                                let x = wave_rect.left() + i as f32 * bar_width;
+
+                                let inside_active_selection =
+                                    match (self.in_marker, self.out_marker) {
+                                        (Some(inf), Some(outf)) => {
+                                            frame_idx >= inf && frame_idx <= outf
+                                        }
+                                        _ => false,
+                                    };
+                                let inside_queued_range = self
+                                    .ranges
+                                    .iter()
+                                    .any(|r| frame_idx >= r.in_frame && frame_idx <= r.out_frame);
+
+                                let bar_color = if out_of_bounds {
+                                    Color32::from_rgb(20, 19, 32)
+                                } else if inside_active_selection {
+                                    Color32::from_rgb(59, 130, 246)
+                                } else if inside_queued_range {
+                                    if self.cut_mode {
+                                        Color32::from_rgb(239, 68, 68)
+                                    } else {
+                                        Color32::from_rgb(16, 185, 129)
+                                    }
+                                } else if self.cut_mode {
+                                    Color32::from_rgb(12, 55, 35)
+                                } else {
+                                    Color32::from_rgb(85, 30, 30)
+                                };
+
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(x + bar_width * 0.5, middle_y - bar_h * 0.5),
+                                        egui::pos2(x + bar_width * 0.5, middle_y + bar_h * 0.5),
+                                    ],
+                                    egui::Stroke::new(bar_width, bar_color),
+                                );
+                            }
+                        }
+                    }
+
+                    // Flush any trailing loading span at the right edge
+                    if let Some(lx) = loading_span_start.take() {
+                        painter.rect_filled(
+                            egui::Rect::from_min_max(
+                                egui::pos2(lx, wave_rect.top() + 1.0),
+                                egui::pos2(wave_rect.right(), wave_rect.bottom() - 1.0),
+                            ),
+                            0.0,
+                            Color32::from_rgba_premultiplied(55, 35, 75, 45),
                         );
                     }
 
@@ -1323,8 +1744,27 @@ impl eframe::App for MainApp {
                             );
                         }
 
-                        // Right-justified Load and Export buttons
+                        // Right-justified Load, Export, and Settings buttons
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(4.0);
+
+                            // Settings gear button
+                            let gear_btn = egui::Button::new(
+                                egui::RichText::new("⚙").size(18.0).color(Color32::from_rgb(160, 160, 200))
+                            )
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::NONE)
+                            .corner_radius(6.0)
+                            .min_size(egui::vec2(36.0, 36.0));
+
+                            let gear_resp = ui.add(gear_btn).on_hover_text("Settings (⌘,)");
+                            if gear_resp.clicked() {
+                                if !self.show_settings_modal {
+                                    self.pending_settings = self.settings.clone();
+                                    self.show_settings_modal = true;
+                                }
+                            }
+
                             ui.add_space(4.0);
 
                             // Export button
@@ -1349,12 +1789,19 @@ impl eframe::App for MainApp {
                                 false,
                                 "Load video file",
                             ).clicked()
-                                && let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("Video", &["mp4", "mkv", "avi", "mov"])
-                                    .pick_file()
-                                {
+                                && let Some(path) = {
+                                    let mut dlg = rfd::FileDialog::new()
+                                        .add_filter("Video", &["mp4", "mkv", "avi", "mov"]);
+                                    if !self.settings.general.default_open_directory.is_empty() {
+                                        dlg = dlg.set_directory(&self.settings.general.default_open_directory);
+                                    }
+                                    dlg.pick_file()
+                                }
+                            {
                                     let path_str = path.to_string_lossy().to_string();
-                                    self.playback.load_video(&path_str);
+                                    self.playback.load_video(&path_str, &self.settings);
+                                    self.settings.add_recent_file(&path_str);
+                                    self.pending_settings.general.recent_files = self.settings.general.recent_files.clone();
                                     self.video_path = Some(path_str.clone());
                                     self.in_marker = None;
                                     self.out_marker = None;

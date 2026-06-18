@@ -15,7 +15,8 @@ fn main() {
     let (tags_tx, mut tags_cons) = tags_rb.split();
     let (clock, _) = MasterClock::new(48000);
     clock.set_has_audio(true);
-    let (me, _meta) = MediaEngine::new(&video_path_buf, 48000, 1, frame_tx, audio_tx, tags_tx, cmd_rx, clock.clone()).unwrap();
+    let (loudness_tx, _loudness_rx) = crossbeam_channel::unbounded();
+    let (me, _meta) = MediaEngine::new(&video_path_buf, 48000, 1, frame_tx, audio_tx, tags_tx, cmd_rx, clock.clone(), loudness_tx, true, 4).unwrap();
     
     clock.reset(0.0);
     me.tx.send(MediaCommand::Seek { frame_index: 0, keyframe_only: false, sequence_id: 1, audio_enabled: false }).unwrap();

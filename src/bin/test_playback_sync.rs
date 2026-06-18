@@ -83,6 +83,7 @@ fn main() -> Result<(), anyhow::Error> {
         }
     });
 
+    let (loudness_tx, _loudness_rx) = crossbeam_channel::unbounded();
     let (me, metadata) = MediaEngine::new(
         &video_path_buf,
         48000,
@@ -92,6 +93,9 @@ fn main() -> Result<(), anyhow::Error> {
         tags_tx,
         cmd_rx,
         master_clock.clone(),
+        loudness_tx,
+        true,  // hw_accel
+        4,     // lookahead_depth
     )?;
 
     println!("Loaded metadata: total_frames={}, fps={}, width={}, height={}, has_audio={}, keyframes count={}",
