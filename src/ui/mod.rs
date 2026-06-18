@@ -1471,8 +1471,17 @@ impl eframe::App for MainApp {
                             let bar_h = scaled_amplitude * (wave_rect.height() - 6.0);
                             let x = wave_rect.left() + i as f32 * bar_width;
 
+                            let is_cut = if out_of_bounds {
+                                false
+                            } else {
+                                self.is_frame_cut(frame_idx_isize as usize)
+                            };
+
                             let bar_color = if out_of_bounds {
                                 Color32::from_rgb(20, 19, 32)
+                            } else if is_cut {
+                                // Dimmed Indigo color for cut regions
+                                Color32::from_rgba_unmultiplied(99, 102, 241, 40)
                             } else {
                                 Color32::from_rgb(99, 102, 241) // Premium Indigo accent color
                             };
@@ -1485,6 +1494,49 @@ impl eframe::App for MainApp {
                                 egui::Stroke::new(bar_width, bar_color),
                             );
                         }
+                    }
+
+                    // Draw scrolling In/Out markers on the filmstrip & waveform
+                    let draw_timeline_marker = |painter: &egui::Painter, frame: usize, color: Color32, direction: f32| {
+                        let frame_time = frame as f64 / fps;
+                        let x = scroll_offset_x + frame_time * pixels_per_second;
+                        let x_f32 = x as f32;
+                        
+                        // Draw only if horizontally visible inside the filmstrip rect
+                        if x_f32 >= filmstrip_rect.left() && x_f32 <= filmstrip_rect.right() {
+                            // 1. Draw continuous vertical line through both filmstrip and waveform
+                            painter.line_segment(
+                                [egui::pos2(x_f32, filmstrip_rect.top()), egui::pos2(x_f32, wave_rect.bottom())],
+                                egui::Stroke::new(1.5, color),
+                            );
+                            
+                            // 2. Top Bracket Caps at filmstrip_rect.top()
+                            painter.line_segment(
+                                [egui::pos2(x_f32, filmstrip_rect.top()), egui::pos2(x_f32 + direction * 8.0, filmstrip_rect.top())],
+                                egui::Stroke::new(1.5, color),
+                            );
+                            painter.line_segment(
+                                [egui::pos2(x_f32 + direction * 8.0, filmstrip_rect.top()), egui::pos2(x_f32 + direction * 8.0, filmstrip_rect.top() + 6.0)],
+                                egui::Stroke::new(1.5, color),
+                            );
+                            
+                            // 3. Bottom Bracket Caps at wave_rect.bottom()
+                            painter.line_segment(
+                                [egui::pos2(x_f32, wave_rect.bottom()), egui::pos2(x_f32 + direction * 8.0, wave_rect.bottom())],
+                                egui::Stroke::new(1.5, color),
+                            );
+                            painter.line_segment(
+                                [egui::pos2(x_f32 + direction * 8.0, wave_rect.bottom()), egui::pos2(x_f32 + direction * 8.0, wave_rect.bottom() - 6.0)],
+                                egui::Stroke::new(1.5, color),
+                            );
+                        }
+                    };
+
+                    if let Some(inf) = self.in_marker {
+                        draw_timeline_marker(&ui.painter(), inf, Color32::from_rgb(251, 191, 36), 1.0);
+                    }
+                    if let Some(outf) = self.out_marker {
+                        draw_timeline_marker(&ui.painter(), outf, Color32::from_rgb(249, 115, 22), -1.0);
                     }
                 });
                 } else {
