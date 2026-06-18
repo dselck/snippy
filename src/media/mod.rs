@@ -46,6 +46,9 @@ impl MediaEngine {
         tags_tx: CachingProd<Arc<SharedRb<Heap<(u64, u64, u64)>>>>,
         cmd_rx: Receiver<MediaCommand>,
         master_clock: crate::audio::clock::MasterClock,
+        loudness_tx: crossbeam_channel::Sender<(usize, f32)>,  // ← new
+        hw_accel: bool,
+        lookahead_depth: usize,
     ) -> Result<(Self, VideoMetadata), anyhow::Error> {
         ffmpeg_next::init()?;
 
@@ -125,6 +128,9 @@ impl MediaEngine {
                 master_clock_clone,
                 keyframes,
                 keyframes_pts_clone,
+                hw_accel,
+                lookahead_depth,
+                loudness_tx,  // ← new, last
             );
         });
 
@@ -174,6 +180,9 @@ fn run_decoding_loop(
     master_clock: crate::audio::clock::MasterClock,
     keyframes: Vec<usize>,
     keyframes_pts: Vec<i64>,
+    hw_accel: bool,
+    lookahead_depth: usize,
+    loudness_tx: crossbeam_channel::Sender<(usize, f32)>,  // ← new, last
 ) -> Result<(), anyhow::Error> {
     let (play_queue_tx, play_queue_rx) = crossbeam_channel::bounded::<DecodedFrame>(20);
     let (decoder_cmd_tx, decoder_cmd_rx) = crossbeam_channel::unbounded::<MediaCommand>();
@@ -197,6 +206,8 @@ fn run_decoding_loop(
             master_clock_clone,
             keyframes_clone,
             keyframes_pts_clone,
+            hw_accel,
+            loudness_tx,  // ← new, last
         );
     });
 
@@ -215,7 +226,7 @@ fn run_decoding_loop(
         if let Some(timeout) = active_wakeup {
             let wait_timeout = timeout.min(std::time::Duration::from_millis(10));
             if wait_timeout > std::time::Duration::from_millis(1) {
-                if lookahead_queue.len() < 4 {
+                if lookahead_queue.len() < lookahead_depth {
                     crossbeam_channel::select! {
                         recv(background_rx) -> cmd => {
                             if let Ok(c) = cmd { events.push(c); } else { return Ok(()); }
@@ -299,7 +310,7 @@ fn run_decoding_loop(
                     }
                 }
                 _ => {
-                    if lookahead_queue.len() < 4 {
+                    if lookahead_queue.len() < lookahead_depth {
                         crossbeam_channel::select! {
                             recv(background_rx) -> cmd => {
                                 if let Ok(c) = cmd { events.push(c); } else { return Ok(()); }
@@ -447,6 +458,8 @@ fn run_decoder_thread(
     master_clock: crate::audio::clock::MasterClock,
     keyframes: Vec<usize>,
     keyframes_pts: Vec<i64>,
+    hw_accel: bool,
+    loudness_tx: crossbeam_channel::Sender<(usize, f32)>,  // ← new, last
 ) -> Result<(), anyhow::Error> {
     let mut input = ffmpeg_next::format::input(&path)?;
 
@@ -465,19 +478,21 @@ fn run_decoder_thread(
         };
         let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(video_stream.parameters())?;
 
-        unsafe {
-            let mut hw_device_ctx: *mut ffmpeg_next::sys::AVBufferRef = std::ptr::null_mut();
-            #[cfg(target_os = "macos")]
-            let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
-            #[cfg(target_os = "windows")]
-            let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
-            #[cfg(target_os = "linux")]
-            let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI;
+        if hw_accel {
+            unsafe {
+                let mut hw_device_ctx: *mut ffmpeg_next::sys::AVBufferRef = std::ptr::null_mut();
+                #[cfg(target_os = "macos")]
+                let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
+                #[cfg(target_os = "windows")]
+                let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
+                #[cfg(target_os = "linux")]
+                let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI;
 
-            let res = ffmpeg_next::sys::av_hwdevice_ctx_create(&mut hw_device_ctx, hw_type, std::ptr::null(), std::ptr::null_mut(), 0);
-            if res == 0 && !hw_device_ctx.is_null() {
-                (*codec_ctx.as_mut_ptr()).hw_device_ctx = ffmpeg_next::sys::av_buffer_ref(hw_device_ctx);
-                ffmpeg_next::sys::av_buffer_unref(&mut hw_device_ctx);
+                let res = ffmpeg_next::sys::av_hwdevice_ctx_create(&mut hw_device_ctx, hw_type, std::ptr::null(), std::ptr::null_mut(), 0);
+                if res == 0 && !hw_device_ctx.is_null() {
+                    (*codec_ctx.as_mut_ptr()).hw_device_ctx = ffmpeg_next::sys::av_buffer_ref(hw_device_ctx);
+                    ffmpeg_next::sys::av_buffer_unref(&mut hw_device_ctx);
+                }
             }
         }
         (idx, time_base_f64, start_time, codec_ctx.decoder().video()?)
@@ -627,10 +642,21 @@ fn run_decoder_thread(
                                 audio_pipeline.update_current_time_from_pts(pts);
                             }
                             if audio_pipeline.send_packet(&packet).is_ok()
-                                && let Ok(chunks) = audio_pipeline.receive_samples()
-                                    && let Some(sink) = audio_sink_opt.as_mut() {
+                                && let Ok(chunks) = audio_pipeline.receive_samples() {
+                                    for chunk in &chunks {
+                                        for (bucket_idx, rms) in crate::media::audio_pipeline::compute_rms_buckets(
+                                            chunk,
+                                            fps,
+                                            target_channels,
+                                            target_sample_rate,
+                                        ) {
+                                            let _ = loudness_tx.try_send((bucket_idx, rms));
+                                        }
+                                    }
+                                    if let Some(sink) = audio_sink_opt.as_mut() {
                                         sink.push(chunks);
                                     }
+                                }
                         }
                 }
         }
