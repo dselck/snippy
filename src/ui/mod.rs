@@ -106,15 +106,10 @@ impl MainApp {
 
         let pending_settings = settings.clone();
 
-        let mut playback = crate::media::PlaybackSession::new();
-
-        let demo_path = "workspace_demo_reel.mp4";
-        if std::path::Path::new(demo_path).exists() {
-            playback.load_video(demo_path, &settings);
-        }
+        let playback = crate::media::PlaybackSession::new();
 
         Self {
-            video_path: Some(demo_path.to_string()),
+            video_path: None,
             playback,
             in_marker: None,
             out_marker: None,
@@ -148,6 +143,10 @@ impl MainApp {
         let seconds = total_seconds.floor() as usize % 60;
         let centiseconds = ((total_seconds - total_seconds.floor()) * 100.0).floor() as usize;
         format!("{:02}:{:02}:{:02}.{:02}", hours, minutes, seconds, centiseconds)
+    }
+
+    pub fn is_frame_cut(&self, frame: usize) -> bool {
+        is_frame_cut_helper(frame, &self.ranges, self.cut_mode)
     }
 
     fn draw_settings_modal(&mut self, ctx: &egui::Context) {
@@ -805,6 +804,16 @@ impl MainApp {
         let track_height = 5.0; // Constant track height
         let track_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(rect.width(), track_height));
 
+        // Draw basic track background and return if no video loaded
+        if self.playback.total_frames() == 0 {
+            painter.rect_filled(
+                track_rect,
+                track_height * 0.5,
+                Color32::from_rgb(8, 8, 14),
+            );
+            return response;
+        }
+
         // 1. Draw track background color dynamically based on cut/keep mode
         let track_color = if self.cut_mode {
             Color32::from_rgb(8, 8, 14) // When cutting, default rest is keep (deep dark)
@@ -936,18 +945,28 @@ impl MainApp {
             Color32::from_rgb(236, 72, 153), // Hot pink playhead handle
         );
 
-        if response.drag_started() || response.clicked() {
-            self.playback.handle_input(media::InputEvent::ScrubDragStart);
-        }
-        if (response.dragged() || response.clicked())
-            && let Some(mouse_pos) = response.interact_pointer_pos() {
+        if response.clicked() {
+            if let Some(mouse_pos) = response.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.hover_pos())) {
                 let rel_x = (mouse_pos.x - rect.left()).clamp(0.0, rect.width());
                 let pct = rel_x / rect.width();
                 let target_frame = (pct * self.playback.total_frames() as f32) as usize;
-                self.playback.handle_input(media::InputEvent::ScrubDragUpdate { target_frame });
+                self.playback.set_playing(false);
+                self.playback.seek_internal(target_frame, false, true);
             }
-        if response.drag_stopped() || response.clicked() {
-            self.playback.handle_input(media::InputEvent::ScrubDragEnd);
+        } else {
+            if response.drag_started() {
+                self.playback.handle_input(media::InputEvent::ScrubDragStart);
+            }
+            if response.dragged()
+                && let Some(mouse_pos) = response.interact_pointer_pos() {
+                    let rel_x = (mouse_pos.x - rect.left()).clamp(0.0, rect.width());
+                    let pct = rel_x / rect.width();
+                    let target_frame = (pct * self.playback.total_frames() as f32) as usize;
+                    self.playback.handle_input(media::InputEvent::ScrubDragUpdate { target_frame });
+                }
+            if response.drag_stopped() {
+                self.playback.handle_input(media::InputEvent::ScrubDragEnd);
+            }
         }
 
         response
@@ -1078,7 +1097,8 @@ impl eframe::App for MainApp {
                 .fill(Color32::from_rgb(8, 8, 14))
                 .inner_margin(egui::Margin::symmetric(16, 12)))
             .show_inside(ui, |ui| {
-                ui.vertical(|ui| {
+                if self.video_path.is_some() {
+                    ui.vertical(|ui| {
                     // Timeline Time Indicators & Zoom Controls
                     ui.horizontal(|ui| {
                         ui.label(
@@ -1117,9 +1137,9 @@ impl eframe::App for MainApp {
                     let spacing_y = ui.spacing().item_spacing.y;
                     let filmstrip_height = (ui.available_height() - 30.0 - spacing_y).max(30.0);
 
-                    let (filmstrip_rect, _response) = ui.allocate_exact_size(
+                    let (filmstrip_rect, filmstrip_response) = ui.allocate_exact_size(
                         egui::vec2(total_width, filmstrip_height),
-                        egui::Sense::hover(),
+                        egui::Sense::click_and_drag(),
                     );
                     
                     let painter = ui.painter_at(filmstrip_rect);
@@ -1311,12 +1331,10 @@ impl eframe::App for MainApp {
                     }
 
                     // Step 5: Drag-to-Scrub Mouse Interaction
-                    let response_id = ui.make_persistent_id("filmstrip_viewport_interact");
-                    let filmstrip_response = ui.interact(filmstrip_rect, response_id, egui::Sense::click_and_drag());
                     
                     if filmstrip_response.dragged() || filmstrip_response.clicked() {
                         self.playback.set_playing(false);
-                        if let Some(pointer_pos) = filmstrip_response.interact_pointer_pos() {
+                        if let Some(pointer_pos) = filmstrip_response.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.hover_pos())) {
                             let dx_pixels = pointer_pos.x - playhead_x as f32;
                             let dt_seconds = dx_pixels as f64 / pixels_per_second;
                             let target_time = current_time_sec + dt_seconds;
@@ -1325,27 +1343,25 @@ impl eframe::App for MainApp {
                         }
                     }
 
-                    // Vertical Center Playhead line over the filmstrip
+                    // Playhead Triangle pointing down at the top of the filmstrip
                     let center_x = playhead_x;
-                    painter.line_segment(
-                        [egui::pos2(center_x, filmstrip_rect.top() - 2.0), egui::pos2(center_x, filmstrip_rect.bottom() + 2.0)],
-                        egui::Stroke::new(2.0, Color32::from_rgb(236, 72, 153)),
-                    );
-                    painter.circle_filled(
-                        egui::pos2(center_x, filmstrip_rect.top()),
-                        4.0,
+                    let p1 = egui::pos2(center_x - 6.0, filmstrip_rect.top() - 2.0);
+                    let p2 = egui::pos2(center_x + 6.0, filmstrip_rect.top() - 2.0);
+                    let p3 = egui::pos2(center_x, filmstrip_rect.top() + 6.0);
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![p1, p2, p3],
                         Color32::from_rgb(236, 72, 153),
-                    );
+                        egui::Stroke::NONE,
+                    ));
 
                     ui.add_space(6.0);
 
                     // 3. Compact Synced Waveform Component
                     let wave_height = 24.0;
-                    let (wave_rect, wave_response) = ui.allocate_exact_size(
+                    let (wave_rect, _wave_response) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), wave_height),
-                        egui::Sense::click_and_drag(),
+                        egui::Sense::hover(),
                     );
-                    let wave_response = wave_response.on_hover_text("Waveform Viewport: Drag or click to scrub");
 
                     let painter = ui.painter_at(wave_rect);
                     painter.rect(
@@ -1362,22 +1378,26 @@ impl eframe::App for MainApp {
                     let visible_range_width = (visible_duration * fps) as f32;
                     let start_frame = ((current_time_sec - (total_width_d * 0.5) / pixels_per_second) * fps) as isize;
 
-
-
-                    let frame_to_x = |frame: usize| -> f32 {
-                        let pct = (frame as isize - start_frame) as f32 / visible_range_width;
-                        wave_rect.left() + pct * wave_rect.width()
-                    };
-
                     // Render real loudness profile bars — one bar per pixel column
                     let loudness = self.playback.loudness_profile();
                     let total_buckets = loudness.len();
                     let bar_count = wave_rect.width() as usize;
                     let bar_width = 1.0_f32;
-                    let middle_y = wave_rect.center().y;
 
-                    // Track contiguous unloaded x-spans for the loading overlay
-                    let mut loading_span_start: Option<f32> = None;
+                    let first_visible_frame = start_frame.max(0) as usize;
+                    let last_visible_frame = (start_frame + visible_range_width as isize)
+                        .min(self.playback.total_frames() as isize) as usize;
+                    let first_bucket = (first_visible_frame * 4).min(total_buckets);
+                    let last_bucket = (last_visible_frame * 4 + 1).min(total_buckets);
+                    let max_amplitude = if first_bucket < last_bucket {
+                        loudness[first_bucket..last_bucket]
+                            .iter()
+                            .filter_map(|&amp_opt| amp_opt)
+                            .fold(0.0_f32, |a, b| a.max(b))
+                    } else {
+                        0.0_f32
+                    };
+                    let scale = if max_amplitude > 0.0 { max_amplitude } else { 1.0 };
 
                     for i in 0..bar_count {
                         let pct = i as f32 / bar_count as f32;
@@ -1396,190 +1416,36 @@ impl eframe::App for MainApp {
 
                         let amplitude_opt = bucket_idx.and_then(|bi| loudness[bi]);
 
-                        match amplitude_opt {
-                            None => {
-                                if loading_span_start.is_none() {
-                                    loading_span_start =
-                                        Some(wave_rect.left() + i as f32 * bar_width);
-                                }
-                                continue;
-                            }
-                            Some(amplitude) => {
-                                // Flush any accumulated loading span
-                                if let Some(lx) = loading_span_start.take() {
-                                    let rx = wave_rect.left() + i as f32 * bar_width;
-                                    painter.rect_filled(
-                                        egui::Rect::from_min_max(
-                                            egui::pos2(lx, wave_rect.top() + 1.0),
-                                            egui::pos2(rx, wave_rect.bottom() - 1.0),
-                                        ),
-                                        0.0,
-                                        Color32::from_rgba_premultiplied(55, 35, 75, 45),
-                                    );
-                                }
+                        if let Some(amplitude) = amplitude_opt {
+                            let scaled_amplitude = amplitude / scale;
+                            let bar_h = scaled_amplitude * (wave_rect.height() - 6.0);
+                            let x = wave_rect.left() + i as f32 * bar_width;
 
-                                let frame_idx = frame_idx_isize.clamp(
-                                    0,
-                                    self.playback.total_frames() as isize,
-                                ) as usize;
-                                let bar_h = amplitude * (wave_rect.height() - 6.0);
-                                let x = wave_rect.left() + i as f32 * bar_width;
-
-                                let inside_active_selection =
-                                    match (self.in_marker, self.out_marker) {
-                                        (Some(inf), Some(outf)) => {
-                                            frame_idx >= inf && frame_idx <= outf
-                                        }
-                                        _ => false,
-                                    };
-                                let inside_queued_range = self
-                                    .ranges
-                                    .iter()
-                                    .any(|r| frame_idx >= r.in_frame && frame_idx <= r.out_frame);
-
-                                let bar_color = if out_of_bounds {
-                                    Color32::from_rgb(20, 19, 32)
-                                } else if inside_active_selection {
-                                    Color32::from_rgb(59, 130, 246)
-                                } else if inside_queued_range {
-                                    if self.cut_mode {
-                                        Color32::from_rgb(239, 68, 68)
-                                    } else {
-                                        Color32::from_rgb(16, 185, 129)
-                                    }
-                                } else if self.cut_mode {
-                                    Color32::from_rgb(12, 55, 35)
-                                } else {
-                                    Color32::from_rgb(85, 30, 30)
-                                };
-
-                                painter.line_segment(
-                                    [
-                                        egui::pos2(x + bar_width * 0.5, middle_y - bar_h * 0.5),
-                                        egui::pos2(x + bar_width * 0.5, middle_y + bar_h * 0.5),
-                                    ],
-                                    egui::Stroke::new(bar_width, bar_color),
-                                );
-                            }
-                        }
-                    }
-
-                    // Flush any trailing loading span at the right edge
-                    if let Some(lx) = loading_span_start.take() {
-                        painter.rect_filled(
-                            egui::Rect::from_min_max(
-                                egui::pos2(lx, wave_rect.top() + 1.0),
-                                egui::pos2(wave_rect.right(), wave_rect.bottom() - 1.0),
-                            ),
-                            0.0,
-                            Color32::from_rgba_premultiplied(55, 35, 75, 45),
-                        );
-                    }
-
-                    // Highlight queued ranges inside the visible window
-                    for range in &self.ranges {
-                        let raw_left = frame_to_x(range.in_frame);
-                        let raw_right = frame_to_x(range.out_frame);
-                        
-                        if raw_right >= wave_rect.left() && raw_left <= wave_rect.right() {
-                            let left_x = raw_left.clamp(wave_rect.left(), wave_rect.right());
-                            let right_x = raw_right.clamp(wave_rect.left(), wave_rect.right());
-                            
-                            let overlay_color = if self.cut_mode {
-                                Color32::from_rgba_premultiplied(239, 68, 68, 15)
+                            let bar_color = if out_of_bounds {
+                                Color32::from_rgb(20, 19, 32)
                             } else {
-                                Color32::from_rgba_premultiplied(16, 185, 129, 15)
-                            };
-                            
-                            let line_color = if self.cut_mode {
-                                Color32::from_rgba_premultiplied(239, 68, 68, 100)
-                            } else {
-                                Color32::from_rgba_premultiplied(16, 185, 129, 100)
+                                Color32::from_rgb(99, 102, 241) // Premium Indigo accent color
                             };
 
-                            painter.rect_filled(
-                                egui::Rect::from_min_max(
-                                    egui::pos2(left_x, wave_rect.top() + 1.0),
-                                    egui::pos2(right_x, wave_rect.bottom() - 1.0),
-                                ),
-                                0.0,
-                                overlay_color,
+                            painter.line_segment(
+                                [
+                                    egui::pos2(x + bar_width * 0.5, wave_rect.bottom() - 3.0),
+                                    egui::pos2(x + bar_width * 0.5, wave_rect.bottom() - 3.0 - bar_h),
+                                ],
+                                egui::Stroke::new(bar_width, bar_color),
                             );
-                            
-                            if raw_left >= wave_rect.left() && raw_left <= wave_rect.right() {
-                                painter.line_segment(
-                                    [egui::pos2(raw_left, wave_rect.top()), egui::pos2(raw_left, wave_rect.bottom())],
-                                    egui::Stroke::new(1.0, line_color),
-                                );
-                            }
-                            if raw_right >= wave_rect.left() && raw_right <= wave_rect.right() {
-                                painter.line_segment(
-                                    [egui::pos2(raw_right, wave_rect.top()), egui::pos2(raw_right, wave_rect.bottom())],
-                                    egui::Stroke::new(1.0, line_color),
-                                );
-                            }
                         }
-                    }
-
-                    // Highlight selected range inside the visible window
-                    if let (Some(inf), Some(outf)) = (self.in_marker, self.out_marker) {
-                        let raw_left = frame_to_x(inf);
-                        let raw_right = frame_to_x(outf);
-                        
-                        if raw_right >= wave_rect.left() && raw_left <= wave_rect.right() {
-                            let left_x = raw_left.clamp(wave_rect.left(), wave_rect.right());
-                            let right_x = raw_right.clamp(wave_rect.left(), wave_rect.right());
-                            
-                            painter.rect_filled(
-                                egui::Rect::from_min_max(
-                                    egui::pos2(left_x, wave_rect.top() + 1.0),
-                                    egui::pos2(right_x, wave_rect.bottom() - 1.0),
-                                ),
-                                0.0,
-                                Color32::from_rgba_premultiplied(59, 130, 246, 15),
-                            );
-                            
-                            if raw_left >= wave_rect.left() && raw_left <= wave_rect.right() {
-                                painter.line_segment(
-                                    [egui::pos2(raw_left, wave_rect.top()), egui::pos2(raw_left, wave_rect.bottom())],
-                                    egui::Stroke::new(2.0, Color32::from_rgb(59, 130, 246)),
-                                );
-                            }
-                            if raw_right >= wave_rect.left() && raw_right <= wave_rect.right() {
-                                painter.line_segment(
-                                    [egui::pos2(raw_right, wave_rect.top()), egui::pos2(raw_right, wave_rect.bottom())],
-                                    egui::Stroke::new(2.0, Color32::from_rgb(59, 130, 246)),
-                                );
-                            }
-                        }
-                    }
-
-                    // Playhead vertical line is always centered in the synced waveform
-                    let playhead_x = wave_rect.center().x;
-                    painter.line_segment(
-                        [egui::pos2(playhead_x, wave_rect.top() - 2.0), egui::pos2(playhead_x, wave_rect.bottom() + 2.0)],
-                        egui::Stroke::new(2.0, Color32::from_rgb(236, 72, 153)),
-                    );
-                    painter.circle_filled(
-                        egui::pos2(playhead_x, wave_rect.top()),
-                        3.0,
-                        Color32::from_rgb(236, 72, 153),
-                    );
-
-                    if wave_response.drag_started() || wave_response.clicked() {
-                        self.playback.handle_input(media::InputEvent::ScrubDragStart);
-                    }
-                    if (wave_response.dragged() || wave_response.clicked())
-                        && let Some(mouse_pos) = wave_response.interact_pointer_pos() {
-                            let rel_x = (mouse_pos.x - wave_rect.left()).clamp(0.0, wave_rect.width());
-                            let pct = rel_x / wave_rect.width();
-                            let target_frame = (pct * self.playback.total_frames() as f32) as usize;
-                            self.playback.handle_input(media::InputEvent::ScrubDragUpdate { target_frame });
-                        }
-                    if wave_response.drag_stopped() || wave_response.clicked() {
-                        self.playback.handle_input(media::InputEvent::ScrubDragEnd);
                     }
                 });
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            egui::RichText::new("No timeline available — load a video to begin editing")
+                                .size(14.0)
+                                .color(Color32::from_rgb(85, 83, 115))
+                        );
+                    });
+                }
             });
 
         // Egui's TopBottomPanel automatically persists the resized height in its internal memory.
@@ -1881,14 +1747,133 @@ impl eframe::App for MainApp {
                             }
 
                             if !rendered {
-                                // Draw a visual loading/empty state in the viewport
-                                painter.text(
-                                    rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "WORKSPACE DEMO REEL\n\n(wgpu video surface output will render here via Metal/DirectX/Vulkan)\n(YUV conversion handled entirely on the GPU)",
-                                    egui::FontId::proportional(15.0),
-                                    Color32::from_rgb(85, 83, 115),
-                                );
+                                if self.video_path.is_none() {
+                                    // Premium empty state design
+                                    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                                        ui.centered_and_justified(|ui| {
+                                            ui.vertical_centered(|ui| {
+                                                let content_height = 160.0;
+                                                let pad = (rect.height() - content_height) * 0.5;
+                                                ui.add_space(pad.max(0.0));
+                                                
+                                                // 1. Draw a beautiful video symbol or icon (custom drawing)
+                                                let icon_size = 48.0;
+                                                let (icon_rect, icon_resp) = ui.allocate_exact_size(
+                                                    egui::vec2(icon_size, icon_size),
+                                                    egui::Sense::click()
+                                                );
+                                                let icon_painter = ui.painter_at(icon_rect);
+                                                
+                                                let icon_color = if icon_resp.hovered() {
+                                                    Color32::from_rgb(129, 140, 248) // Lighter Indigo
+                                                } else {
+                                                    Color32::from_rgb(99, 102, 241) // Normal Indigo
+                                                };
+
+                                                icon_painter.rect_stroke(
+                                                    icon_rect.shrink(6.0),
+                                                    4.0,
+                                                    egui::Stroke::new(2.0, icon_color),
+                                                    egui::StrokeKind::Inside,
+                                                );
+                                                // Draw sprocket holes
+                                                for y in 0..4 {
+                                                    let offset_y = 8.0 + y as f32 * 10.0;
+                                                    icon_painter.rect_filled(
+                                                        egui::Rect::from_min_size(
+                                                            egui::pos2(icon_rect.left() + 8.0, icon_rect.top() + offset_y),
+                                                            egui::vec2(3.0, 3.0),
+                                                        ),
+                                                        0.5,
+                                                        icon_color,
+                                                    );
+                                                    icon_painter.rect_filled(
+                                                        egui::Rect::from_min_size(
+                                                            egui::pos2(icon_rect.right() - 11.0, icon_rect.top() + offset_y),
+                                                            egui::vec2(3.0, 3.0),
+                                                        ),
+                                                        0.5,
+                                                        icon_color,
+                                                    );
+                                                }
+                                                // Draw play triangle in the center
+                                                let tri_center = icon_rect.center();
+                                                let tri_p1 = egui::pos2(tri_center.x - 3.0, tri_center.y - 5.0);
+                                                let tri_p2 = egui::pos2(tri_center.x - 3.0, tri_center.y + 5.0);
+                                                let tri_p3 = egui::pos2(tri_center.x + 5.0, tri_center.y);
+                                                icon_painter.add(egui::Shape::convex_polygon(
+                                                    vec![tri_p1, tri_p2, tri_p3],
+                                                    icon_color,
+                                                    egui::Stroke::NONE,
+                                                ));
+
+                                                ui.add_space(16.0);
+
+                                                // 2. Beautiful Title
+                                                ui.label(
+                                                    egui::RichText::new("No Video Source")
+                                                        .size(20.0)
+                                                        .strong()
+                                                        .color(Color32::WHITE)
+                                                );
+
+                                                ui.add_space(8.0);
+
+                                                // 3. Helpful description
+                                                ui.label(
+                                                    egui::RichText::new("Import a video file to begin cutting snippets")
+                                                        .size(13.0)
+                                                        .color(Color32::from_rgb(142, 144, 166))
+                                                );
+
+                                                ui.add_space(20.0);
+
+                                                // 4. Premium Upload / Load button
+                                                let btn = egui::Button::new(
+                                                    egui::RichText::new("Open Video File")
+                                                        .font(egui::FontId::proportional(13.0))
+                                                        .strong()
+                                                        .color(Color32::WHITE)
+                                                )
+                                                .fill(Color32::from_rgb(37, 35, 58))
+                                                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(59, 56, 92)))
+                                                .corner_radius(6.0)
+                                                .min_size(egui::vec2(150.0, 32.0));
+
+                                                let btn_resp = ui.add(btn);
+                                                
+                                                // Trigger load logic if clicked
+                                                if btn_resp.clicked() || icon_resp.clicked() {
+                                                    if let Some(path) = {
+                                                        let mut dlg = rfd::FileDialog::new()
+                                                            .add_filter("Video", &["mp4", "mkv", "avi", "mov"]);
+                                                        if !self.settings.general.default_open_directory.is_empty() {
+                                                            dlg = dlg.set_directory(&self.settings.general.default_open_directory);
+                                                        }
+                                                        dlg.pick_file()
+                                                    } {
+                                                        let path_str = path.to_string_lossy().to_string();
+                                                        self.playback.load_video(&path_str, &self.settings);
+                                                        self.settings.add_recent_file(&path_str);
+                                                        self.pending_settings.general.recent_files = self.settings.general.recent_files.clone();
+                                                        self.video_path = Some(path_str.clone());
+                                                        self.in_marker = None;
+                                                        self.out_marker = None;
+                                                    }
+                                                }
+                                            });
+                                        });
+                                    });
+                                } else {
+                                    // Decoding state
+                                    painter.text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "Decoding video frame...",
+                                        egui::FontId::proportional(15.0),
+                                        Color32::from_rgb(85, 83, 115),
+                                    );
+                                }
                             }
 
                             // Draw a subtle border glow inside the viewport
@@ -2068,48 +2053,50 @@ impl eframe::App for MainApp {
                         let offset = (full_width - controls_width) * 0.5;
                         ui.add_space(offset.max(0.0));
 
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(controls_width, 34.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+                        ui.add_enabled_ui(self.video_path.is_some(), |ui| {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(controls_width, 34.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
-                                if playback_control_button(ui, PlaybackIcon::Start, false, "Go to start of video").clicked() {
-                                    self.playback.seek_internal(0, false, true);
-                                }
-                                let prev_resp = playback_control_button(ui, PlaybackIcon::PrevFrame, false, "Step backward one frame");
-                                if prev_resp.clicked() {
-                                    prev_pressed = true;
-                                }
-                                if prev_resp.is_pointer_button_down_on() {
-                                    prev_down = true;
-                                }
-                                if playback_control_button(ui, PlaybackIcon::SetIn, false, "Set In marker at current frame [").clicked() {
-                                    self.in_marker = Some(self.playback.current_frame());
-                                }
+                                    if playback_control_button(ui, PlaybackIcon::Start, false, "Go to start of video").clicked() {
+                                        self.playback.seek_internal(0, false, true);
+                                    }
+                                    let prev_resp = playback_control_button(ui, PlaybackIcon::PrevFrame, false, "Step backward one frame");
+                                    if prev_resp.clicked() {
+                                        prev_pressed = true;
+                                    }
+                                    if prev_resp.is_pointer_button_down_on() {
+                                        prev_down = true;
+                                    }
+                                    if playback_control_button(ui, PlaybackIcon::SetIn, false, "Set In marker at current frame [").clicked() {
+                                        self.in_marker = Some(self.playback.current_frame());
+                                    }
 
-                                // Play/pause button
-                                let play_icon = if self.playback.is_playing() { PlaybackIcon::Pause } else { PlaybackIcon::Play };
-                                let play_tooltip = if self.playback.is_playing() { "Pause playback" } else { "Start playback" };
-                                if playback_control_button(ui, play_icon, true, play_tooltip).clicked() {
-                                    self.playback.toggle_playback();
-                                }
+                                    // Play/pause button
+                                    let play_icon = if self.playback.is_playing() { PlaybackIcon::Pause } else { PlaybackIcon::Play };
+                                    let play_tooltip = if self.playback.is_playing() { "Pause playback" } else { "Start playback" };
+                                    if playback_control_button(ui, play_icon, true, play_tooltip).clicked() {
+                                        self.playback.toggle_playback();
+                                    }
 
-                                if playback_control_button(ui, PlaybackIcon::SetOut, false, "Set Out marker at current frame ]").clicked() {
-                                    self.out_marker = Some(self.playback.current_frame());
-                                }
-                                let next_resp = playback_control_button(ui, PlaybackIcon::NextFrame, false, "Step forward one frame");
-                                if next_resp.clicked() {
-                                    next_pressed = true;
-                                }
-                                if next_resp.is_pointer_button_down_on() {
-                                    next_down = true;
-                                }
-                                if playback_control_button(ui, PlaybackIcon::End, false, "Go to end of video").clicked() {
-                                    self.playback.seek_internal(self.playback.total_frames(), false, true);
-                                }
-                            },
-                        );
+                                    if playback_control_button(ui, PlaybackIcon::SetOut, false, "Set Out marker at current frame ]").clicked() {
+                                        self.out_marker = Some(self.playback.current_frame());
+                                    }
+                                    let next_resp = playback_control_button(ui, PlaybackIcon::NextFrame, false, "Step forward one frame");
+                                    if next_resp.clicked() {
+                                        next_pressed = true;
+                                    }
+                                    if next_resp.is_pointer_button_down_on() {
+                                        next_down = true;
+                                    }
+                                    if playback_control_button(ui, PlaybackIcon::End, false, "Go to end of video").clicked() {
+                                        self.playback.seek_internal(self.playback.total_frames(), false, true);
+                                    }
+                                },
+                            );
+                        });
 
                         // 2. Right-justified Add Snippet button (placed at the end of the row)
                         let mut clicked = false;
@@ -2229,5 +2216,37 @@ impl eframe::egui_wgpu::CallbackTrait for YuvCallback {
         }
     }
 }
+
+pub fn is_frame_cut_helper(frame: usize, ranges: &[ExportRange], cut_mode: bool) -> bool {
+    let is_in_snippet = ranges.iter().any(|r| frame >= r.in_frame && frame <= r.out_frame);
+    if cut_mode {
+        is_in_snippet
+    } else {
+        !is_in_snippet
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_frame_cut() {
+        let ranges = vec![
+            ExportRange { id: 1, in_frame: 10, out_frame: 20 },
+            ExportRange { id: 2, in_frame: 40, out_frame: 50 },
+        ];
+        // Cut mode: ranges are cut, rest is kept
+        assert!(is_frame_cut_helper(15, &ranges, true));
+        assert!(!is_frame_cut_helper(30, &ranges, true));
+        assert!(is_frame_cut_helper(45, &ranges, true));
+
+        // Keep mode: ranges are kept, rest is cut
+        assert!(!is_frame_cut_helper(15, &ranges, false));
+        assert!(is_frame_cut_helper(30, &ranges, false));
+        assert!(!is_frame_cut_helper(45, &ranges, false));
+    }
+}
+
 
 
