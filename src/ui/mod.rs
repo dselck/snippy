@@ -1359,17 +1359,7 @@ impl eframe::App for MainApp {
                     let visible_range_width = (visible_duration * fps) as f32;
                     let start_frame = ((current_time_sec - (total_width_d * 0.5) / pixels_per_second) * fps) as isize;
 
-                    if let Some(tx) = self.playback.loudness_decode_tx.as_ref() {
-                        let padding = (visible_range_width * 0.2) as isize;
-                        let request_start = (start_frame - padding).max(0) as usize;
-                        let request_end = (start_frame + visible_range_width as isize + padding).min(self.playback.total_frames() as isize) as usize;
-                        if request_start < request_end {
-                            let _ = tx.send(crate::media::session::LoudnessCommand::Request {
-                                start_frame: request_start,
-                                end_frame: request_end,
-                            });
-                        }
-                    }
+
 
                     let frame_to_x = |frame: usize| -> f32 {
                         let pct = (frame as isize - start_frame) as f32 / visible_range_width;

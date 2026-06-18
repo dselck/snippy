@@ -57,16 +57,8 @@ pub struct PlaybackSession {
     thumbnail_threads: Vec<thread::JoinHandle<()>>,
     loudness_profile: Vec<Option<f32>>,
     loudness_rx: Option<crossbeam_channel::Receiver<(usize, f32)>>,
-    pub(crate) loudness_decode_tx: Option<Sender<LoudnessCommand>>,
+    pub(crate) loudness_shutdown_tx: Option<Sender<()>>,
     loudness_threads: Vec<thread::JoinHandle<()>>,
-}
-
-#[derive(Debug, Clone)]
-pub enum LoudnessCommand {
-    Request {
-        start_frame: usize,
-        end_frame: usize,
-    },
 }
 
 impl Default for PlaybackSession {
@@ -133,7 +125,7 @@ impl PlaybackSession {
             thumbnail_threads: Vec::new(),
             loudness_profile: Vec::new(),
             loudness_rx: None,
-            loudness_decode_tx: None,
+            loudness_shutdown_tx: None,
             loudness_threads: Vec::new(),
         }
     }
@@ -148,7 +140,7 @@ impl PlaybackSession {
     }
 
     pub fn shutdown_loudness_thread(&mut self) {
-        drop(self.loudness_decode_tx.take());
+        drop(self.loudness_shutdown_tx.take());
         for handle in self.loudness_threads.drain(..) {
             let _ = handle.join();
         }
@@ -203,14 +195,14 @@ impl PlaybackSession {
                 self.thumbnail_rx = Some(t_rx);
                 self.thumbnail_threads = t_handles;
 
-                let (l_cmd_tx, l_cmd_rx) = crossbeam_channel::unbounded::<LoudnessCommand>();
+                let (shutdown_tx, shutdown_rx) = crossbeam_channel::unbounded::<()>();
                 let loudness_tx_clone = loudness_tx;
                 let path_clone = path.to_string();
                 let fps_clone = meta.fps;
                 let handle = thread::spawn(move || {
-                    run_loudness_decoder(path_clone, fps_clone, l_cmd_rx, loudness_tx_clone);
+                    run_entire_audio_decoder(path_clone, fps_clone, shutdown_rx, loudness_tx_clone);
                 });
-                self.loudness_decode_tx = Some(l_cmd_tx);
+                self.loudness_shutdown_tx = Some(shutdown_tx);
                 self.loudness_threads = vec![handle];
 
                 self.seek_internal(0, false, true);
@@ -356,14 +348,14 @@ impl PlaybackSession {
                 self.thumbnail_rx = Some(t_rx);
                 self.thumbnail_threads = t_handles;
 
-                let (l_cmd_tx, l_cmd_rx) = crossbeam_channel::unbounded::<LoudnessCommand>();
+                let (shutdown_tx, shutdown_rx) = crossbeam_channel::unbounded::<()>();
                 let loudness_tx_clone = loudness_tx;
                 let path_clone = path.to_string();
                 let fps_clone = meta.fps;
                 let handle = thread::spawn(move || {
-                    run_loudness_decoder(path_clone, fps_clone, l_cmd_rx, loudness_tx_clone);
+                    run_entire_audio_decoder(path_clone, fps_clone, shutdown_rx, loudness_tx_clone);
                 });
-                self.loudness_decode_tx = Some(l_cmd_tx);
+                self.loudness_shutdown_tx = Some(shutdown_tx);
                 self.loudness_threads = vec![handle];
 
                 self.seek_internal(0, false, true);
@@ -670,10 +662,10 @@ mod tests {
     }
 }
 
-fn run_loudness_decoder(
+fn run_entire_audio_decoder(
     path: String,
     fps: f64,
-    command_rx: Receiver<LoudnessCommand>,
+    shutdown_rx: Receiver<()>,
     loudness_tx: Sender<(usize, f32)>,
 ) {
     ffmpeg_next::init().ok();
@@ -709,52 +701,24 @@ fn run_loudness_decoder(
         0.0,
     );
 
-    loop {
-        let mut cmd = match command_rx.recv() {
-            Ok(c) => c,
-            Err(_) => break,
-        };
+    let mut packets = input.packets();
+    let mut check_counter = 0;
 
-        while let Ok(newer_cmd) = command_rx.try_recv() {
-            cmd = newer_cmd;
-        }
-
-        let LoudnessCommand::Request { start_frame, end_frame } = cmd;
-
-        let start_sec = start_frame as f64 / fps;
-        let pts_us = (start_sec * 1_000_000.0) as i64;
-
-        if input.seek(pts_us, ..pts_us).is_ok() {
-            pipeline.handle_seek(start_sec);
-        }
-
-        let end_sec = end_frame as f64 / fps;
-        let mut packets = input.packets();
-
-        while let Some((stream, packet)) = packets.next() {
-            if !command_rx.is_empty() {
+    while let Some((stream, packet)) = packets.next() {
+        check_counter += 1;
+        if check_counter % 64 == 0 {
+            if shutdown_rx.try_recv().is_ok() {
                 break;
             }
+        }
 
-            if stream.index() == audio_stream_index {
-                if pipeline.send_packet(&packet).is_ok() {
-                    if let Ok(chunks) = pipeline.receive_samples() {
-                        let mut reached_end = false;
-                        for chunk in chunks {
-                            if let Some((_, chunk_pts_us)) = chunk.tag {
-                                let chunk_sec = chunk_pts_us as f64 / 1_000_000.0;
-                                if chunk_sec > end_sec {
-                                    reached_end = true;
-                                    break;
-                                }
-                            }
-                            let buckets = crate::media::audio_pipeline::compute_rms_buckets(&chunk, fps, 1, 48000);
-                            for (b_idx, rms) in buckets {
-                                let _ = loudness_tx.send((b_idx, rms));
-                            }
-                        }
-                        if reached_end {
-                            break;
+        if stream.index() == audio_stream_index {
+            if pipeline.send_packet(&packet).is_ok() {
+                if let Ok(chunks) = pipeline.receive_samples() {
+                    for chunk in chunks {
+                        let buckets = crate::media::audio_pipeline::compute_rms_buckets(&chunk, fps, 1, 48000);
+                        for (b_idx, rms) in buckets {
+                            let _ = loudness_tx.send((b_idx, rms));
                         }
                     }
                 }
