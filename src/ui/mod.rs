@@ -979,7 +979,10 @@ impl eframe::App for MainApp {
         }
 
         // Receive frames from the Media Engine
-        let (latest_frame, frames_popped) = self.playback.update();
+        let (latest_frame, frames_popped, loudness_updated) = self.playback.update();
+        if loudness_updated {
+            ctx.request_repaint();
+        }
         if frames_popped > 0 {
             self.decode_fps_frame_count += frames_popped;
         }

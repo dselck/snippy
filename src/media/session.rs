@@ -363,7 +363,7 @@ impl PlaybackSession {
         }
     }
 
-    pub fn update(&mut self) -> (Option<&DecodedFrame>, usize) {
+    pub fn update(&mut self) -> (Option<&DecodedFrame>, usize, bool) {
         let mut got_frame = false;
         let mut frames_received = 0;
 
@@ -403,17 +403,19 @@ impl PlaybackSession {
         }
         
         // Drain loudness side-channel — write each bucket at most once
+        let mut loudness_updated = false;
         if let Some(rx) = &self.loudness_rx {
             while let Ok((bucket_idx, rms)) = rx.try_recv() {
                 if let Some(slot) = self.loudness_profile.get_mut(bucket_idx) {
                     if slot.is_none() {
                         *slot = Some(rms);
+                        loudness_updated = true;
                     }
                 }
             }
         }
         
-        (self.latest_frame.as_ref(), frames_received)
+        (self.latest_frame.as_ref(), frames_received, loudness_updated)
     }
 
     pub fn loudness_profile(&self) -> &[Option<f32>] {
