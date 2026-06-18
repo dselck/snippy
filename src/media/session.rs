@@ -57,6 +57,16 @@ pub struct PlaybackSession {
     thumbnail_threads: Vec<thread::JoinHandle<()>>,
     loudness_profile: Vec<Option<f32>>,
     loudness_rx: Option<crossbeam_channel::Receiver<(usize, f32)>>,
+    pub(crate) loudness_decode_tx: Option<Sender<LoudnessCommand>>,
+    loudness_threads: Vec<thread::JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum LoudnessCommand {
+    Request {
+        start_frame: usize,
+        end_frame: usize,
+    },
 }
 
 impl Default for PlaybackSession {
@@ -68,6 +78,7 @@ impl Default for PlaybackSession {
 impl Drop for PlaybackSession {
     fn drop(&mut self) {
         self.shutdown_thumbnail_thread();
+        self.shutdown_loudness_thread();
     }
 }
 
@@ -122,6 +133,8 @@ impl PlaybackSession {
             thumbnail_threads: Vec::new(),
             loudness_profile: Vec::new(),
             loudness_rx: None,
+            loudness_decode_tx: None,
+            loudness_threads: Vec::new(),
         }
     }
 
@@ -134,8 +147,16 @@ impl PlaybackSession {
         }
     }
 
+    pub fn shutdown_loudness_thread(&mut self) {
+        drop(self.loudness_decode_tx.take());
+        for handle in self.loudness_threads.drain(..) {
+            let _ = handle.join();
+        }
+    }
+
     pub fn load_video(&mut self, path: &str, settings: &crate::settings::Settings) {
         self.shutdown_thumbnail_thread();
+        self.shutdown_loudness_thread();
         if let Ok(mut ae) = AudioEngine::new() {
             let channels = ae.channels;
             let audio_tx = ae.tx.take().unwrap();
@@ -154,7 +175,7 @@ impl PlaybackSession {
                 tags_tx,
                 cmd_rx,
                 master_clock.clone(),
-                loudness_tx,
+                loudness_tx.clone(),
                 settings.hardware.playback_hw_accel,
                 settings.advanced.presenter_lookahead_depth,
             ) {
@@ -181,6 +202,16 @@ impl PlaybackSession {
                 self.thumbnail_tx = Some(t_tx);
                 self.thumbnail_rx = Some(t_rx);
                 self.thumbnail_threads = t_handles;
+
+                let (l_cmd_tx, l_cmd_rx) = crossbeam_channel::unbounded::<LoudnessCommand>();
+                let loudness_tx_clone = loudness_tx;
+                let path_clone = path.to_string();
+                let fps_clone = meta.fps;
+                let handle = thread::spawn(move || {
+                    run_loudness_decoder(path_clone, fps_clone, l_cmd_rx, loudness_tx_clone);
+                });
+                self.loudness_decode_tx = Some(l_cmd_tx);
+                self.loudness_threads = vec![handle];
 
                 self.seek_internal(0, false, true);
             }
@@ -297,7 +328,7 @@ impl PlaybackSession {
                 tags_tx,
                 cmd_rx,
                 master_clock.clone(),
-                loudness_tx,
+                loudness_tx.clone(),
                 settings.hardware.playback_hw_accel,
                 settings.advanced.presenter_lookahead_depth,
             ) {
@@ -324,6 +355,16 @@ impl PlaybackSession {
                 self.thumbnail_tx = Some(t_tx);
                 self.thumbnail_rx = Some(t_rx);
                 self.thumbnail_threads = t_handles;
+
+                let (l_cmd_tx, l_cmd_rx) = crossbeam_channel::unbounded::<LoudnessCommand>();
+                let loudness_tx_clone = loudness_tx;
+                let path_clone = path.to_string();
+                let fps_clone = meta.fps;
+                let handle = thread::spawn(move || {
+                    run_loudness_decoder(path_clone, fps_clone, l_cmd_rx, loudness_tx_clone);
+                });
+                self.loudness_decode_tx = Some(l_cmd_tx);
+                self.loudness_threads = vec![handle];
 
                 self.seek_internal(0, false, true);
             }
@@ -625,6 +666,99 @@ mod tests {
                 assert_eq!(keyframe_only, false);
             }
             _ => panic!("Expected Seek command"),
+        }
+    }
+}
+
+fn run_loudness_decoder(
+    path: String,
+    fps: f64,
+    command_rx: Receiver<LoudnessCommand>,
+    loudness_tx: Sender<(usize, f32)>,
+) {
+    ffmpeg_next::init().ok();
+    let mut input = match ffmpeg_next::format::input(&path) {
+        Ok(i) => i,
+        Err(_) => return,
+    };
+
+    let stream = match input.streams().best(ffmpeg_next::media::Type::Audio) {
+        Some(s) => s,
+        None => return,
+    };
+
+    let audio_stream_index = stream.index();
+    let audio_codec_ctx = match ffmpeg_next::codec::context::Context::from_parameters(stream.parameters()) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let audio_decoder = match audio_codec_ctx.decoder().audio() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    let audio_time_base = stream.time_base();
+    let audio_tb_f64 = audio_time_base.numerator() as f64 / audio_time_base.denominator() as f64;
+
+    let mut pipeline = crate::media::audio_pipeline::AudioDecoderPipeline::new(
+        audio_decoder,
+        48000,
+        1,
+        audio_tb_f64,
+        0.0,
+    );
+
+    loop {
+        let mut cmd = match command_rx.recv() {
+            Ok(c) => c,
+            Err(_) => break,
+        };
+
+        while let Ok(newer_cmd) = command_rx.try_recv() {
+            cmd = newer_cmd;
+        }
+
+        let LoudnessCommand::Request { start_frame, end_frame } = cmd;
+
+        let start_sec = start_frame as f64 / fps;
+        let pts_us = (start_sec * 1_000_000.0) as i64;
+
+        if input.seek(pts_us, ..pts_us).is_ok() {
+            pipeline.handle_seek(start_sec);
+        }
+
+        let end_sec = end_frame as f64 / fps;
+        let mut packets = input.packets();
+
+        while let Some((stream, packet)) = packets.next() {
+            if !command_rx.is_empty() {
+                break;
+            }
+
+            if stream.index() == audio_stream_index {
+                if pipeline.send_packet(&packet).is_ok() {
+                    if let Ok(chunks) = pipeline.receive_samples() {
+                        let mut reached_end = false;
+                        for chunk in chunks {
+                            if let Some((_, chunk_pts_us)) = chunk.tag {
+                                let chunk_sec = chunk_pts_us as f64 / 1_000_000.0;
+                                if chunk_sec > end_sec {
+                                    reached_end = true;
+                                    break;
+                                }
+                            }
+                            let buckets = crate::media::audio_pipeline::compute_rms_buckets(&chunk, fps, 1, 48000);
+                            for (b_idx, rms) in buckets {
+                                let _ = loudness_tx.send((b_idx, rms));
+                            }
+                        }
+                        if reached_end {
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 }
