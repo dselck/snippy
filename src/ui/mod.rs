@@ -1232,17 +1232,46 @@ impl eframe::App for MainApp {
                             egui::vec2(actual_thumb_width, thumb_height),
                         );
 
+                        let is_cut = self.is_frame_cut(target_frame);
+                        let tint = if is_cut {
+                            Color32::from_gray(90) // Dimmed
+                        } else {
+                            Color32::WHITE
+                        };
+
                         if let Some(texture) = self.thumbnail_cache.get(&target_frame) {
                             // Draw decoded thumbnail image
                             painter.image(
                                 texture.id(),
                                 thub_rect,
                                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                                Color32::WHITE,
+                                tint,
                             );
+
+                            if is_cut {
+                                // Draw red transparent tint
+                                painter.rect_filled(
+                                    thub_rect,
+                                    0.0,
+                                    Color32::from_rgba_unmultiplied(239, 68, 68, 20),
+                                );
+                                // Draw diagonal hatching lines
+                                draw_hatching(
+                                    &painter,
+                                    thub_rect,
+                                    Color32::from_rgba_unmultiplied(239, 68, 68, 45),
+                                    1.0,
+                                    12.0,
+                                );
+                            }
                         } else {
                             // Placeholder loading card with animated spinner
-                            painter.rect_filled(thub_rect, 4.0, Color32::from_rgb(18, 17, 28));
+                            let placeholder_bg = if is_cut {
+                                Color32::from_rgb(18, 10, 15) // Darker reddish bg
+                            } else {
+                                Color32::from_rgb(18, 17, 28)
+                            };
+                            painter.rect_filled(thub_rect, 4.0, placeholder_bg);
                             painter.rect_stroke(thub_rect, 4.0, egui::Stroke::new(1.0, Color32::from_rgb(45, 43, 75)), egui::StrokeKind::Inside);
                             if inner_height > 16.0 {
                                 // Spinning arc: one full revolution every 1.2 s
@@ -1273,9 +1302,30 @@ impl eframe::App for MainApp {
                                 }
                                 ui.ctx().request_repaint();
                             }
+                            if is_cut {
+                                draw_hatching(
+                                    &painter,
+                                    thub_rect,
+                                    Color32::from_rgba_unmultiplied(239, 68, 68, 30),
+                                    1.0,
+                                    12.0,
+                                );
+                            }
                             if !self.in_flight_requests.contains_key(&target_frame) {
                                 visible_frames.push(target_frame);
                                 self.in_flight_requests.insert(target_frame, now);
+                            }
+                        }
+
+                        // Draw active selection border (blue outline)
+                        if let (Some(inf), Some(outf)) = (self.in_marker, self.out_marker) {
+                            if target_frame >= inf && target_frame <= outf {
+                                painter.rect_stroke(
+                                    thub_rect,
+                                    4.0,
+                                    egui::Stroke::new(2.0, Color32::from_rgb(59, 130, 246)),
+                                    egui::StrokeKind::Inside,
+                                );
                             }
                         }
 
@@ -2214,6 +2264,17 @@ impl eframe::egui_wgpu::CallbackTrait for YuvCallback {
 
             renderer.render(render_pass);
         }
+    }
+}
+
+fn draw_hatching(painter: &egui::Painter, rect: egui::Rect, color: Color32, stroke_width: f32, spacing: f32) {
+    let clipped_painter = painter.with_clip_rect(rect);
+    let mut x = rect.min.x - rect.height();
+    while x < rect.max.x {
+        let p1 = egui::pos2(x, rect.min.y);
+        let p2 = egui::pos2(x + rect.height(), rect.max.y);
+        clipped_painter.line_segment([p1, p2], egui::Stroke::new(stroke_width, color));
+        x += spacing;
     }
 }
 
