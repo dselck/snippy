@@ -10,7 +10,7 @@ This document details the design for introducing logarithmic decibel (dB) scalin
 - Set the default inner filmstrip frame height to $48.0$ pixels ($64.0$ pixels including top/bottom sprockets).
 - Correct the bottom timeline layout so that the filmstrip timeline height is calculated directly from `self.timeline_height` (preventing layout feedback loops) with a non-filmstrip height constant of $128.0$ pixels.
 - Scale the timeline panel default size ($192.0$ pixels) and range ($160.0$ to $350.0$ pixels) appropriately.
-- Ensure the user's resized timeline height persists while dragging the resize handle by using a proximity-based drag tracking check: update height when pointer is within $15$ pixels of the top border of the panel, preventing layout feedback loops during scrubbing or other click interactions.
+- Ensure the user's resized timeline height persists while dragging the resize handle by using a persistent `is_resizing_timeline` drag state flag initialized when a click starts within $15$ pixels of the top border of the panel. This prevents layout feedback loops and maintains resizing tracking even if the mouse pointer drifts from the top edge during fast drags.
 - Prevent the waveform from aliasing or "phasing" around the screen when zoomed out by replacing point/nearest-neighbor sampling with a peak decimation (maximum amplitude aggregation) over the bucket range corresponding to each pixel column.
 
 ## Proposed Changes
@@ -35,7 +35,8 @@ pub struct PlaybackSettings {
 ### 2. Waveform Rendering & Layout Correctness (`src/ui/mod.rs`)
 
 We will:
-- Set `timeline_height: 192.0;` as the default timeline deck height in `MainApp::new`.
+- Add a new boolean field `is_resizing_timeline` to the `MainApp` struct.
+- Set `timeline_height: 192.0;` and `is_resizing_timeline: false` in `MainApp::new`.
 - Adjust the `timeline_deck` panel constraints to `.size_range(160.0..=350.0)`.
 - Set `wave_height = 32.0;`.
 - Calculate `filmstrip_height` directly from `self.timeline_height` to eliminate layout feedback loops:
@@ -43,12 +44,21 @@ We will:
 - Update `self.timeline_height` while dragging the panel handle:
   ```rust
   let new_height = panel_response.response.rect.height();
-  if new_height != self.timeline_height && ui.ctx().input(|i| i.pointer.any_down()) {
+
+  if ui.ctx().input(|i| i.pointer.any_pressed()) {
       if let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
           let dist_to_top = (pos.y - panel_response.response.rect.top()).abs();
           if dist_to_top < 15.0 {
-              self.timeline_height = new_height;
+              self.is_resizing_timeline = true;
           }
+      }
+  }
+
+  if self.is_resizing_timeline {
+      if ui.ctx().input(|i| i.pointer.any_down()) {
+          self.timeline_height = new_height;
+      } else {
+          self.is_resizing_timeline = false;
       }
   }
   ```
