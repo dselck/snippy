@@ -1157,8 +1157,8 @@ impl eframe::App for MainApp {
                     let total_width = ui.available_width();
                     let spacing_y = ui.spacing().item_spacing.y;
                     let wave_height = 32.0;
-                    let reserved_for_waveform = wave_height + 12.0;
-                    let filmstrip_height = (ui.available_height() - reserved_for_waveform - spacing_y).max(30.0);
+                    let reserved_for_waveform = spacing_y + 6.0 + spacing_y + wave_height;
+                    let filmstrip_height = (ui.available_height() - reserved_for_waveform).max(30.0);
 
                     let (filmstrip_rect, filmstrip_response) = ui.allocate_exact_size(
                         egui::vec2(total_width, filmstrip_height),
@@ -1592,8 +1592,13 @@ impl eframe::App for MainApp {
             });
 
         let new_height = panel_response.response.rect.height();
-        if panel_response.response.dragged() {
-            self.timeline_height = new_height;
+        if new_height != self.timeline_height && ui.ctx().input(|i| i.pointer.any_down()) {
+            if let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
+                let dist_to_top = (pos.y - panel_response.response.rect.top()).abs();
+                if dist_to_top < 15.0 {
+                    self.timeline_height = new_height;
+                }
+            }
         }
 
         egui::Panel::right("sidebar_deck")
