@@ -1455,20 +1455,7 @@ impl eframe::App for MainApp {
                     let bar_count = wave_rect.width() as usize;
                     let bar_width = 1.0_f32;
 
-                    let first_visible_frame = start_frame.max(0) as usize;
-                    let last_visible_frame = (start_frame + visible_range_width as isize)
-                        .min(self.playback.total_frames() as isize) as usize;
-                    let first_bucket = (first_visible_frame * 4).min(total_buckets);
-                    let last_bucket = (last_visible_frame * 4 + 1).min(total_buckets);
-                    let max_amplitude = if first_bucket < last_bucket {
-                        loudness[first_bucket..last_bucket]
-                            .iter()
-                            .filter_map(|&amp_opt| amp_opt)
-                            .fold(0.0_f32, |a, b| a.max(b))
-                    } else {
-                        0.0_f32
-                    };
-                    let scale = if max_amplitude > 0.0 { max_amplitude } else { 1.0 };
+                    let db_floor = self.settings.playback.waveform_db_floor;
 
                     for i in 0..bar_count {
                         let pct = i as f32 / bar_count as f32;
@@ -1488,7 +1475,15 @@ impl eframe::App for MainApp {
                         let amplitude_opt = bucket_idx.and_then(|bi| loudness[bi]);
 
                         if let Some(amplitude) = amplitude_opt {
-                            let scaled_amplitude = amplitude / scale;
+                            let scaled_amplitude = if db_floor >= 0.0 {
+                                amplitude
+                            } else if amplitude <= 0.0 {
+                                0.0
+                            } else {
+                                let db = 20.0 * amplitude.log10();
+                                let pct = (db - db_floor) / -db_floor;
+                                pct.clamp(0.0, 1.0)
+                            };
                             let bar_h = scaled_amplitude * (wave_rect.height() - 6.0);
                             let x = wave_rect.left() + i as f32 * bar_width;
 

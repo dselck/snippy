@@ -1,10 +1,13 @@
-# Design Specification: Configurable Audio Waveform Decibel Scaling
+# Design Specification: Configurable Audio Waveform Decibel Scaling & Rendering Refinements
 
-This document details the design for introducing logarithmic decibel (dB) scaling to the audio waveform rendering in Snippy2, complete with a new configuration option for setting the decibel floor.
+This document details the design for introducing logarithmic decibel (dB) scaling to the audio waveform rendering in Snippy2, tripling its visual height, and refining the rendering algorithm using peak decimation to resolve aliasing ("phasing") issues.
 
 ## Goal
 
-Accentuate the difference between silence/near-silence and low-level audio in the waveform viewer. We use absolute decibel scaling so that the height of the waveform remains stable and consistent (not changing when new segments load or when scrubbing), while mapping the linear RMS amplitude values logarithmically.
+- Accentuate the difference between silence/near-silence and low-level audio in the waveform viewer.
+- Use absolute decibel scaling so that the height of the waveform remains stable and consistent (not changing when new segments load or when scrubbing), while mapping the linear RMS amplitude values logarithmically.
+- Triple the visual height of the waveform component (from $24.0$ to $72.0$ pixels) to make it a more prominent visual editing reference.
+- Prevent the waveform from aliasing or "phasing" around the screen when zoomed out by replacing point/nearest-neighbor sampling with a peak decimation (maximum amplitude aggregation) over the bucket range corresponding to each pixel column.
 
 ## Proposed Changes
 
@@ -27,20 +30,17 @@ pub struct PlaybackSettings {
 
 ### 2. Waveform Rendering (`src/ui/mod.rs`)
 
-We will remove the dynamic normalization pass (which computed a local visible peak `scale` and normalized relative to it) and replace it with absolute decibel mapping.
-
-For each bucket index in the rendering loop:
-1. Retrieve the linear RMS value `amplitude`.
-2. Map to a `scaled_amplitude` value in $[0.0, 1.0]$:
-   - If `db_floor >= 0.0`: Use linear scaling directly (`amplitude`).
-   - If `amplitude <= 0.0`: Use `0.0`.
-   - Else: 
-     $$dB = 20 \cdot \log_{10}(amplitude)$$
-     $$\text{scaled\_amplitude} = \frac{dB - db\_floor}{-db\_floor}$$
-     Clamp the result to $[0.0, 1.0]$.
-3. Draw the bar height proportional to `scaled_amplitude`.
+We will:
+- Set `wave_height = 72.0;`.
+- Calculate the fractional frame range mapped to each pixel column `i` to determine the corresponding range of loudness buckets.
+- Aggregated bucket range: `[b_start_d.floor() as isize, b_end_d.ceil() as isize]`.
+- Loop over the buckets in this range and find the maximum RMS amplitude (`max_amp`).
+- Use the center frame of the column range to check if the frame is in a cut region (`self.is_frame_cut`).
+- Scale `max_amp` according to `waveform_db_floor`.
+- Draw the vertical line segment from the bottom up to the calculated peak height.
 
 ## Alternative Approaches Considered & Rejected
 
 - **Dynamic Normalization + Decibel Scaling**: Normalizing the amplitude relative to the peak of the visible frame before applying dB scaling. This was rejected because the height of the waveform changes/jumps dynamically as parts of the video are scrubbed or populated.
 - **Power-law / Square Root scaling**: Applying a square root or cube root. This was rejected because standard decibel scaling provides a more precise and controllable threshold to distinguish between background noise/silence and active audio.
+- **Nearest-Neighbor Point Sampling**: Sampling a single bucket index per pixel. This was rejected because it causes severe aliasing (shimmering/phasing) when zoomed out.
