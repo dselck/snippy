@@ -64,6 +64,7 @@ pub struct MainApp {
     pub thumbnails_dirty: bool,
     pub in_flight_requests: std::collections::HashMap<usize, std::time::Instant>,
     pub is_dragging_filmstrip: bool,
+    pub is_resizing_timeline: bool,
     pub last_zoom_level: f32,
     pub last_thumbnail_height: f32,
 
@@ -127,6 +128,7 @@ impl MainApp {
             thumbnails_dirty: true,
             in_flight_requests: std::collections::HashMap::new(),
             is_dragging_filmstrip: false,
+            is_resizing_timeline: false,
             last_zoom_level: initial_zoom,
             last_thumbnail_height: 0.0,
             settings,
@@ -1589,12 +1591,21 @@ impl eframe::App for MainApp {
             });
 
         let new_height = panel_response.response.rect.height();
-        if new_height != self.timeline_height && ui.ctx().input(|i| i.pointer.any_down()) {
+
+        if ui.ctx().input(|i| i.pointer.any_pressed()) {
             if let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
                 let dist_to_top = (pos.y - panel_response.response.rect.top()).abs();
                 if dist_to_top < 15.0 {
-                    self.timeline_height = new_height;
+                    self.is_resizing_timeline = true;
                 }
+            }
+        }
+
+        if self.is_resizing_timeline {
+            if ui.ctx().input(|i| i.pointer.any_down()) {
+                self.timeline_height = new_height;
+            } else {
+                self.is_resizing_timeline = false;
             }
         }
 
