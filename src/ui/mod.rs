@@ -976,12 +976,17 @@ impl MainApp {
 impl eframe::App for MainApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        let mut prev_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
-        let mut next_pressed = ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
-        let mut prev_down = ctx.input(|i| i.key_down(egui::Key::ArrowLeft));
-        let mut next_down = ctx.input(|i| i.key_down(egui::Key::ArrowRight));
-        let prev_released = ctx.input(|i| i.key_released(egui::Key::ArrowLeft));
-        let next_released = ctx.input(|i| i.key_released(egui::Key::ArrowRight));
+        let wants_kb = ctx.egui_wants_keyboard_input();
+        let mut prev_pressed = !wants_kb && ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
+        let mut next_pressed = !wants_kb && ctx.input(|i| i.key_pressed(egui::Key::ArrowRight));
+        let mut prev_down = !wants_kb && ctx.input(|i| i.key_down(egui::Key::ArrowLeft));
+        let mut next_down = !wants_kb && ctx.input(|i| i.key_down(egui::Key::ArrowRight));
+        let prev_released = !wants_kb && ctx.input(|i| i.key_released(egui::Key::ArrowLeft));
+        let next_released = !wants_kb && ctx.input(|i| i.key_released(egui::Key::ArrowRight));
+
+        if !wants_kb && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+            self.playback.toggle_playback();
+        }
 
         let ctrl_d = egui::KeyboardShortcut::new(egui::Modifiers::CTRL, egui::Key::D);
         if ctx.input_mut(|i| i.consume_shortcut(&ctrl_d)) {
