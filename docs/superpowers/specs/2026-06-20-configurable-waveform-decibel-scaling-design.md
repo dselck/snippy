@@ -6,8 +6,10 @@ This document details the design for introducing logarithmic decibel (dB) scalin
 
 - Accentuate the difference between silence/near-silence and low-level audio in the waveform viewer.
 - Use absolute decibel scaling so that the height of the waveform remains stable and consistent (not changing when new segments load or when scrubbing), while mapping the linear RMS amplitude values logarithmically.
-- Double the visual height of the waveform component (from $24.0$ to $48.0$ pixels) to make it a more prominent visual editing reference.
-- Correct the bottom timeline layout so that the filmstrip timeline height is dynamically calculated to accommodate the taller waveform, and scale the timeline panel default size and range appropriately.
+- Increase the visual height of the waveform component (from $24.0$ to $32.0$ pixels) to make it a more prominent visual editing reference.
+- Set the default inner filmstrip frame height to $48.0$ pixels ($64.0$ pixels including top/bottom sprockets).
+- Correct the bottom timeline layout so that the filmstrip timeline height is dynamically calculated to accommodate the taller waveform, and scale the timeline panel default size ($164.0$ pixels) and range ($130.0$ to $300.0$ pixels) appropriately.
+- Ensure the user's resized timeline height persists while dragging the resize handle.
 - Prevent the waveform from aliasing or "phasing" around the screen when zoomed out by replacing point/nearest-neighbor sampling with a peak decimation (maximum amplitude aggregation) over the bucket range corresponding to each pixel column.
 
 ## Proposed Changes
@@ -32,11 +34,18 @@ pub struct PlaybackSettings {
 ### 2. Waveform Rendering & Layout Correctness (`src/ui/mod.rs`)
 
 We will:
-- Set `timeline_height: 180.0;` as the default timeline deck height in `MainApp::new`.
+- Set `timeline_height: 164.0;` as the default timeline deck height in `MainApp::new`.
 - Adjust the `timeline_deck` panel constraints to `.size_range(130.0..=300.0)`.
-- Set `wave_height = 48.0;`.
+- Set `wave_height = 32.0;`.
 - Calculate `reserved_for_waveform = wave_height + 12.0;` and use it to size the filmstrip dynamically:
   `filmstrip_height = (ui.available_height() - reserved_for_waveform - spacing_y).max(30.0);`
+- Update `self.timeline_height` while dragging the panel handle:
+  ```rust
+  let new_height = panel_response.response.rect.height();
+  if new_height != self.timeline_height && ui.ctx().input(|i| i.pointer.any_down()) {
+      self.timeline_height = new_height;
+  }
+  ```
 - Calculate the fractional frame range mapped to each pixel column `i` to determine the corresponding range of loudness buckets.
 - Aggregated bucket range: `[b_start_d.floor() as isize, b_end_d.ceil() as isize]`.
 - Loop over the buckets in this range and find the maximum RMS amplitude (`max_amp`).

@@ -117,7 +117,7 @@ impl MainApp {
             next_range_id: 1,
             cut_mode: settings.general.default_cut_mode,
             zoom_level: initial_zoom,
-            timeline_height: 220.0,
+            timeline_height: 180.0,
             show_debug_hud: false,
             drift_history: std::collections::VecDeque::with_capacity(60),
             decode_fps_frame_count: 0,
@@ -1113,7 +1113,7 @@ impl eframe::App for MainApp {
         egui::Panel::bottom("timeline_deck")
             .resizable(true)
             .default_size(self.timeline_height)
-            .size_range(150.0..=350.0)
+            .size_range(130.0..=300.0)
             .frame(egui::Frame::NONE
                 .fill(Color32::from_rgb(8, 8, 14))
                 .inner_margin(egui::Margin::symmetric(16, 12)))
@@ -1156,7 +1156,7 @@ impl eframe::App for MainApp {
                     // 2. Sprocket Filmstrip Viewport
                     let total_width = ui.available_width();
                     let spacing_y = ui.spacing().item_spacing.y;
-                    let wave_height = 72.0;
+                    let wave_height = 48.0;
                     let reserved_for_waveform = wave_height + 12.0;
                     let filmstrip_height = (ui.available_height() - reserved_for_waveform - spacing_y).max(30.0);
 
@@ -1430,7 +1430,7 @@ impl eframe::App for MainApp {
                     ui.add_space(6.0);
 
                     // 3. Compact Synced Waveform Component
-                    let wave_height = 72.0;
+                    let wave_height = 48.0;
                     let (wave_rect, _wave_response) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), wave_height),
                         egui::Sense::hover(),
