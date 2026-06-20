@@ -61,11 +61,18 @@ impl Default for Theme {
 pub struct PlaybackSettings {
     /// Master output volume (0.0 = silent, 1.0 = full volume)
     pub volume: f32,
+    /// Decibel floor for the audio waveform viewer (e.g. -45.0).
+    /// RMS values below this floor are rendered as flat silence (0% height).
+    /// Set to 0.0 or positive to use linear scaling.
+    pub waveform_db_floor: f32,
 }
 
 impl Default for PlaybackSettings {
     fn default() -> Self {
-        Self { volume: 1.0 }
+        Self {
+            volume: 1.0,
+            waveform_db_floor: -45.0,
+        }
     }
 }
 
@@ -370,6 +377,12 @@ const COMMENTED_DEFAULTS: &str = r#"# Snippy Settings
 # Master output volume (0.0 = silent, 1.0 = full volume)
 volume = 1.0
 
+# The decibel floor for the audio waveform viewer (e.g. -45.0).
+# RMS values below this floor are rendered as flat silence (0% height).
+# RMS values at/above 0 dB are rendered at 100% height.
+# Default: -45.0. Set to 0.0 or a positive value to use linear scaling.
+waveform_db_floor = -45.0
+
 [hardware]
 # Enable GPU-accelerated video decoding.
 # Uses VideoToolbox on macOS, D3D11 on Windows, VAAPI on Linux.
@@ -426,3 +439,27 @@ recent_files = []
 # Default directory opened by the file picker. Leave empty to use the OS default.
 default_open_directory = ""
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_settings_with_waveform_db_floor() {
+        let toml_str = r#"
+            [playback]
+            volume = 0.8
+            waveform_db_floor = -50.0
+        "#;
+        let settings: Settings = toml::from_str(toml_str).unwrap();
+        assert_eq!(settings.playback.volume, 0.8);
+        assert_eq!(settings.playback.waveform_db_floor, -50.0);
+    }
+
+    #[test]
+    fn test_default_waveform_db_floor() {
+        let settings = Settings::default();
+        assert_eq!(settings.playback.waveform_db_floor, -45.0);
+    }
+}
+
