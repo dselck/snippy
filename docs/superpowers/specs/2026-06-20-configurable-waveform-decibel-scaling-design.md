@@ -1,12 +1,12 @@
 # Design Specification: Configurable Audio Waveform Decibel Scaling & Rendering Refinements
 
-This document details the design for introducing logarithmic decibel (dB) scaling to the audio waveform rendering in Snippy2, tripling its visual height, correcting the bottom timeline layout, and refining the rendering algorithm using peak decimation to resolve aliasing ("phasing") issues.
+This document details the design for introducing logarithmic decibel (dB) scaling to the audio waveform rendering in Snippy2, doubling its visual height, correcting the bottom timeline layout, and refining the rendering algorithm using peak decimation to resolve aliasing ("phasing") issues.
 
 ## Goal
 
 - Accentuate the difference between silence/near-silence and low-level audio in the waveform viewer.
 - Use absolute decibel scaling so that the height of the waveform remains stable and consistent (not changing when new segments load or when scrubbing), while mapping the linear RMS amplitude values logarithmically.
-- Triple the visual height of the waveform component (from $24.0$ to $72.0$ pixels) to make it a more prominent visual editing reference.
+- Double the visual height of the waveform component (from $24.0$ to $48.0$ pixels) to make it a more prominent visual editing reference.
 - Correct the bottom timeline layout so that the filmstrip timeline height is dynamically calculated to accommodate the taller waveform, and scale the timeline panel default size and range appropriately.
 - Prevent the waveform from aliasing or "phasing" around the screen when zoomed out by replacing point/nearest-neighbor sampling with a peak decimation (maximum amplitude aggregation) over the bucket range corresponding to each pixel column.
 
@@ -32,9 +32,9 @@ pub struct PlaybackSettings {
 ### 2. Waveform Rendering & Layout Correctness (`src/ui/mod.rs`)
 
 We will:
-- Set `timeline_height: 220.0;` as the default timeline deck height in `MainApp::new`.
-- Adjust the `timeline_deck` panel constraints to `.size_range(150.0..=350.0)`.
-- Set `wave_height = 72.0;`.
+- Set `timeline_height: 180.0;` as the default timeline deck height in `MainApp::new`.
+- Adjust the `timeline_deck` panel constraints to `.size_range(130.0..=300.0)`.
+- Set `wave_height = 48.0;`.
 - Calculate `reserved_for_waveform = wave_height + 12.0;` and use it to size the filmstrip dynamically:
   `filmstrip_height = (ui.available_height() - reserved_for_waveform - spacing_y).max(30.0);`
 - Calculate the fractional frame range mapped to each pixel column `i` to determine the corresponding range of loudness buckets.
