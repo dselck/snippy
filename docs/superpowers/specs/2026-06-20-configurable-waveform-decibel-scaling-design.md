@@ -9,7 +9,7 @@ This document details the design for introducing logarithmic decibel (dB) scalin
 - Increase the visual height of the waveform component (from $24.0$ to $32.0$ pixels) to make it a more prominent visual editing reference.
 - Set the default inner filmstrip frame height to $48.0$ pixels ($64.0$ pixels including top/bottom sprockets).
 - Correct the bottom timeline layout so that the filmstrip timeline height is dynamically calculated to accommodate the taller waveform, and scale the timeline panel default size ($164.0$ pixels) and range ($130.0$ to $300.0$ pixels) appropriately.
-- Ensure the user's resized timeline height persists while dragging the resize handle.
+- Ensure the user's resized timeline height persists while dragging the resize handle using `panel_response.response.dragged()`, preventing layout feedback loops during scrubbing or other click interactions.
 - Prevent the waveform from aliasing or "phasing" around the screen when zoomed out by replacing point/nearest-neighbor sampling with a peak decimation (maximum amplitude aggregation) over the bucket range corresponding to each pixel column.
 
 ## Proposed Changes
@@ -42,7 +42,7 @@ We will:
 - Update `self.timeline_height` while dragging the panel handle:
   ```rust
   let new_height = panel_response.response.rect.height();
-  if new_height != self.timeline_height && ui.ctx().input(|i| i.pointer.any_down()) {
+  if panel_response.response.dragged() {
       self.timeline_height = new_height;
   }
   ```

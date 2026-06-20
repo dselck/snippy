@@ -117,7 +117,7 @@ impl MainApp {
             next_range_id: 1,
             cut_mode: settings.general.default_cut_mode,
             zoom_level: initial_zoom,
-            timeline_height: 180.0,
+            timeline_height: 164.0,
             show_debug_hud: false,
             drift_history: std::collections::VecDeque::with_capacity(60),
             decode_fps_frame_count: 0,
@@ -1110,7 +1110,7 @@ impl eframe::App for MainApp {
         }
 
         // 2. Bottom Panel: Timeline and Waveform Deck (Full width)
-        egui::Panel::bottom("timeline_deck")
+        let panel_response = egui::Panel::bottom("timeline_deck")
             .resizable(true)
             .default_size(self.timeline_height)
             .size_range(130.0..=300.0)
@@ -1156,7 +1156,7 @@ impl eframe::App for MainApp {
                     // 2. Sprocket Filmstrip Viewport
                     let total_width = ui.available_width();
                     let spacing_y = ui.spacing().item_spacing.y;
-                    let wave_height = 48.0;
+                    let wave_height = 32.0;
                     let reserved_for_waveform = wave_height + 12.0;
                     let filmstrip_height = (ui.available_height() - reserved_for_waveform - spacing_y).max(30.0);
 
@@ -1430,7 +1430,7 @@ impl eframe::App for MainApp {
                     ui.add_space(6.0);
 
                     // 3. Compact Synced Waveform Component
-                    let wave_height = 48.0;
+                    let wave_height = 32.0;
                     let (wave_rect, _wave_response) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), wave_height),
                         egui::Sense::hover(),
@@ -1591,8 +1591,10 @@ impl eframe::App for MainApp {
                 }
             });
 
-        // Egui's TopBottomPanel automatically persists the resized height in its internal memory.
-        // We do not update self.timeline_height here to avoid a layout feedback loop.
+        let new_height = panel_response.response.rect.height();
+        if new_height != self.timeline_height && ui.ctx().input(|i| i.pointer.any_down()) {
+            self.timeline_height = new_height;
+        }
 
         egui::Panel::right("sidebar_deck")
             .resizable(false)
