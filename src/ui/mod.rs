@@ -1592,7 +1592,7 @@ impl eframe::App for MainApp {
             });
 
         let new_height = panel_response.response.rect.height();
-        if new_height != self.timeline_height && ui.ctx().input(|i| i.pointer.any_down()) {
+        if panel_response.response.dragged() {
             self.timeline_height = new_height;
         }
 

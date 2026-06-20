@@ -9,7 +9,7 @@ This document details the design for introducing logarithmic decibel (dB) scalin
 - Increase the visual height of the waveform component (from $24.0$ to $32.0$ pixels) to make it a more prominent visual editing reference.
 - Set the default inner filmstrip frame height to $48.0$ pixels ($64.0$ pixels including top/bottom sprockets).
 - Correct the bottom timeline layout so that the filmstrip timeline height is dynamically calculated to accommodate the taller waveform, and scale the timeline panel default size ($164.0$ pixels) and range ($130.0$ to $300.0$ pixels) appropriately.
-- Ensure the user's resized timeline height persists while dragging the resize handle using `panel_response.response.dragged()`, preventing layout feedback loops during scrubbing or other click interactions.
+- Ensure the user's resized timeline height persists while dragging the resize handle by using a proximity-based drag tracking check: update height when pointer is within $15$ pixels of the top border of the panel, preventing layout feedback loops during scrubbing or other click interactions.
 - Prevent the waveform from aliasing or "phasing" around the screen when zoomed out by replacing point/nearest-neighbor sampling with a peak decimation (maximum amplitude aggregation) over the bucket range corresponding to each pixel column.
 
 ## Proposed Changes
@@ -37,13 +37,18 @@ We will:
 - Set `timeline_height: 164.0;` as the default timeline deck height in `MainApp::new`.
 - Adjust the `timeline_deck` panel constraints to `.size_range(130.0..=300.0)`.
 - Set `wave_height = 32.0;`.
-- Calculate `reserved_for_waveform = wave_height + 12.0;` and use it to size the filmstrip dynamically:
-  `filmstrip_height = (ui.available_height() - reserved_for_waveform - spacing_y).max(30.0);`
+- Calculate `reserved_for_waveform = spacing_y + 6.0 + spacing_y + wave_height;` and use it to size the filmstrip dynamically:
+  `filmstrip_height = (ui.available_height() - reserved_for_waveform).max(30.0);`
 - Update `self.timeline_height` while dragging the panel handle:
   ```rust
   let new_height = panel_response.response.rect.height();
-  if panel_response.response.dragged() {
-      self.timeline_height = new_height;
+  if new_height != self.timeline_height && ui.ctx().input(|i| i.pointer.any_down()) {
+      if let Some(pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
+          let dist_to_top = (pos.y - panel_response.response.rect.top()).abs();
+          if dist_to_top < 15.0 {
+              self.timeline_height = new_height;
+          }
+      }
   }
   ```
 - Calculate the fractional frame range mapped to each pixel column `i` to determine the corresponding range of loudness buckets.
