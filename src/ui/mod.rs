@@ -115,7 +115,7 @@ impl MainApp {
             out_marker: None,
             ranges: vec![],
             next_range_id: 1,
-            cut_mode: false,
+            cut_mode: settings.general.default_cut_mode,
             zoom_level: initial_zoom,
             timeline_height: 145.0,
             show_debug_hud: false,
@@ -274,6 +274,22 @@ impl MainApp {
                     ui.label(egui::RichText::new("General").size(13.0).color(accent).strong());
                     egui::Frame::NONE.fill(card_bg).corner_radius(8.0).inner_margin(egui::Margin::same(12)).show(ui, |ui| {
                         ui.set_width(452.0);
+                        
+                        // Default snippets edit mode
+                        ui.horizontal(|ui| {
+                            ui.label("Default edit mode");
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                egui::ComboBox::from_id_salt("default_cut_mode")
+                                    .selected_text(if self.pending_settings.general.default_cut_mode { "Cut" } else { "Keep" })
+                                    .width(80.0)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut self.pending_settings.general.default_cut_mode, true, "Cut");
+                                        ui.selectable_value(&mut self.pending_settings.general.default_cut_mode, false, "Keep");
+                                    });
+                            });
+                        });
+                        ui.add_space(8.0);
+
                         ui.label("Default open directory");
 
                         // Build a meaningful hint showing the actual OS default path
@@ -816,7 +832,7 @@ impl MainApp {
 
         // 1. Draw track background color dynamically based on cut/keep mode
         let track_color = if self.cut_mode {
-            Color32::from_rgb(8, 8, 14) // When cutting, default rest is keep (deep dark)
+            Color32::from_rgb(30, 27, 75) // When cutting, default rest is keep (deep indigo)
         } else {
             Color32::from_rgb(63, 29, 29) // When keeping, default rest is cut (crimson)
         };
