@@ -1120,6 +1120,7 @@ impl eframe::App for MainApp {
                 .fill(Color32::from_rgb(8, 8, 14))
                 .inner_margin(egui::Margin::symmetric(16, 12)))
             .show_inside(ui, |ui| {
+                ui.set_min_height(ui.max_rect().height());
                 if self.video_path.is_some() {
                     ui.vertical(|ui| {
                     // Timeline Time Indicators & Zoom Controls
