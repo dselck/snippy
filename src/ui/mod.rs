@@ -2396,6 +2396,36 @@ pub fn is_frame_cut_helper(frame: usize, ranges: &[ExportRange], cut_mode: bool)
     }
 }
 
+pub fn coalesce_and_reindex_ranges(ranges: &mut Vec<ExportRange>) {
+    if ranges.is_empty() {
+        return;
+    }
+    
+    // Sort ranges by start frame to ensure left-to-right evaluation
+    ranges.sort_by_key(|r| r.in_frame);
+    
+    let mut merged: Vec<ExportRange> = Vec::with_capacity(ranges.len());
+    for range in ranges.drain(..) {
+        if let Some(last) = merged.last_mut() {
+            // If the current range overlaps or is contiguous with the last one
+            if range.in_frame <= last.out_frame + 1 {
+                last.out_frame = last.out_frame.max(range.out_frame);
+            } else {
+                merged.push(range);
+            }
+        } else {
+            merged.push(range);
+        }
+    }
+    
+    // Re-assign IDs to be 1..N
+    for (idx, range) in merged.iter_mut().enumerate() {
+        range.id = idx + 1;
+    }
+    
+    *ranges = merged;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2415,6 +2445,35 @@ mod tests {
         assert!(!is_frame_cut_helper(15, &ranges, false));
         assert!(is_frame_cut_helper(30, &ranges, false));
         assert!(!is_frame_cut_helper(45, &ranges, false));
+    }
+
+    #[test]
+    fn test_coalesce_and_reindex_ranges() {
+        // 1. Empty case
+        let mut ranges = vec![];
+        coalesce_and_reindex_ranges(&mut ranges);
+        assert!(ranges.is_empty());
+
+        // 2. Overlapping, out-of-order, and contiguous case
+        let mut ranges = vec![
+            ExportRange { id: 99, in_frame: 21, out_frame: 30 }, // contiguous to 10..20
+            ExportRange { id: 100, in_frame: 10, out_frame: 20 },
+            ExportRange { id: 101, in_frame: 15, out_frame: 25 }, // overlaps both
+            ExportRange { id: 102, in_frame: 40, out_frame: 50 }, // distinct
+        ];
+        coalesce_and_reindex_ranges(&mut ranges);
+        
+        assert_eq!(ranges.len(), 2);
+        
+        // The first 3 should be merged into 10..30
+        assert_eq!(ranges[0].id, 1);
+        assert_eq!(ranges[0].in_frame, 10);
+        assert_eq!(ranges[0].out_frame, 30);
+        
+        // The last one should be 40..50, re-indexed to 2
+        assert_eq!(ranges[1].id, 2);
+        assert_eq!(ranges[1].in_frame, 40);
+        assert_eq!(ranges[1].out_frame, 50);
     }
 }
 
