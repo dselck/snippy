@@ -1714,6 +1714,8 @@ impl eframe::App for MainApp {
 
                         if let Some(idx) = to_delete {
                             self.ranges.remove(idx);
+                            coalesce_and_reindex_ranges(&mut self.ranges);
+                            self.next_range_id = self.ranges.len() + 1;
                         }
                     });
 
@@ -2276,7 +2278,8 @@ impl eframe::App for MainApp {
                                         in_frame: inf,
                                         out_frame: outf,
                                     });
-                                    self.next_range_id += 1;
+                                    coalesce_and_reindex_ranges(&mut self.ranges);
+                                    self.next_range_id = self.ranges.len() + 1;
                                 }
                     });
                 });
