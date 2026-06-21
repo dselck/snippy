@@ -111,3 +111,23 @@ _Avoid_: Thumbnail task, decode job
 **Thumbnail LRU Cache**:
 The bounded `LruCache<usize, TextureHandle>` in the UI thread that evicts least-recently-accessed thumbnails when the entry count exceeds 300.
 _Avoid_: Thumbnail HashMap, texture store
+
+**Settings**:
+The flat, grouped collection of user-controllable values that govern application behaviour, persisted as TOML in the OS config directory. Divided into UI-visible settings (surfaced in the Settings modal) and advanced settings (accessible only by hand-editing the TOML file directly). Owned by `MainApp` and loaded once at startup.
+_Avoid_: Config, Preferences, Options
+
+**Notification**:
+A transient, dismissible in-app message held in a `VecDeque<Notification>` on `MainApp` and rendered as dismissible banners in the UI. Any subsystem can push a Notification to surface warnings to the user (e.g. corrupt Settings file, hardware acceleration fallback).
+_Avoid_: Toast, Alert, Error message
+
+**Zoom Interval**:
+The amount of video time (in seconds or frames, depending on the configured unit) represented by a single thumbnail step on the filmstrip timeline. The slider position is derived from the Zoom Interval via an exponential or linear mapping against the configured min/max bounds.
+_Avoid_: Zoom level, zoom scalar, normalised zoom
+
+**Loudness Profile**:
+The time-indexed array of RMS amplitude measurements owned by PlaybackSession and surfaced to the UI as a read-only slice. Covers the full video duration at sub-frame resolution; entries are absent until the corresponding audio has been opportunistically decoded.
+_Avoid_: Waveform data, audio profile, amplitude array
+
+**Loudness Bucket**:
+A single entry in the Loudness Profile representing the root-mean-square amplitude of the audio samples in one sub-frame time window.
+_Avoid_: Amplitude sample, waveform bar, loudness sample

@@ -102,7 +102,7 @@ impl PlaybackSession {
     pub fn new() -> Self {
         Self {
             current_frame: 0,
-            total_frames: 1000,
+            total_frames: 0,
             is_playing: false,
             video_fps: 24.0,
             frame_rx: None,

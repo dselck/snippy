@@ -30,7 +30,7 @@ impl MediaTestRig {
     /// Open a video file and spin up the media engine headlessly.
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self, anyhow::Error> {
         let mut session = crate::media::PlaybackSession::new();
-        session.load_video(&path.as_ref().to_string_lossy());
+        session.load_video(&path.as_ref().to_string_lossy(), &crate::settings::Settings::default());
         if session.media_engine.is_none() {
             anyhow::bail!("Failed to load video in PlaybackSession");
         }

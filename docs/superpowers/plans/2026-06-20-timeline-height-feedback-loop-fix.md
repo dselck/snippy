@@ -16,7 +16,7 @@
 **Files:**
 - Modify: `src/ui/mod.rs`
 
-- [ ] **Step 1: Replace any_down() check with panel_response.response.dragged()**
+- [x] **Step 1: Replace any_down() check with panel_response.response.dragged()**
   Modify the drag-tracking condition in `src/ui/mod.rs` (around line 1595):
 
   Replace:
@@ -35,15 +35,15 @@
           }
   ```
 
-- [ ] **Step 2: Verify cargo check compiles without errors**
+- [x] **Step 2: Verify cargo check compiles without errors**
   Run: `cargo check`
   Expected: PASS
 
-- [ ] **Step 3: Run tests**
+- [x] **Step 3: Run tests**
   Run: `cargo test`
   Expected: PASS
 
-- [ ] **Step 4: Commit changes to git**
+- [x] **Step 4: Commit changes to git**
   Run:
   ```bash
   git add src/ui/mod.rs
