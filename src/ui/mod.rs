@@ -982,7 +982,7 @@ impl MainApp {
         painter.circle_filled(
             handle_center,
             6.0,
-            Color32::from_rgb(236, 72, 153), // Hot pink playhead handle
+            palette.accent, // Playhead handle
         );
 
         if response.clicked() {
@@ -1442,7 +1442,7 @@ impl eframe::App for MainApp {
                     let p3 = egui::pos2(center_x, filmstrip_rect.top() + 6.0);
                     painter.add(egui::Shape::convex_polygon(
                         vec![p1, p2, p3],
-                        Color32::from_rgb(236, 72, 153),
+                        palette.accent,
                         egui::Stroke::NONE,
                     ));
 
@@ -1593,10 +1593,10 @@ impl eframe::App for MainApp {
                     };
 
                     if let Some(inf) = self.in_marker {
-                        draw_timeline_marker(&ui.painter(), inf, Color32::from_rgb(251, 191, 36), 1.0);
+                        draw_timeline_marker(&ui.painter(), inf, palette.warn_color, 1.0);
                     }
                     if let Some(outf) = self.out_marker {
-                        draw_timeline_marker(&ui.painter(), outf, Color32::from_rgb(249, 115, 22), -1.0);
+                        draw_timeline_marker(&ui.painter(), outf, palette.accent, -1.0);
                     }
                 });
                 } else {
@@ -1604,7 +1604,7 @@ impl eframe::App for MainApp {
                         ui.label(
                             egui::RichText::new("No timeline available — load a video to begin editing")
                                 .size(14.0)
-                                .color(Color32::from_rgb(85, 83, 115))
+                                .color(palette.text_muted)
                         );
                     });
                 }
@@ -1647,7 +1647,7 @@ impl eframe::App for MainApp {
                         ui.add_space(6.0);
                         
                         let (scissor_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                        draw_scissor_icon(&ui.painter_at(scissor_rect), scissor_rect, Color32::from_rgb(236, 72, 153));
+                        draw_scissor_icon(&ui.painter_at(scissor_rect), scissor_rect, palette.accent);
 
                         // Inline Mode Toggle Switch on the right
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1769,7 +1769,7 @@ impl eframe::App for MainApp {
 
                         // Scissor Icon
                         let (scissor_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                        draw_scissor_icon(&ui.painter_at(scissor_rect), scissor_rect, Color32::from_rgb(236, 72, 153));
+                        draw_scissor_icon(&ui.painter_at(scissor_rect), scissor_rect, palette.accent);
 
                         ui.add_space(2.0);
 
@@ -2016,8 +2016,8 @@ impl eframe::App for MainApp {
                                                         .strong()
                                                         .color(Color32::WHITE)
                                                 )
-                                                .fill(Color32::from_rgb(37, 35, 58))
-                                                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(59, 56, 92)))
+                                                .fill(palette.panel_bg.linear_multiply(0.9))
+                                                .stroke(egui::Stroke::new(1.0, palette.border_color))
                                                 .corner_radius(6.0)
                                                 .min_size(egui::vec2(150.0, 32.0));
 
@@ -2052,7 +2052,7 @@ impl eframe::App for MainApp {
                                         egui::Align2::CENTER_CENTER,
                                         "Decoding video frame...",
                                         egui::FontId::proportional(15.0),
-                                        Color32::from_rgb(85, 83, 115),
+                                        palette.text_muted,
                                     );
                                 }
                             }
@@ -2061,7 +2061,7 @@ impl eframe::App for MainApp {
                             painter.rect_stroke(
                                 rect,
                                 8.0,
-                                egui::Stroke::new(1.0, Color32::from_rgba_premultiplied(99, 102, 241, 10)),
+                                egui::Stroke::new(1.0, palette.accent.linear_multiply(0.1)),
                                 egui::StrokeKind::Inside,
                             );
 
@@ -2077,14 +2077,14 @@ impl eframe::App for MainApp {
                                 
                                 ui.scope_builder(egui::UiBuilder::new().max_rect(hud_rect), |ui| {
                                     egui::Frame::NONE
-                                        .fill(Color32::from_rgba_unmultiplied(15, 17, 28, 235))
-                                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(63, 66, 97)))
+                                        .fill(palette.card_bg)
+                                        .stroke(egui::Stroke::new(1.0, palette.border_color))
                                         .corner_radius(8.0)
                                         .inner_margin(egui::Margin::same(10))
                                         .show(ui, |ui| {
                                             ui.vertical(|ui| {
                                                 ui.horizontal(|ui| {
-                                                    ui.label(egui::RichText::new("⚡ AV SYNC TELEMETRY").strong().color(Color32::from_rgb(129, 140, 248)));
+                                                    ui.label(egui::RichText::new("⚡ AV SYNC TELEMETRY").strong().color(palette.accent_hover));
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                         let active_color = if self.playback.is_playing() { Color32::from_rgb(74, 222, 128) } else { Color32::from_rgb(156, 163, 175) };
                                                         ui.label(egui::RichText::new(if self.playback.is_playing() { "● ACTIVE" } else { "■ PAUSED" }).color(active_color).font(egui::FontId::monospace(10.0)));
