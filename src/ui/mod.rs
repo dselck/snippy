@@ -154,11 +154,12 @@ impl MainApp {
     fn draw_settings_modal(&mut self, ctx: &egui::Context) {
         use crate::settings::ZoomUnit;
 
-        let accent   = Color32::from_rgb(99, 102, 241);
-        let muted    = Color32::from_rgb(130, 130, 160);
-        let warn_col = Color32::from_rgb(200, 150, 50);
-        let card_bg  = Color32::from_rgb(15, 14, 25);
-        let sep_col  = Color32::from_rgb(33, 31, 54);
+        let palette  = get_palette(self.settings.appearance.theme);
+        let accent   = palette.accent;
+        let muted    = palette.text_muted;
+        let warn_col = palette.warn_color;
+        let card_bg  = palette.card_bg;
+        let sep_col  = palette.border_color;
 
         // Restart-required check: settings that only take effect after media reload.
         let needs_restart = self.pending_settings.hardware.playback_hw_accel   != self.settings.hardware.playback_hw_accel
@@ -175,7 +176,7 @@ impl MainApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .fixed_size([480.0, 560.0])
-            .frame(egui::Frame::window(&ctx.global_style()).fill(Color32::from_rgb(10, 10, 18)).stroke(egui::Stroke::new(1.0, sep_col)))
+            .frame(egui::Frame::window(&ctx.global_style()).fill(palette.panel_bg).stroke(egui::Stroke::new(1.0, sep_col)))
             .show(ctx, |ui| {
                 ui.set_width(480.0);
 
@@ -324,7 +325,7 @@ impl MainApp {
                         });
 
                         ui.add_space(8.0);
-                        ui.label(egui::RichText::new("Recent files").size(12.0).color(Color32::from_rgb(200, 200, 210)));
+                        ui.label(egui::RichText::new("Recent files").size(12.0).color(palette.text_normal));
                         if self.pending_settings.general.recent_files.is_empty() {
                             ui.label(egui::RichText::new("No recent files.").size(11.0).color(muted));
                         } else {
@@ -695,7 +696,7 @@ fn draw_scissor_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) 
     painter.line_segment([blade2_start, blade2_end], egui::Stroke::new(stroke_width, color));
 }
 
-fn toggle_switch(ui: &mut egui::Ui, cut_mode: &mut bool) -> egui::Response {
+fn toggle_switch(ui: &mut egui::Ui, theme: crate::settings::Theme, cut_mode: &mut bool) -> egui::Response {
     let desired_size = egui::vec2(34.0, 18.0);
     let (rect, mut response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
     
@@ -705,12 +706,13 @@ fn toggle_switch(ui: &mut egui::Ui, cut_mode: &mut bool) -> egui::Response {
     }
     
     let painter = ui.painter();
+    let palette = get_palette(theme);
     
     // Background color: red if cut_mode, green if keep_mode
     let bg_color = if *cut_mode {
-        Color32::from_rgb(239, 68, 68)   // Red for CUT
+        palette.cut_color
     } else {
-        Color32::from_rgb(16, 185, 129)  // Green for KEEP
+        palette.keep_color
     };
     
     // Draw capsule background
@@ -731,6 +733,7 @@ fn toggle_switch(ui: &mut egui::Ui, cut_mode: &mut bool) -> egui::Response {
 
 fn playback_control_button(
     ui: &mut egui::Ui,
+    theme: crate::settings::Theme,
     icon: PlaybackIcon,
     is_play_btn: bool,
     tooltip: &str,
@@ -744,40 +747,41 @@ fn playback_control_button(
     let response = response.on_hover_text(tooltip);
 
     let painter = ui.painter();
+    let palette = get_palette(theme);
     
     // Determine background color based on hover, click states
     let bg_color = if response.clicked() || response.is_pointer_button_down_on() {
         if is_play_btn {
-            Color32::from_rgb(124, 58, 237) // Bright active click
+            palette.accent
         } else if matches!(icon, PlaybackIcon::AddSnippet) {
-            Color32::from_rgb(52, 211, 153) // Lighter green active click (#34D399)
+            palette.keep_color
         } else {
-            Color32::from_rgb(45, 43, 75)
+            palette.widget_active_bg
         }
     } else if response.hovered() {
         if is_play_btn {
-            Color32::from_rgb(124, 58, 237) // Accent purple hover
+            palette.accent_hover
         } else if matches!(icon, PlaybackIcon::AddSnippet) {
-            Color32::from_rgb(52, 211, 153) // Green hover
+            palette.keep_color
         } else {
-            Color32::from_rgb(34, 32, 58)
+            palette.widget_hovered_bg
         }
     } else {
         if is_play_btn {
-            Color32::from_rgb(99, 102, 241) // Default play button (indigo)
+            palette.accent
         } else if matches!(icon, PlaybackIcon::AddSnippet) {
-            Color32::from_rgb(16, 185, 129) // Default green (#10B981)
+            palette.keep_color
         } else {
-            Color32::from_rgb(16, 15, 28)
+            palette.widget_inactive_bg
         }
     };
 
     let border_color = if is_play_btn {
-        Color32::from_rgb(124, 58, 237)
+        palette.accent_hover
     } else if matches!(icon, PlaybackIcon::AddSnippet) {
-        Color32::from_rgb(16, 185, 129)
+        palette.keep_color
     } else {
-        Color32::from_rgb(28, 26, 48)
+        palette.border_color
     };
 
     // Draw circular button background
@@ -790,11 +794,11 @@ fn playback_control_button(
 
     // Draw custom vector icon inside the button
     let icon_color = if is_play_btn || matches!(icon, PlaybackIcon::AddSnippet) {
-        Color32::WHITE
+        egui::Color32::WHITE
     } else if response.hovered() {
-        Color32::from_rgb(199, 210, 254)
+        palette.text_normal
     } else {
-        Color32::from_rgb(148, 163, 184)
+        palette.text_muted
     };
 
     draw_playback_icon(painter, rect, &icon, icon_color);
@@ -807,6 +811,7 @@ impl MainApp {
         &mut self,
         ui: &mut egui::Ui,
     ) -> egui::Response {
+        let palette = get_palette(self.settings.appearance.theme);
         let height = 12.0; // Interaction height
         let (rect, response) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), height),
@@ -825,16 +830,16 @@ impl MainApp {
             painter.rect_filled(
                 track_rect,
                 track_height * 0.5,
-                Color32::from_rgb(8, 8, 14),
+                palette.timeline_track_bg,
             );
             return response;
         }
 
         // 1. Draw track background color dynamically based on cut/keep mode
         let track_color = if self.cut_mode {
-            Color32::from_rgb(30, 27, 75) // When cutting, default rest is keep (deep indigo)
+            palette.keep_color.linear_multiply(0.25)
         } else {
-            Color32::from_rgb(63, 29, 29) // When keeping, default rest is cut (crimson)
+            palette.cut_color.linear_multiply(0.25)
         };
         painter.rect_filled(
             track_rect,
@@ -844,9 +849,9 @@ impl MainApp {
 
         // 2. Draw keep/cut regions (saved export ranges) on the track
         let snippet_color = if self.cut_mode {
-            Color32::from_rgb(63, 29, 29) // In cut mode, snippets are red/cut
+            palette.cut_color.linear_multiply(0.5)
         } else {
-            Color32::from_rgb(99, 102, 241) // In keep mode, snippets are indigo/kept
+            palette.keep_color
         };
         for range in &self.ranges {
             let left_pct = range.in_frame as f32 / self.playback.total_frames() as f32;
@@ -880,7 +885,7 @@ impl MainApp {
                 painter.rect_filled(
                     selection_rect,
                     track_height * 0.5,
-                    Color32::from_rgb(59, 130, 246), // Active selection color (electric blue)
+                    palette.accent, // Active selection color
                 );
             }
 
@@ -941,13 +946,13 @@ impl MainApp {
         // In marker — amber yellow, bracket opens rightward
         if let Some(inf) = self.in_marker {
             let label = format!("[ {}", self.frame_to_time(inf));
-            draw_marker(&painter, inf, Color32::from_rgb(251, 191, 36), &label, 1.0);
+            draw_marker(&painter, inf, palette.warn_color, &label, 1.0);
         }
 
         // Out marker — orange, bracket opens leftward
         if let Some(outf) = self.out_marker {
             let label = format!("{} ]", self.frame_to_time(outf));
-            draw_marker(&painter, outf, Color32::from_rgb(249, 115, 22), &label, -1.0);
+            draw_marker(&painter, outf, palette.accent, &label, -1.0);
         }
 
         // 5. Always draw circular playhead handle (always visible)
@@ -1630,7 +1635,7 @@ impl eframe::App for MainApp {
 
                         // Inline Mode Toggle Switch on the right
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let switch_resp = toggle_switch(ui, &mut self.cut_mode);
+                            let switch_resp = toggle_switch(ui, self.settings.appearance.theme, &mut self.cut_mode);
                             let tooltip_text = if self.cut_mode {
                                 "Mode: CUT (Snippets define what to crop out; rest is kept)"
                             } else {
@@ -1802,6 +1807,7 @@ impl eframe::App for MainApp {
                             ui.add_enabled_ui(has_ranges, |ui| {
                                 if playback_control_button(
                                     ui,
+                                    self.settings.appearance.theme,
                                     PlaybackIcon::ExportVideo,
                                     false,
                                     "export video",
@@ -1815,6 +1821,7 @@ impl eframe::App for MainApp {
                             // Load button
                             if playback_control_button(
                                 ui,
+                                self.settings.appearance.theme,
                                 PlaybackIcon::LoadVideo,
                                 false,
                                 "Load video file",
@@ -2175,38 +2182,38 @@ impl eframe::App for MainApp {
                                 |ui| {
                                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
-                                    if playback_control_button(ui, PlaybackIcon::Start, false, "Go to start of video").clicked() {
+                                    if playback_control_button(ui, self.settings.appearance.theme, PlaybackIcon::Start, false, "Go to start of video").clicked() {
                                         self.playback.seek_internal(0, false, true);
                                     }
-                                    let prev_resp = playback_control_button(ui, PlaybackIcon::PrevFrame, false, "Step backward one frame");
+                                    let prev_resp = playback_control_button(ui, self.settings.appearance.theme, PlaybackIcon::PrevFrame, false, "Step backward one frame");
                                     if prev_resp.clicked() {
                                         prev_pressed = true;
                                     }
                                     if prev_resp.is_pointer_button_down_on() {
                                         prev_down = true;
                                     }
-                                    if playback_control_button(ui, PlaybackIcon::SetIn, false, "Set In marker at current frame [").clicked() {
+                                    if playback_control_button(ui, self.settings.appearance.theme, PlaybackIcon::SetIn, false, "Set In marker at current frame [").clicked() {
                                         self.in_marker = Some(self.playback.current_frame());
                                     }
 
                                     // Play/pause button
                                     let play_icon = if self.playback.is_playing() { PlaybackIcon::Pause } else { PlaybackIcon::Play };
                                     let play_tooltip = if self.playback.is_playing() { "Pause playback" } else { "Start playback" };
-                                    if playback_control_button(ui, play_icon, true, play_tooltip).clicked() {
+                                    if playback_control_button(ui, self.settings.appearance.theme, play_icon, true, play_tooltip).clicked() {
                                         self.playback.toggle_playback();
                                     }
 
-                                    if playback_control_button(ui, PlaybackIcon::SetOut, false, "Set Out marker at current frame ]").clicked() {
+                                    if playback_control_button(ui, self.settings.appearance.theme, PlaybackIcon::SetOut, false, "Set Out marker at current frame ]").clicked() {
                                         self.out_marker = Some(self.playback.current_frame());
                                     }
-                                    let next_resp = playback_control_button(ui, PlaybackIcon::NextFrame, false, "Step forward one frame");
+                                    let next_resp = playback_control_button(ui, self.settings.appearance.theme, PlaybackIcon::NextFrame, false, "Step forward one frame");
                                     if next_resp.clicked() {
                                         next_pressed = true;
                                     }
                                     if next_resp.is_pointer_button_down_on() {
                                         next_down = true;
                                     }
-                                    if playback_control_button(ui, PlaybackIcon::End, false, "Go to end of video").clicked() {
+                                    if playback_control_button(ui, self.settings.appearance.theme, PlaybackIcon::End, false, "Go to end of video").clicked() {
                                         self.playback.seek_internal(self.playback.total_frames(), false, true);
                                     }
                                 },
@@ -2218,7 +2225,7 @@ impl eframe::App for MainApp {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let enabled = self.in_marker.is_some() && self.out_marker.is_some();
                             ui.add_enabled_ui(enabled, |ui| {
-                                if playback_control_button(ui, PlaybackIcon::AddSnippet, false, "Add current selection as a new snippet").clicked() {
+                                if playback_control_button(ui, self.settings.appearance.theme, PlaybackIcon::AddSnippet, false, "Add current selection as a new snippet").clicked() {
                                     clicked = true;
                                 }
                             });
