@@ -1,4 +1,6 @@
 pub mod yuv_renderer;
+pub mod theme;
+pub use theme::{get_palette, ThemePalette};
 
 use crate::media;
 use crate::notifications::{Notification, NotificationKind, NotificationQueue};
@@ -55,7 +57,6 @@ pub struct MainApp {
     pub timeline_height: f32,
 
     pub show_debug_hud: bool,
-    pub drift_history: std::collections::VecDeque<f32>,
     pub decode_fps_frame_count: usize,
     pub decode_fps_last_reset: std::time::Instant,
     pub decode_fps: f32,
@@ -120,7 +121,6 @@ impl MainApp {
             zoom_level: initial_zoom,
             timeline_height: 192.0,
             show_debug_hud: false,
-            drift_history: std::collections::VecDeque::with_capacity(60),
             decode_fps_frame_count: 0,
             decode_fps_last_reset: std::time::Instant::now(),
             decode_fps: 0.0,
@@ -2133,51 +2133,7 @@ impl eframe::App for MainApp {
                                                     });
                                                 });
                                                 
-                                                // Task 4: Custom Sparkline Plot
-                                                ui.add_space(6.0);
-                                                let plot_height = 50.0;
-                                                let (plot_rect, _) = ui.allocate_exact_size(
-                                                    egui::vec2(ui.available_width(), plot_height),
-                                                    egui::Sense::hover(),
-                                                );
-                                                
-                                                let plot_painter = ui.painter_at(plot_rect);
-                                                plot_painter.rect_filled(plot_rect, 4.0, Color32::from_rgb(11, 13, 25));
-                                                plot_painter.rect_stroke(plot_rect, 4.0, egui::Stroke::new(1.0, Color32::from_rgb(39, 42, 68)), egui::StrokeKind::Inside);
-                                                
-                                                let zero_y = plot_rect.center().y;
-                                                plot_painter.line_segment(
-                                                    [egui::pos2(plot_rect.left(), zero_y), egui::pos2(plot_rect.right(), zero_y)],
-                                                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(148, 163, 184, 50)),
-                                                );
-                                                
-                                                let max_scale_sec = 0.3;
-                                                let scale_y = |drift_val_sec: f32| -> f32 {
-                                                    let normalized = (drift_val_sec / max_scale_sec).clamp(-1.0, 1.0);
-                                                    zero_y - normalized * (plot_height * 0.4)
-                                                };
-                                                
-                                                let t_plus_y = scale_y(0.15);
-                                                let t_minus_y = scale_y(-0.15);
-                                                
-                                                plot_painter.line_segment([egui::pos2(plot_rect.left(), t_plus_y), egui::pos2(plot_rect.right(), t_plus_y)], egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(244, 63, 94, 80)));
-                                                plot_painter.line_segment([egui::pos2(plot_rect.left(), t_minus_y), egui::pos2(plot_rect.right(), t_minus_y)], egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(244, 63, 94, 80)));
-                                                
-                                                plot_painter.text(egui::pos2(plot_rect.left() + 4.0, t_plus_y - 2.0), egui::Align2::LEFT_BOTTOM, "+150ms", egui::FontId::monospace(8.0), Color32::from_rgba_unmultiplied(244, 63, 94, 150));
-                                                plot_painter.text(egui::pos2(plot_rect.left() + 4.0, t_minus_y + 2.0), egui::Align2::LEFT_TOP, "-150ms", egui::FontId::monospace(8.0), Color32::from_rgba_unmultiplied(244, 63, 94, 150));
-                                                
-                                                if self.drift_history.len() > 1 {
-                                                    let mut points = Vec::new();
-                                                    let dx = plot_rect.width() / (self.drift_history.len() - 1) as f32;
-                                                    for (i, &d_val) in self.drift_history.iter().enumerate() {
-                                                        let x = plot_rect.left() + i as f32 * dx;
-                                                        let y = scale_y(d_val);
-                                                        points.push(egui::pos2(x, y));
-                                                    }
-                                                    for window in points.windows(2) {
-                                                        plot_painter.line_segment([window[0], window[1]], egui::Stroke::new(1.5, Color32::from_rgb(251, 113, 133)));
-                                                    }
-                                                }
+
                                                 
                                                 // Task 5: Diagnostic Buttons
                                                 ui.add_space(8.0);
