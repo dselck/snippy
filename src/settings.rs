@@ -40,15 +40,21 @@ impl Default for ZoomBehavior {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Theme {
-    Dark,
+    #[serde(alias = "dark")]
+    VideoEditorDark,
+    SleekMidnight,
+    HighContrastOled,
+    ClassicIndigoDark,
+    VideoEditorLight,
+    ClassicWarmLight,
 }
 
 impl Default for Theme {
     fn default() -> Self {
-        Theme::Dark
+        Theme::VideoEditorDark
     }
 }
 
@@ -135,7 +141,7 @@ pub struct AppearanceSettings {
 
 impl Default for AppearanceSettings {
     fn default() -> Self {
-        Self { theme: Theme::Dark }
+        Self { theme: Theme::VideoEditorDark }
     }
 }
 
