@@ -1662,7 +1662,7 @@ impl eframe::App for MainApp {
                             ui.add_space(4.0);
 
                             let label_text = if self.cut_mode { "CUT" } else { "KEEP" };
-                            let label_color = if self.cut_mode { Color32::from_rgb(239, 68, 68) } else { Color32::from_rgb(16, 185, 129) };
+                            let label_color = if self.cut_mode { palette.cut_color } else { palette.keep_color };
                             ui.label(egui::RichText::new(label_text).strong().size(11.0).color(label_color));
                         });
                     });
@@ -1683,14 +1683,14 @@ impl eframe::App for MainApp {
                                     // Column 1: Bracketed ID [01]
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
-                                        ui.label(egui::RichText::new("[").strong().color(Color32::from_rgb(99, 102, 241)));
-                                        ui.label(egui::RichText::new(format!("{:02}", range.id)).strong().color(Color32::WHITE));
-                                        ui.label(egui::RichText::new("]").strong().color(Color32::from_rgb(99, 102, 241)));
+                                        ui.label(egui::RichText::new("[").strong().color(palette.accent));
+                                        ui.label(egui::RichText::new(format!("{:02}", range.id)).strong().color(palette.text_normal));
+                                        ui.label(egui::RichText::new("]").strong().color(palette.accent));
                                     });
 
                                     // Column 2: In - Out times (monospaced)
                                     let time_str = format!("{}-{}", self.frame_to_time(range.in_frame), self.frame_to_time(range.out_frame));
-                                    ui.label(egui::RichText::new(time_str).monospace().color(Color32::from_rgb(220, 222, 235)));
+                                    ui.label(egui::RichText::new(time_str).monospace().color(palette.text_normal));
 
                                     // Column 3: Progress mini track
                                     let (rect, _response) = ui.allocate_exact_size(
@@ -1700,7 +1700,7 @@ impl eframe::App for MainApp {
                                     let painter = ui.painter();
                                     
                                     // Draw background track
-                                    painter.rect_filled(rect, 2.0, Color32::from_rgb(30, 27, 51));
+                                    painter.rect_filled(rect, 2.0, palette.widget_inactive_bg);
                                     
                                     // Draw fill segment
                                     if self.playback.total_frames() > 0 {
@@ -1715,9 +1715,9 @@ impl eframe::App for MainApp {
                                         );
                                         
                                         let fill_color = if self.cut_mode {
-                                            Color32::from_rgb(239, 68, 68) // cut is red
+                                            palette.cut_color // cut is red
                                         } else {
-                                            Color32::from_rgb(16, 185, 129) // keep is green
+                                            palette.keep_color // keep is green
                                         };
                                         painter.rect_filled(fill_rect, 2.0, fill_color);
                                     }
