@@ -1015,6 +1015,7 @@ impl MainApp {
 
 impl eframe::App for MainApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let palette = get_palette(self.settings.appearance.theme);
         let ctx = ui.ctx().clone();
         let wants_kb = ctx.egui_wants_keyboard_input();
         let mut prev_pressed = !wants_kb && ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
@@ -1139,7 +1140,7 @@ impl eframe::App for MainApp {
             .default_size(self.timeline_height)
             .size_range(160.0..=350.0)
             .frame(egui::Frame::NONE
-                .fill(Color32::from_rgb(8, 8, 14))
+                .fill(palette.panel_bg)
                 .inner_margin(egui::Margin::symmetric(16, 12)))
             .show_inside(ui, |ui| {
                 ui.set_min_height(ui.max_rect().height());
@@ -1636,17 +1637,17 @@ impl eframe::App for MainApp {
             .resizable(false)
             .default_size(300.0)
             .frame(egui::Frame::NONE
-                .fill(Color32::from_rgb(11, 10, 18))
-                .stroke(egui::Stroke::new(1.0, Color32::from_rgb(22, 21, 38)))
+                .fill(palette.card_bg)
+                .stroke(egui::Stroke::new(1.0, palette.border_color))
                 .inner_margin(egui::Margin::same(16)))
             .show_inside(ui, |ui| {
                 ui.vertical(|ui| {
                     // Title: [snippets] ✂ and Inline Toggle Switch
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
-                        ui.label(egui::RichText::new("[").strong().color(Color32::from_rgb(99, 102, 241)).size(18.0));
-                        ui.label(egui::RichText::new("snippets").strong().color(Color32::WHITE).size(18.0));
-                        ui.label(egui::RichText::new("]").strong().color(Color32::from_rgb(99, 102, 241)).size(18.0));
+                        ui.label(egui::RichText::new("[").strong().color(palette.accent).size(18.0));
+                        ui.label(egui::RichText::new("snippets").strong().color(palette.text_normal).size(18.0));
+                        ui.label(egui::RichText::new("]").strong().color(palette.accent).size(18.0));
                         ui.add_space(6.0);
                         
                         let (scissor_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
@@ -1748,7 +1749,7 @@ impl eframe::App for MainApp {
         // 4. Central Panel: The Video Viewport Deck (Remaining center space)
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE
-                .fill(Color32::from_rgb(8, 8, 14))
+                .fill(palette.panel_bg)
                 .inner_margin(egui::Margin::same(16)))
             .show_inside(ui, |ui| {
                 ui.vertical(|ui| {
@@ -1759,14 +1760,13 @@ impl eframe::App for MainApp {
                         ui.label(
                             egui::RichText::new("[")
                                 .font(egui::FontId::new(20.0, egui::FontFamily::Name("medium".into())))
-                                .color(Color32::from_rgb(99, 102, 241))
+                                .color(palette.accent)
                         );
-
                         // Word mark "snippy"
                         ui.label(
                             egui::RichText::new("snippy")
                                 .font(egui::FontId::new(18.0, egui::FontFamily::Name("medium".into())))
-                                .color(Color32::WHITE)
+                                .color(palette.text_normal)
                         );
 
                         ui.add_space(2.0);
@@ -1781,7 +1781,7 @@ impl eframe::App for MainApp {
                         ui.label(
                             egui::RichText::new("]")
                                 .font(egui::FontId::new(20.0, egui::FontFamily::Name("medium".into())))
-                                .color(Color32::from_rgb(99, 102, 241))
+                                .color(palette.accent)
                         );
 
                         ui.add_space(8.0);
@@ -1793,7 +1793,7 @@ impl eframe::App for MainApp {
                                 .unwrap_or(path);
                             ui.label(
                                 egui::RichText::new(format!("—  {}", filename))
-                                    .color(Color32::from_rgb(142, 144, 166))
+                                    .color(palette.text_muted)
                                     .font(egui::FontId::proportional(14.0))
                             );
                         }
@@ -1804,7 +1804,7 @@ impl eframe::App for MainApp {
 
                             // Settings gear button
                             let gear_btn = egui::Button::new(
-                                egui::RichText::new("⚙").size(18.0).color(Color32::from_rgb(160, 160, 200))
+                                egui::RichText::new("⚙").size(18.0).color(palette.text_muted)
                             )
                             .fill(Color32::TRANSPARENT)
                             .stroke(egui::Stroke::NONE)
