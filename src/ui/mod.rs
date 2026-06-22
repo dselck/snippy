@@ -80,7 +80,12 @@ pub struct MainApp {
 impl MainApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_fonts(&cc.egui_ctx);
-        configure_theme(&cc.egui_ctx);
+
+        // Load settings from disk; push any load error as a Notification.
+        let (settings, load_err) = Settings::load();
+
+        // Configure theme using loaded settings
+        configure_theme(&cc.egui_ctx, settings.appearance.theme);
 
         if let Some(wgpu_state) = &cc.wgpu_render_state {
             let mut renderer = wgpu_state.renderer.write();
@@ -89,11 +94,6 @@ impl MainApp {
                 wgpu_state.target_format,
             ));
         }
-
-
-
-        // Load settings from disk; push any load error as a Notification.
-        let (settings, load_err) = Settings::load();
         let mut notifications = NotificationQueue::new();
         if let Some(err) = load_err {
             notifications.push(Notification::error(err.message()));
@@ -409,44 +409,42 @@ fn configure_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-fn configure_theme(ctx: &egui::Context) {
+fn configure_theme(ctx: &egui::Context, theme: crate::settings::Theme) {
+    let palette = get_palette(theme);
     let mut style = (*ctx.global_style()).clone();
     
-    // Custom Slate/Indigo Dark Palette
-    let panel_bg = Color32::from_rgb(8, 8, 14);       // Deep space black
-    let card_bg = Color32::from_rgb(15, 14, 25);       // Sleek card background
-    let border_color = Color32::from_rgb(33, 31, 54);   // Subdued violet border
-    let text_normal = Color32::from_rgb(220, 222, 235); // Clean light text
-    let accent_purple = Color32::from_rgb(99, 102, 241); // Electric indigo accent
-    let accent_hover = Color32::from_rgb(124, 58, 237);  // Bright purple hover
-
-    let mut visuals = egui::Visuals::dark();
-    visuals.window_fill = panel_bg;
-    visuals.panel_fill = panel_bg;
+    let mut visuals = if palette.is_dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    
+    visuals.window_fill = palette.panel_bg;
+    visuals.panel_fill = palette.panel_bg;
     
     // Configure buttons, inputs, slider styles
-    visuals.widgets.noninteractive.bg_fill = card_bg;
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, border_color);
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_normal);
+    visuals.widgets.noninteractive.bg_fill = palette.card_bg;
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, palette.border_color);
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, palette.text_normal);
 
-    visuals.widgets.inactive.bg_fill = Color32::from_rgb(24, 23, 40);
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border_color);
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text_normal);
+    visuals.widgets.inactive.bg_fill = palette.widget_inactive_bg;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, palette.border_color);
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, palette.text_normal);
     visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
  
-    visuals.widgets.hovered.bg_fill = Color32::from_rgb(38, 36, 64);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent_purple);
-    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.hovered.bg_fill = palette.widget_hovered_bg;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, palette.accent);
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, if palette.is_dark { egui::Color32::WHITE } else { egui::Color32::BLACK });
     visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
  
-    visuals.widgets.active.bg_fill = accent_purple;
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent_hover);
-    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.active.bg_fill = palette.accent;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, palette.accent_hover);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, if palette.is_dark { egui::Color32::WHITE } else { egui::Color32::BLACK });
     visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
 
     // Selection styling
-    visuals.selection.bg_fill = accent_purple;
-    visuals.selection.stroke = egui::Stroke::new(1.0, accent_hover);
+    visuals.selection.bg_fill = palette.accent;
+    visuals.selection.stroke = egui::Stroke::new(1.0, palette.accent_hover);
 
     // Global layout roundings
     visuals.window_corner_radius = egui::CornerRadius::same(12);
@@ -454,7 +452,7 @@ fn configure_theme(ctx: &egui::Context) {
         offset: [0, 8],
         blur: 15,
         spread: 0,
-        color: Color32::from_black_alpha(40),
+        color: egui::Color32::from_black_alpha(40),
     };
 
     style.visuals = visuals;
