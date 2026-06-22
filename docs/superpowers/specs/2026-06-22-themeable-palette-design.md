@@ -245,11 +245,46 @@ fn configure_theme(ctx: &egui::Context, theme: Theme) {
 ```
 
 ### Step 3: Replace Hardcoded UI Colors
-Refactor `src/ui/mod.rs` to retrieve and reference `self.settings.appearance.theme.palette()` (or cache it on `MainApp` at theme application) instead of using raw `Color32::from_rgb(...)` constants. Affected code:
-* Settings Modal frame styling (currently using hardcoded `Color32::from_rgb(10, 10, 18)`).
-* Audio Waveform drawing logic.
-* Cut/Keep status capsules and buttons.
-* Timeline snippet tracks and markers.
+Refactor `src/ui/mod.rs` to retrieve and reference `self.settings.appearance.theme.palette()` (or retrieve it using `get_palette(theme)`) instead of using raw `Color32` constants. The theme will apply to all main UI components:
+
+1. **Layout Panels:**
+   - Bottom Panel (`timeline_deck`): Background fill maps to `palette.panel_bg`.
+   - Right Panel (`sidebar_deck`): Background fill maps to `palette.card_bg`, and border stroke maps to `palette.border_color`.
+   - Central Panel (Viewport container): Background fill maps to `palette.panel_bg`.
+
+2. **Typography & Accents:**
+   - Panel Titles (e.g. `snippets`, `snippy` wordmark): Colors map to `palette.text_normal`.
+   - Decorative Brackets (e.g. `[` and `]` surrounding titles and IDs): Colors map to `palette.accent`.
+   - Subtext and Muted Labels (e.g. filename text, duration labels): Colors map to `palette.text_muted`.
+
+3. **Filmstrip Component:**
+   - Filmstrip track rect fill maps to `palette.timeline_track_bg`.
+   - Filmstrip border stroke maps to `palette.border_color`.
+   - Filmstrip sprocket holes (top and bottom) map to `palette.panel_bg`.
+   - Thumbnail borders and placeholder backgrounds map to `palette.border_color` and `palette.timeline_track_bg`.
+   - Loading indicator arc maps to `palette.accent`.
+
+4. **Waveform Deck & Visualizer:**
+   - Waveform deck panel fill/stroke map to `palette.card_bg` and `palette.border_color`.
+   - Waveform background fill maps to `palette.timeline_track_bg`.
+   - Active waveform bars map to `palette.accent`.
+   - Muted/background waveform bars map to `palette.accent.linear_multiply(0.35)` or `palette.text_muted`.
+
+5. **Markers, Playhead & Scissor Icons:**
+   - Playhead circular handle and vertical playback line map to `palette.accent`.
+   - Scissor tool icon color maps to `palette.accent`.
+   - In-marker bracket and line map to `palette.warn_color`.
+   - Out-marker bracket and line map to `palette.accent` (or `palette.warn_color`).
+
+6. **Snippet List Items:**
+   - Snippet cards inactive background and border map to `palette.widget_inactive_bg` and `palette.border_color`.
+   - Snippet cards hovered/active states map to `palette.widget_hovered_bg` / `palette.accent` and `palette.border_color`.
+   - Mode indicators (Cut/Keep) map to `palette.cut_color` and `palette.keep_color`.
+
+7. **Telemetry HUD:**
+   - Background panel maps to `palette.panel_bg.linear_multiply(0.9)` or `palette.card_bg.linear_multiply(0.9)`.
+   - Borders and text fields map to `palette.border_color`, `palette.text_normal`, and `palette.accent`.
+   - Active status lights (e.g. green for playing, red for lagging) map to `Color32::LIGHT_GREEN` and `Color32::LIGHT_RED`.
 
 ### Step 4: Settings ComboBox & Real-time Update
 Modify `draw_settings_modal`:
