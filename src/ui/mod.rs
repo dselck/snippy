@@ -1459,8 +1459,8 @@ impl eframe::App for MainApp {
                     painter.rect(
                         wave_rect,
                         4.0,
-                        Color32::from_rgb(14, 13, 23),
-                        egui::Stroke::new(1.0, Color32::from_rgb(26, 25, 43)),
+                        palette.card_bg,
+                        egui::Stroke::new(1.0, palette.border_color),
                         egui::StrokeKind::Inside,
                     );
 
@@ -1539,11 +1539,11 @@ impl eframe::App for MainApp {
                             };
 
                             let bar_color = if out_of_bounds {
-                                Color32::from_rgb(20, 19, 32)
+                                palette.timeline_track_bg
                             } else if is_cut {
-                                Color32::from_rgba_unmultiplied(99, 102, 241, 40)
+                                palette.accent.linear_multiply(0.35)
                             } else {
-                                Color32::from_rgb(99, 102, 241)
+                                palette.accent
                             };
 
                             painter.line_segment(
