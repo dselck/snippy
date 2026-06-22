@@ -20,7 +20,8 @@ fn main() -> Result<(), anyhow::Error> {
     let tags_rb = ringbuf::SharedRb::<ringbuf::storage::Heap<(u64, u64, u64)>>::new(256);
     let (tags_tx, mut tags_cons) = tags_rb.split();
 
-    let (master_clock, ticker) = snippy2::audio::clock::MasterClock::new(48000);
+    let master_clock = snippy2::audio::clock::MasterClock::new(48000);
+    let ticker = master_clock.clone();
     master_clock.set_has_audio(true);
     master_clock.play();
 

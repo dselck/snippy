@@ -1,4 +1,3 @@
-use crossbeam_channel::Sender;
 
 pub struct HwFrameWrapper {
     pub frame: ffmpeg_next::util::frame::Video,
@@ -101,22 +100,6 @@ pub enum MediaCommand {
     },
     Shutdown,
 }
-
-pub enum VideoThreadCommand {
-    Seek {
-        frame_index: usize,
-        keyframe_only: bool,
-        sequence_id: usize,
-        audio_enabled: bool,
-        resp_tx: Sender<bool>,
-    },
-    Play,
-}
-
-pub enum AudioThreadCommand {
-    Seek { target_time: f64, resp_tx: Sender<()> },
-}
-
 #[derive(Clone, Debug)]
 pub struct VideoMetadata {
     pub total_frames: usize,

@@ -3,13 +3,6 @@ use crate::media::types::DecodedFrame;
 use crossbeam_channel::Sender;
 use std::collections::VecDeque;
 
-pub trait FrameSink: Send {
-    fn push(&mut self, frames: impl IntoIterator<Item = DecodedFrame>);
-    fn flush(&mut self);
-    fn needs_frames(&self) -> bool;
-    fn clear(&mut self);
-}
-
 pub struct CrossbeamFrameSink {
     tx: Sender<DecodedFrame>,
     internal_queue: VecDeque<DecodedFrame>,
@@ -24,17 +17,15 @@ impl CrossbeamFrameSink {
             target_capacity,
         }
     }
-}
 
-impl FrameSink for CrossbeamFrameSink {
-    fn push(&mut self, frames: impl IntoIterator<Item = DecodedFrame>) {
+    pub fn push(&mut self, frames: impl IntoIterator<Item = DecodedFrame>) {
         for frame in frames {
             self.internal_queue.push_back(frame);
         }
         self.flush();
     }
 
-    fn flush(&mut self) {
+    pub fn flush(&mut self) {
         while self.internal_queue.front().is_some() {
             if self.tx.is_full() {
                 break;
@@ -46,11 +37,11 @@ impl FrameSink for CrossbeamFrameSink {
         }
     }
 
-    fn needs_frames(&self) -> bool {
+    pub fn needs_frames(&self) -> bool {
         self.internal_queue.is_empty() && self.tx.len() < self.target_capacity
     }
 
-    fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.internal_queue.clear();
     }
 }
@@ -111,13 +102,6 @@ use ringbuf::{storage::Heap, traits::*, CachingProd, SharedRb};
 use crate::audio::clock::MasterClock;
 use std::sync::Arc;
 
-pub trait AudioSink: Send {
-    fn push(&mut self, chunks: impl IntoIterator<Item = AudioChunk>);
-    fn flush(&mut self);
-    fn needs_audio(&self) -> bool;
-    fn clear(&mut self);
-}
-
 pub struct CrossbeamAudioSink {
     audio_tx: CachingProd<Arc<SharedRb<Heap<(f32, u64)>>>>,
     tags_tx: CachingProd<Arc<SharedRb<Heap<(u64, u64, u64)>>>>,
@@ -142,10 +126,8 @@ impl CrossbeamAudioSink {
             target_vacant,
         }
     }
-}
 
-impl AudioSink for CrossbeamAudioSink {
-    fn push(&mut self, chunks: impl IntoIterator<Item = AudioChunk>) {
+    pub fn push(&mut self, chunks: impl IntoIterator<Item = AudioChunk>) {
         let generation = self.master_clock.playback_generation();
         for chunk in chunks {
             self.internal_queue.push_back((chunk.data, chunk.tag, generation));
@@ -153,7 +135,7 @@ impl AudioSink for CrossbeamAudioSink {
         self.flush();
     }
 
-    fn flush(&mut self) {
+    pub fn flush(&mut self) {
         while let Some((data, tag, generation)) = self.internal_queue.pop_front() {
             if self.audio_tx.vacant_len() < self.target_vacant {
                 self.internal_queue.push_front((data, tag, generation));
@@ -181,11 +163,11 @@ impl AudioSink for CrossbeamAudioSink {
         }
     }
 
-    fn needs_audio(&self) -> bool {
+    pub fn needs_audio(&self) -> bool {
         self.internal_queue.is_empty() && self.audio_tx.vacant_len() >= self.target_vacant
     }
 
-    fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.internal_queue.clear();
     }
 }
@@ -197,7 +179,7 @@ mod tests_audio {
 
     #[test]
     fn test_crossbeam_audio_sink() {
-        let (master_clock, _ticker) = MasterClock::new(48000);
+        let master_clock = MasterClock::new(48000);
         let audio_rb = SharedRb::<Heap<(f32, u64)>>::new(10);
         let (audio_tx, mut _audio_rx) = audio_rb.split();
         let tags_rb = SharedRb::<Heap<(u64, u64, u64)>>::new(10);

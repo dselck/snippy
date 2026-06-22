@@ -209,7 +209,8 @@ impl PlaybackSession {
             }
         } else {
             println!("[PlaybackSession] No default audio device found. Falling back to real-time paced simulation.");
-            let (master_clock, ticker) = MasterClock::new(48000);
+            let master_clock = MasterClock::new(48000);
+            let ticker = master_clock.clone();
             master_clock.set_has_audio(true); // Treat as audio video
 
             let rb = SharedRb::<Heap<(f32, u64)>>::new(48000 * 2 * 2);

@@ -21,13 +21,8 @@ pub struct MasterClock {
     state: Arc<ClockState>,
 }
 
-#[derive(Clone)]
-pub struct ClockTicker {
-    state: Arc<ClockState>,
-}
-
 impl MasterClock {
-    pub fn new(sample_rate: u32) -> (Self, ClockTicker) {
+    pub fn new(sample_rate: u32) -> Self {
         let state = Arc::new(ClockState {
             current_position_us: AtomicU64::new(0),
             has_audio: AtomicBool::new(false),
@@ -39,7 +34,7 @@ impl MasterClock {
             sample_rate,
             fallback_epoch: Instant::now(),
         });
-        (Self { state: state.clone() }, ClockTicker { state })
+        Self { state }
     }
 
     pub fn current_time(&self) -> f64 {
@@ -104,35 +99,10 @@ impl MasterClock {
         self.state.audio_paused_for_sync.store(true, Ordering::SeqCst);
         self.inc_playback_generation();
     }
-}
 
-impl MasterClockPort for MasterClock {
-    fn current_pts(&self) -> Option<f64> {
-        if !self.has_audio() {
-            Some(self.current_time())
-        } else {
-            let current_us = self.state.current_position_us.load(Ordering::Relaxed);
-            Some(current_us as f64 / 1_000_000.0)
-        }
-    }
-
-    fn stall_for_catchup(&self) {
-        self.state.audio_paused_for_sync.store(true, Ordering::SeqCst);
-    }
-
-    fn resume_from_catchup(&self) {
-        self.state.audio_paused_for_sync.store(false, Ordering::SeqCst);
-    }
-}
-
-impl ClockTicker {
     pub fn is_active(&self) -> bool {
         self.state.is_playing.load(Ordering::Relaxed)
             && !self.state.audio_paused_for_sync.load(Ordering::Relaxed)
-    }
-
-    pub fn playback_generation(&self) -> u64 {
-        self.state.playback_generation.load(Ordering::Relaxed)
     }
 
     pub fn advance(&self, written_samples: u64, last_tag: Option<(u64, u64)>, samples_read_total: u64) {
@@ -156,13 +126,32 @@ impl ClockTicker {
     }
 }
 
+impl MasterClockPort for MasterClock {
+    fn current_pts(&self) -> Option<f64> {
+        if !self.has_audio() {
+            Some(self.current_time())
+        } else {
+            let current_us = self.state.current_position_us.load(Ordering::Relaxed);
+            Some(current_us as f64 / 1_000_000.0)
+        }
+    }
+
+    fn stall_for_catchup(&self) {
+        self.state.audio_paused_for_sync.store(true, Ordering::SeqCst);
+    }
+
+    fn resume_from_catchup(&self) {
+        self.state.audio_paused_for_sync.store(false, Ordering::SeqCst);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_fallback_clock() {
-        let (clock, _) = MasterClock::new(48000);
+        let clock = MasterClock::new(48000);
         clock.set_has_audio(false);
         clock.set_position(1.0);
         assert_eq!(clock.current_pts(), Some(1.0));
@@ -181,7 +170,8 @@ mod tests {
 
     #[test]
     fn test_ticker_advance() {
-        let (clock, ticker) = MasterClock::new(48000);
+        let clock = MasterClock::new(48000);
+        let ticker = clock.clone();
         clock.set_has_audio(true);
         clock.play();
         
@@ -197,7 +187,8 @@ mod tests {
 
     #[test]
     fn test_play_clears_sync_pause() {
-        let (clock, ticker) = MasterClock::new(48000);
+        let clock = MasterClock::new(48000);
+        let ticker = clock.clone();
         clock.set_has_audio(true);
         clock.reset(0.0);
         assert!(!ticker.is_active(), "Ticker should be inactive after reset");

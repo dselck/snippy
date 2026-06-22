@@ -33,7 +33,8 @@ impl AudioEngine {
         let tags_rb = ringbuf::SharedRb::<ringbuf::storage::Heap<(u64, u64, u64)>>::new(256);
         let (tags_prod, mut tags_cons) = tags_rb.split();
 
-        let (master_clock, ticker) = clock::MasterClock::new(sample_rate);
+        let master_clock = clock::MasterClock::new(sample_rate);
+        let ticker = master_clock.clone();
 
         let mut samples_read_total = 0u64; // In frames
         let mut last_tag: Option<(u64, u64)> = None;
