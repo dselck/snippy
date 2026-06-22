@@ -244,10 +244,25 @@ impl MainApp {
                         ui.horizontal(|ui| {
                             ui.label("Theme");
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(egui::RichText::new("Dark").color(muted).size(12.0));
+                                egui::ComboBox::from_id_salt("theme_selector")
+                                    .selected_text(match self.pending_settings.appearance.theme {
+                                        crate::settings::Theme::VideoEditorDark => "Video Editor Dark",
+                                        crate::settings::Theme::SleekMidnight => "Sleek Midnight",
+                                        crate::settings::Theme::HighContrastOled => "High-Contrast OLED",
+                                        crate::settings::Theme::ClassicIndigoDark => "Classic Indigo Dark",
+                                        crate::settings::Theme::VideoEditorLight => "Video Editor Light",
+                                        crate::settings::Theme::ClassicWarmLight => "Classic Warm Light",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut self.pending_settings.appearance.theme, crate::settings::Theme::VideoEditorDark, "Video Editor Dark");
+                                        ui.selectable_value(&mut self.pending_settings.appearance.theme, crate::settings::Theme::SleekMidnight, "Sleek Midnight");
+                                        ui.selectable_value(&mut self.pending_settings.appearance.theme, crate::settings::Theme::HighContrastOled, "High-Contrast OLED");
+                                        ui.selectable_value(&mut self.pending_settings.appearance.theme, crate::settings::Theme::ClassicIndigoDark, "Classic Indigo Dark");
+                                        ui.selectable_value(&mut self.pending_settings.appearance.theme, crate::settings::Theme::VideoEditorLight, "Video Editor Light");
+                                        ui.selectable_value(&mut self.pending_settings.appearance.theme, crate::settings::Theme::ClassicWarmLight, "Classic Warm Light");
+                                    });
                             });
                         });
-                        ui.label(egui::RichText::new("Additional themes coming soon.").size(11.0).color(muted));
                     });
                     ui.add_space(12.0);
 
@@ -376,10 +391,14 @@ impl MainApp {
             });
 
         if close_modal {
+            let theme_changed = self.settings.appearance.theme != self.pending_settings.appearance.theme;
             // Commit pending settings → live settings
             self.settings = self.pending_settings.clone();
             self.settings.save();
             self.show_settings_modal = false;
+            if theme_changed {
+                configure_theme(ctx, self.settings.appearance.theme);
+            }
         }
     }
 }
