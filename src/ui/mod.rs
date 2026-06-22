@@ -1190,8 +1190,8 @@ impl eframe::App for MainApp {
                     
                     let painter = ui.painter_at(filmstrip_rect);
                     // Draw filmstrip track card background
-                    painter.rect_filled(filmstrip_rect, 6.0, Color32::from_rgb(12, 11, 20));
-                    painter.rect_stroke(filmstrip_rect, 6.0, egui::Stroke::new(1.0, Color32::from_rgb(26, 25, 43)), egui::StrokeKind::Inside);
+                    painter.rect_filled(filmstrip_rect, 6.0, palette.timeline_track_bg);
+                    painter.rect_stroke(filmstrip_rect, 6.0, egui::Stroke::new(1.0, palette.border_color), egui::StrokeKind::Inside);
 
                     let sprocket_height = 8.0;
                     let inner_height = (filmstrip_height - (sprocket_height * 2.0)).max(10.0);
@@ -1223,14 +1223,14 @@ impl eframe::App for MainApp {
                             egui::pos2(sx, filmstrip_rect.top() + (sprocket_height - sprocket_h) * 0.5),
                             egui::vec2(sprocket_width, sprocket_h),
                         );
-                        painter.rect_filled(top_sprocket_rect, 1.0, Color32::from_rgb(24, 23, 40));
+                        painter.rect_filled(top_sprocket_rect, 1.0, palette.panel_bg);
 
                         // Bottom sprocket hole
                         let bottom_sprocket_rect = egui::Rect::from_min_size(
                             egui::pos2(sx, filmstrip_rect.bottom() - (sprocket_height + sprocket_h) * 0.5),
                             egui::vec2(sprocket_width, sprocket_h),
                         );
-                        painter.rect_filled(bottom_sprocket_rect, 1.0, Color32::from_rgb(24, 23, 40));
+                        painter.rect_filled(bottom_sprocket_rect, 1.0, palette.panel_bg);
                     }
 
                     // Calculate logarithmic delta step
@@ -1280,9 +1280,9 @@ impl eframe::App for MainApp {
 
                         let is_cut = self.is_frame_cut(target_frame);
                         let tint = if is_cut {
-                            Color32::from_gray(90) // Dimmed
+                            palette.text_muted // Dimmed
                         } else {
-                            Color32::WHITE
+                            palette.text_normal
                         };
 
                         if let Some(texture) = self.thumbnail_cache.get(&target_frame) {
@@ -1312,13 +1312,9 @@ impl eframe::App for MainApp {
                             }
                         } else {
                             // Placeholder loading card with animated spinner
-                            let placeholder_bg = if is_cut {
-                                Color32::from_rgb(18, 10, 15) // Darker reddish bg
-                            } else {
-                                Color32::from_rgb(18, 17, 28)
-                            };
+                            let placeholder_bg = palette.timeline_track_bg;
                             painter.rect_filled(thub_rect, 4.0, placeholder_bg);
-                            painter.rect_stroke(thub_rect, 4.0, egui::Stroke::new(1.0, Color32::from_rgb(45, 43, 75)), egui::StrokeKind::Inside);
+                            painter.rect_stroke(thub_rect, 4.0, egui::Stroke::new(1.0, palette.border_color), egui::StrokeKind::Inside);
                             if inner_height > 16.0 {
                                 // Spinning arc: one full revolution every 1.2 s
                                 let t = ui.ctx().input(|i| i.time) as f32;
@@ -1327,7 +1323,7 @@ impl eframe::App for MainApp {
                                 let r = (thub_rect.size().min_elem() * 0.22).max(4.0);
                                 let arc_fraction = 0.65_f32;
                                 let n_segments = 20usize;
-                                let arc_color = Color32::from_rgb(110, 90, 160);
+                                let arc_color = palette.accent;
                                 let points: Vec<egui::Pos2> = (0..=n_segments)
                                     .map(|k| {
                                         let a = angle
@@ -1352,7 +1348,7 @@ impl eframe::App for MainApp {
                                 draw_hatching(
                                     &painter,
                                     thub_rect,
-                                    Color32::from_rgba_unmultiplied(239, 68, 68, 30),
+                                    palette.cut_color.linear_multiply(0.2),
                                     1.0,
                                     12.0,
                                 );
@@ -1369,7 +1365,7 @@ impl eframe::App for MainApp {
                                 painter.rect_stroke(
                                     thub_rect,
                                     4.0,
-                                    egui::Stroke::new(2.0, Color32::from_rgb(59, 130, 246)),
+                                    egui::Stroke::new(2.0, palette.accent),
                                     egui::StrokeKind::Inside,
                                 );
                             }
@@ -1384,7 +1380,7 @@ impl eframe::App for MainApp {
                                 egui::Align2::CENTER_CENTER,
                                 time_text,
                                 egui::FontId::monospace(8.0),
-                                Color32::from_rgb(148, 163, 184),
+                                palette.text_muted,
                             );
                         }
                     }
