@@ -1,7 +1,9 @@
 use crossbeam_channel::{Receiver, Sender};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Condvar};
+use std::collections::VecDeque;
 use std::thread;
+use crate::media::types::get_nearest_keyframe;
 
 #[derive(Debug, Clone)]
 pub enum ThumbnailCommand {
@@ -24,16 +26,7 @@ pub struct ThumbnailResponse {
     pub rgba_data: Vec<u8>,
 }
 
-fn get_nearest_keyframe(keyframes: &[usize], target: usize) -> usize {
-    if keyframes.is_empty() {
-        return target;
-    }
-    match keyframes.binary_search(&target) {
-        Ok(i) => keyframes[i],
-        Err(0) => keyframes[0],
-        Err(i) => keyframes[i - 1],
-    }
-}
+
 
 /// One GOP's worth of decode work dispatched to a worker thread.
 #[derive(Debug)]
@@ -90,8 +83,8 @@ pub fn spawn_thumbnail_decoder_pool(
 
     // Shared FIFO work queue. Coordinator pushes visible GOPs first, padding GOPs after.
     // Workers pull in FIFO order, so visible work is always consumed first.
-    let work_queue: Arc<crossbeam_queue::SegQueue<GopWorkItem>> =
-        Arc::new(crossbeam_queue::SegQueue::new());
+    let work_queue: Arc<(Mutex<VecDeque<GopWorkItem>>, Condvar)> =
+        Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
 
     let mut handles: Vec<thread::JoinHandle<()>> = Vec::with_capacity(thread_count + 1);
 
@@ -122,7 +115,7 @@ pub fn spawn_thumbnail_decoder_pool(
 
 fn coordinator_thread(
     cmd_rx: Receiver<ThumbnailCommand>,
-    work_queue: Arc<crossbeam_queue::SegQueue<GopWorkItem>>,
+    work_queue: Arc<(Mutex<VecDeque<GopWorkItem>>, Condvar)>,
     generation: Arc<AtomicU64>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     keyframes: Vec<usize>,
@@ -137,33 +130,42 @@ fn coordinator_thread(
             ThumbnailCommand::Clear => {
                 // Preempt workers and drain the queue.
                 generation.fetch_add(1, Ordering::SeqCst);
-                while work_queue.pop().is_some() {}
+                {
+                    let mut queue = work_queue.0.lock().unwrap();
+                    queue.clear();
+                }
+                work_queue.1.notify_all();
                 while cmd_rx.try_recv().is_ok() {} // drain further clears
             }
             ThumbnailCommand::Request { visible_frames, padding_frames, height } => {
                 // Advance generation — workers observing the old value will abort.
                 let new_gen = generation.fetch_add(1, Ordering::SeqCst) + 1;
                 // Drain the stale work queue before pushing new work.
-                while work_queue.pop().is_some() {}
-                // Visible GOPs pushed first → consumed first by workers (FIFO priority).
-                for item in group_frames_by_gop(&visible_frames, &keyframes, &keyframes_pts, new_gen, height) {
-                    work_queue.push(item);
+                {
+                    let mut queue = work_queue.0.lock().unwrap();
+                    queue.clear();
+                    // Visible GOPs pushed first → consumed first by workers (FIFO priority).
+                    for item in group_frames_by_gop(&visible_frames, &keyframes, &keyframes_pts, new_gen, height) {
+                        queue.push_back(item);
+                    }
+                    // Padding GOPs pushed after → consumed once visible GOPs are done.
+                    for item in group_frames_by_gop(&padding_frames, &keyframes, &keyframes_pts, new_gen, height) {
+                        queue.push_back(item);
+                    }
                 }
-                // Padding GOPs pushed after → consumed once visible GOPs are done.
-                for item in group_frames_by_gop(&padding_frames, &keyframes, &keyframes_pts, new_gen, height) {
-                    work_queue.push(item);
-                }
+                work_queue.1.notify_all();
             }
         }
     }
     // Signal workers to exit once the coordinator's command channel closes.
     shutdown.store(true, Ordering::SeqCst);
+    work_queue.1.notify_all();
 }
 
 fn worker_thread(
     path: String,
     fps: f64,
-    work_queue: Arc<crossbeam_queue::SegQueue<GopWorkItem>>,
+    work_queue: Arc<(Mutex<VecDeque<GopWorkItem>>, Condvar)>,
     generation: Arc<AtomicU64>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     resp_tx: Sender<ThumbnailResponse>,
@@ -230,11 +232,16 @@ fn worker_thread(
     let mut scaler: Option<ffmpeg_next::software::scaling::context::Context> = None;
 
     loop {
-        // Spin-wait for a work item with a short sleep to avoid pegging the CPU.
-        let item = loop {
-            if let Some(i) = work_queue.pop() { break i; }
-            if shutdown.load(Ordering::SeqCst) { return; }
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        // Wait for a work item using Mutex + Condvar.
+        let item = {
+            let mut queue = work_queue.0.lock().unwrap();
+            loop {
+                if shutdown.load(Ordering::SeqCst) { return; }
+                if let Some(i) = queue.pop_front() {
+                    break i;
+                }
+                queue = work_queue.1.wait(queue).unwrap();
+            }
         };
 
         // Stale generation — a newer batch arrived; skip without decoding.

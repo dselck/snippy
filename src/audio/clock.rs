@@ -2,8 +2,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::media::sync::MasterClockPort;
-
 struct ClockState {
     current_position_us: AtomicU64,
     has_audio: AtomicBool,
@@ -124,10 +122,7 @@ impl MasterClock {
         let now_us = std::cmp::max(1, self.state.fallback_epoch.elapsed().as_micros() as u64);
         self.state.fallback_start_us.store(now_us, Ordering::Relaxed);
     }
-}
-
-impl MasterClockPort for MasterClock {
-    fn current_pts(&self) -> Option<f64> {
+    pub fn current_pts(&self) -> Option<f64> {
         if !self.has_audio() {
             Some(self.current_time())
         } else {
@@ -136,14 +131,15 @@ impl MasterClockPort for MasterClock {
         }
     }
 
-    fn stall_for_catchup(&self) {
+    pub fn stall_for_catchup(&self) {
         self.state.audio_paused_for_sync.store(true, Ordering::SeqCst);
     }
 
-    fn resume_from_catchup(&self) {
+    pub fn resume_from_catchup(&self) {
         self.state.audio_paused_for_sync.store(false, Ordering::SeqCst);
     }
 }
+
 
 #[cfg(test)]
 mod tests {

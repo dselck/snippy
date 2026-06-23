@@ -65,7 +65,7 @@ mod tests {
             frame_idx: 0,
             planes: Arc::new(YuvPlanes {
                 y: vec![], u: vec![], v: vec![],
-                width: 0, height: 0, y_stride: 0, u_stride: 0, v_stride: 0, is_10bit: false,
+                width: 0, height: 0, y_stride: 0, u_stride: 0, v_stride: 0,
             }),
             sequence_id: 0,
             pts_sec: 0.0,

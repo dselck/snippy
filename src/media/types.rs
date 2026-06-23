@@ -15,13 +15,6 @@ unsafe impl Sync for HwFrameWrapper {}
 #[derive(Clone, Debug)]
 pub enum GpuFrameDescriptor {
     CVPixelBuffer(*const std::ffi::c_void),
-    D3D11Texture(*const std::ffi::c_void),
-    Dmabuf {
-        fd: std::os::fd::RawFd,
-        width: u32,
-        height: u32,
-        format: u32,
-    },
     // macOS VideoToolbox HW frame
     MacOsHwFrame(std::sync::Arc<HwFrameWrapper>),
 }
@@ -39,7 +32,6 @@ pub struct YuvPlanes {
     pub y_stride: u32,
     pub u_stride: u32,
     pub v_stride: u32,
-    pub is_10bit: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -109,4 +101,15 @@ pub struct VideoMetadata {
     pub has_audio: bool,
     pub keyframes: Vec<usize>,
     pub keyframes_pts: Vec<i64>,
+}
+
+pub fn get_nearest_keyframe(keyframes: &[usize], target: usize) -> usize {
+    if keyframes.is_empty() {
+        return target;
+    }
+    match keyframes.binary_search(&target) {
+        Ok(i) => keyframes[i],
+        Err(0) => keyframes[0],
+        Err(i) => keyframes[i - 1],
+    }
 }

@@ -1,13 +1,9 @@
 use std::collections::HashMap;
-
-#[derive(Debug, Clone)]
-pub struct CachedFrame {
-    pub frame: crate::media::DecodedFrame,
-}
+use crate::media::DecodedFrame;
 
 pub struct GopCache {
     pub keyframe_idx: usize,
-    pub frames: HashMap<usize, CachedFrame>,
+    pub frames: HashMap<usize, DecodedFrame>,
 }
 
 impl Default for GopCache {
@@ -24,11 +20,11 @@ impl GopCache {
         }
     }
 
-    pub fn get_cached(&self, frame_idx: usize) -> Option<&CachedFrame> {
+    pub fn get_cached(&self, frame_idx: usize) -> Option<&DecodedFrame> {
         self.frames.get(&frame_idx)
     }
 
-    pub fn insert_frame(&mut self, frame_idx: usize, frame: CachedFrame) {
+    pub fn insert_frame(&mut self, frame_idx: usize, frame: DecodedFrame) {
         if frame_idx >= self.keyframe_idx {
             self.frames.insert(frame_idx, frame);
         }
@@ -41,3 +37,4 @@ impl GopCache {
         }
     }
 }
+

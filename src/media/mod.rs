@@ -156,17 +156,6 @@ pub enum PresenterState {
     },
 }
 
-fn get_nearest_keyframe(keyframes: &[usize], target: usize) -> usize {
-    if keyframes.is_empty() {
-        return target;
-    }
-    match keyframes.binary_search(&target) {
-        Ok(i) => keyframes[i],
-        Err(0) => keyframes[0],
-        Err(i) => keyframes[i - 1],
-    }
-}
-
 fn run_decoding_loop(
     path: &str,
     target_sample_rate: u32,
@@ -211,7 +200,7 @@ fn run_decoding_loop(
         );
     });
 
-    let mut sync_engine = crate::media::sync::VideoSyncEngine::new(Box::new(master_clock.clone()));
+    let mut sync_engine = crate::media::sync::VideoSyncEngine::new(master_clock.clone());
     let mut state = PresenterState::Paused;
     let mut current_frame: Option<DecodedFrame> = None;
     let mut lookahead_queue = std::collections::VecDeque::new();

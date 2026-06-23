@@ -1,6 +1,6 @@
 use ffmpeg_next::Packet;
 use crate::media::types::DecodedFrame;
-use crate::media::cache::{GopCache, CachedFrame};
+use crate::media::cache::GopCache;
 
 #[derive(Debug)]
 pub enum DecodeError {
@@ -45,18 +45,7 @@ impl VideoDecoderPipeline {
         }
     }
 
-    fn get_nearest_keyframe(keyframes: &[usize], frame_idx: usize) -> usize {
-        match keyframes.binary_search(&frame_idx) {
-            Ok(_) => frame_idx,
-            Err(pos) => {
-                if pos == 0 {
-                    0
-                } else {
-                    keyframes[pos - 1]
-                }
-            }
-        }
-    }
+
 
     pub fn play(&mut self) {
         self.play_mode = true;
@@ -84,10 +73,6 @@ impl VideoDecoderPipeline {
         self.decode_more
     }
 
-    pub fn current_sequence_id(&self) -> usize {
-        self.current_sequence_id
-    }
-
     /// Prepares the pipeline for a seek.
     /// Returns `true` if the seek was satisfied from cache (in which case, the caller shouldn't seek FFmpeg).
     pub fn seek(
@@ -97,7 +82,7 @@ impl VideoDecoderPipeline {
         sequence_id: usize,
         audio_enabled: bool,
     ) -> bool {
-        let target_kf = Self::get_nearest_keyframe(&self.keyframes, frame_index);
+        let target_kf = crate::media::types::get_nearest_keyframe(&self.keyframes, frame_index);
         self.gop_cache.clear_if_different_gop(target_kf);
 
         if !audio_enabled {
@@ -144,7 +129,7 @@ impl VideoDecoderPipeline {
 
     pub fn get_cached_frame(&self, frame_idx: usize) -> Option<DecodedFrame> {
         self.gop_cache.get_cached(frame_idx).map(|f| {
-            let mut f_frame = f.frame.clone();
+            let mut f_frame = f.clone();
             match &mut f_frame {
                 DecodedFrame::Cpu { sequence_id, .. } => *sequence_id = self.current_sequence_id,
                 DecodedFrame::Gpu { sequence_id, .. } => *sequence_id = self.current_sequence_id,
@@ -177,9 +162,9 @@ impl VideoDecoderPipeline {
             let _pts_sec = decoded.pts_sec();
 
             // GOP Cache population: limit cache to the current GOP to prevent unbounded memory growth
-            let nearest_kf = Self::get_nearest_keyframe(&self.keyframes, frame_idx);
+            let nearest_kf = crate::media::types::get_nearest_keyframe(&self.keyframes, frame_idx);
             self.gop_cache.clear_if_different_gop(nearest_kf);
-            self.gop_cache.insert_frame(frame_idx, CachedFrame { frame: decoded.clone() });
+            self.gop_cache.insert_frame(frame_idx, decoded.clone());
 
             self.last_decoded_frame = Some(frame_idx);
 

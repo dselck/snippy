@@ -77,22 +77,7 @@ impl DecoderAdapter for FfmpegDecoderAdapter {
                     }));
                 }
 
-                let actual_frame = if frame.format() == ffmpeg_next::format::Pixel::VIDEOTOOLBOX || frame.format() == ffmpeg_next::format::Pixel::D3D11 {
-                    let mut sw_frame = ffmpeg_next::util::frame::Video::empty();
-                    let ret = unsafe {
-                        ffmpeg_next::sys::av_hwframe_transfer_data(
-                            sw_frame.as_mut_ptr(),
-                            frame.as_ptr(),
-                            0,
-                        )
-                    };
-                    if ret < 0 {
-                        return Err(DecodeError::Fault(format!("Failed to transfer hw frame: {}", ret)));
-                    }
-                    sw_frame
-                } else {
-                    frame.clone()
-                };
+                let actual_frame = frame.clone();
 
                 let actual_color_space = actual_frame.color_space();
                 let actual_color_range = actual_frame.color_range();
@@ -132,7 +117,6 @@ impl DecoderAdapter for FfmpegDecoderAdapter {
                     y_stride: video_frame.stride(0) as u32,
                     u_stride: video_frame.stride(1) as u32,
                     v_stride: video_frame.stride(2) as u32,
-                    is_10bit: false,
                 });
 
                 Ok(Some(DecodedFrame::Cpu {

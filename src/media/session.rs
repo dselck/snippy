@@ -47,7 +47,6 @@ pub struct PlaybackSession {
 
     // Headless support
     master_clock: Option<MasterClock>,
-    audio_consumer: Option<thread::JoinHandle<()>>,
 
     arrow_seek_state: ArrowSeekState,
     is_scrubbing: bool,
@@ -117,7 +116,6 @@ impl PlaybackSession {
             last_sent_seek_frame: None,
             was_playing_before_scrub: false,
             master_clock: None,
-            audio_consumer: None,
             arrow_seek_state: ArrowSeekState::Idle,
             is_scrubbing: false,
             thumbnail_tx: None,
@@ -179,7 +177,6 @@ impl PlaybackSession {
                 self.frame_rx = Some(frame_rx);
                 self.master_clock = Some(master_clock);
                 self.audio_engine = Some(ae);
-                self.audio_consumer = None;
                 self.loudness_profile = vec![None; meta.total_frames * 4];
                 self.loudness_rx = Some(loudness_rx);
 
@@ -220,7 +217,7 @@ impl PlaybackSession {
             let (tags_tx, mut tags_cons) = tags_rb.split();
 
             let ticker_clone = ticker.clone();
-            let audio_consumer = thread::spawn(move || {
+            let _audio_consumer = thread::spawn(move || {
                 let sample_rate = 48000;
                 let mut start_time = Instant::now();
                 let mut samples_read_total = 0u64;
@@ -333,7 +330,6 @@ impl PlaybackSession {
                 self.frame_rx = Some(frame_rx);
                 self.master_clock = Some(master_clock);
                 self.audio_engine = None;
-                self.audio_consumer = Some(audio_consumer);
                 self.loudness_profile = vec![None; meta.total_frames * 4];
                 self.loudness_rx = Some(loudness_rx);
 

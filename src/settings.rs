@@ -50,11 +50,56 @@ pub enum Theme {
     ClassicIndigoDark,
     VideoEditorLight,
     ClassicWarmLight,
+    CustomDynamic,
 }
 
 impl Default for Theme {
     fn default() -> Self {
         Theme::VideoEditorDark
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomMode {
+    Dark,
+    Light,
+    Custom,
+}
+
+impl Default for CustomMode {
+    fn default() -> Self {
+        CustomMode::Dark
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorHarmony {
+    Complementary,
+    SplitComplementary,
+    Analogous,
+    Triadic,
+    Tetradic,
+    Monochromatic,
+}
+
+impl Default for ColorHarmony {
+    fn default() -> Self {
+        ColorHarmony::Complementary
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticStyle {
+    Classic,
+    Harmonized,
+}
+
+impl Default for SemanticStyle {
+    fn default() -> Self {
+        SemanticStyle::Classic
     }
 }
 
@@ -133,15 +178,39 @@ impl Default for AdvancedSettings {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AppearanceSettings {
     pub theme: Theme,
+    pub custom_theme_mode: CustomMode,
+    pub custom_theme_hue: f32,
+    pub custom_theme_chroma: f32,
+    
+    // Custom overrides
+    pub custom_bg_lightness: f32,
+    pub custom_bg_chroma: f32,
+    pub custom_accent_lightness: f32,
+    pub custom_neutral_hue: f32,
+    pub custom_harmony: ColorHarmony,
+    pub custom_secondary_chroma: f32,
+    pub custom_semantic_style: SemanticStyle,
 }
 
 impl Default for AppearanceSettings {
     fn default() -> Self {
-        Self { theme: Theme::VideoEditorDark }
+        Self {
+            theme: Theme::VideoEditorDark,
+            custom_theme_mode: CustomMode::Dark,
+            custom_theme_hue: 250.0,
+            custom_theme_chroma: 0.15,
+            custom_bg_lightness: 0.08,
+            custom_bg_chroma: 0.015,
+            custom_accent_lightness: 0.65,
+            custom_neutral_hue: 250.0,
+            custom_harmony: ColorHarmony::Complementary,
+            custom_secondary_chroma: 0.10,
+            custom_semantic_style: SemanticStyle::Classic,
+        }
     }
 }
 

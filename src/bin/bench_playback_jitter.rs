@@ -5,7 +5,7 @@
 //! nominal frame rate (e.g. 41.67ms for 24fps).
 
 use snippy2::bench::{format_video_info, BenchReport, MediaTestRig, Stats, TestMediaLocator};
-use snippy2::media::{MediaCommand, MasterClockPort};
+use snippy2::media::MediaCommand;
 use std::time::{Duration, Instant};
 
 fn main() -> Result<(), anyhow::Error> {

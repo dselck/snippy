@@ -7,6 +7,12 @@
       "skillPath": "skills/productivity/caveman/SKILL.md",
       "computedHash": "934433479903febc585bf6deb5f0cebc63137e3f86b7babe0aab1ecb94d6d7a4"
     },
+    "color-expert": {
+      "source": "meodai/skill.color-expert",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "1b8eb8204cc4087b56715212852162d310536fd74d1c92409a145c43af6a6547"
+    },
     "diagnose": {
       "source": "mattpocock/skills",
       "sourceType": "github",

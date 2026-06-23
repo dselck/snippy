@@ -85,7 +85,7 @@ impl MainApp {
         let (settings, load_err) = Settings::load();
 
         // Configure theme using loaded settings
-        configure_theme(&cc.egui_ctx, settings.appearance.theme);
+        configure_theme(&cc.egui_ctx, &settings.appearance);
 
         if let Some(wgpu_state) = &cc.wgpu_render_state {
             let mut renderer = wgpu_state.renderer.write();
@@ -154,7 +154,7 @@ impl MainApp {
     fn draw_settings_modal(&mut self, ctx: &egui::Context) {
         use crate::settings::ZoomUnit;
 
-        let palette  = get_palette(self.settings.appearance.theme);
+        let palette  = get_palette(&self.settings.appearance);
         let accent   = palette.accent;
         let muted    = palette.text_muted;
         let warn_col = palette.warn_color;
@@ -182,7 +182,7 @@ impl MainApp {
 
                 // Title row
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("⚙  Settings").size(18.0).color(Color32::WHITE).strong());
+                    ui.label(egui::RichText::new("⚙  Settings").size(18.0).color(palette.text_normal).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(egui::RichText::new("⌘,").size(12.0).color(muted));
                     });
@@ -252,6 +252,7 @@ impl MainApp {
                                         crate::settings::Theme::ClassicIndigoDark => "Classic Indigo Dark",
                                         crate::settings::Theme::VideoEditorLight => "Video Editor Light",
                                         crate::settings::Theme::ClassicWarmLight => "Classic Warm Light",
+                                        crate::settings::Theme::CustomDynamic => "Custom Dynamic",
                                     })
                                     .show_ui(ui, |ui| {
                                         ui.selectable_value(&mut self.pending_settings.appearance.theme, crate::settings::Theme::VideoEditorDark, "Video Editor Dark");
@@ -260,9 +261,205 @@ impl MainApp {
                                         ui.selectable_value(&mut self.pending_settings.appearance.theme, crate::settings::Theme::ClassicIndigoDark, "Classic Indigo Dark");
                                         ui.selectable_value(&mut self.pending_settings.appearance.theme, crate::settings::Theme::VideoEditorLight, "Video Editor Light");
                                         ui.selectable_value(&mut self.pending_settings.appearance.theme, crate::settings::Theme::ClassicWarmLight, "Classic Warm Light");
+                                        ui.selectable_value(&mut self.pending_settings.appearance.theme, crate::settings::Theme::CustomDynamic, "Custom Dynamic");
                                     });
                             });
                         });
+                        if self.pending_settings.appearance.theme == crate::settings::Theme::CustomDynamic {
+                            ui.add_space(8.0);
+                            
+                            // Mode selector: Dark, Light, Custom
+                            ui.horizontal(|ui| {
+                                ui.label("Mode");
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let mode_text = match self.pending_settings.appearance.custom_theme_mode {
+                                        crate::settings::CustomMode::Dark => "Dark",
+                                        crate::settings::CustomMode::Light => "Light",
+                                        crate::settings::CustomMode::Custom => "Custom",
+                                    };
+                                    egui::ComboBox::from_id_salt("custom_theme_mode")
+                                        .selected_text(mode_text)
+                                        .width(80.0)
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(&mut self.pending_settings.appearance.custom_theme_mode, crate::settings::CustomMode::Dark, "Dark");
+                                            ui.selectable_value(&mut self.pending_settings.appearance.custom_theme_mode, crate::settings::CustomMode::Light, "Light");
+                                            ui.selectable_value(&mut self.pending_settings.appearance.custom_theme_mode, crate::settings::CustomMode::Custom, "Custom");
+                                        });
+                                    });
+                            });
+                            
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.label("Accent Color");
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let accent_l = match self.pending_settings.appearance.custom_theme_mode {
+                                        crate::settings::CustomMode::Dark => 0.65,
+                                        crate::settings::CustomMode::Light => 0.55,
+                                        crate::settings::CustomMode::Custom => self.pending_settings.appearance.custom_accent_lightness,
+                                    };
+                                    let accent_rgb = crate::ui::theme::oklch_to_rgb(
+                                        accent_l,
+                                        self.pending_settings.appearance.custom_theme_chroma,
+                                        self.pending_settings.appearance.custom_theme_hue,
+                                    );
+                                    
+                                    let mut rgb_array = [accent_rgb.r(), accent_rgb.g(), accent_rgb.b()];
+                                    if ui.color_edit_button_srgb(&mut rgb_array).changed() {
+                                        let (l, c, h) = crate::ui::theme::rgb_to_oklch(rgb_array[0], rgb_array[1], rgb_array[2]);
+                                        self.pending_settings.appearance.custom_theme_hue = h;
+                                        self.pending_settings.appearance.custom_theme_chroma = c;
+                                        if self.pending_settings.appearance.custom_theme_mode == crate::settings::CustomMode::Custom {
+                                            self.pending_settings.appearance.custom_accent_lightness = l;
+                                        }
+                                    }
+                                });
+                            });
+                            
+                            ui.add_space(8.0);
+                            egui::CollapsingHeader::new(egui::RichText::new("Color Theory Options").size(12.0).color(accent).strong())
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    ui.add_space(4.0);
+                                    
+                                    // Semantic Style: Classic vs Harmonized
+                                    ui.horizontal(|ui| {
+                                        ui.label("Semantic Style");
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            let style_text = match self.pending_settings.appearance.custom_semantic_style {
+                                                crate::settings::SemanticStyle::Classic => "Classic (Green/Red)",
+                                                crate::settings::SemanticStyle::Harmonized => "Harmonized",
+                                            };
+                                            egui::ComboBox::from_id_salt("custom_semantic_style")
+                                                .selected_text(style_text)
+                                                .width(140.0)
+                                                .show_ui(ui, |ui| {
+                                                    ui.selectable_value(&mut self.pending_settings.appearance.custom_semantic_style, crate::settings::SemanticStyle::Classic, "Classic (Green/Red)");
+                                                    ui.selectable_value(&mut self.pending_settings.appearance.custom_semantic_style, crate::settings::SemanticStyle::Harmonized, "Harmonized");
+                                                });
+                                        });
+                                    });
+
+                                    ui.add_space(6.0);
+                                    // Harmony selector
+                                    ui.horizontal(|ui| {
+                                        ui.label("Harmony");
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            let harmony_text = match self.pending_settings.appearance.custom_harmony {
+                                                crate::settings::ColorHarmony::Complementary => "Complementary",
+                                                crate::settings::ColorHarmony::SplitComplementary => "Split-Complementary",
+                                                crate::settings::ColorHarmony::Analogous => "Analogous",
+                                                crate::settings::ColorHarmony::Triadic => "Triadic",
+                                                crate::settings::ColorHarmony::Tetradic => "Tetradic",
+                                                crate::settings::ColorHarmony::Monochromatic => "Monochromatic",
+                                            };
+                                            egui::ComboBox::from_id_salt("custom_harmony")
+                                                .selected_text(harmony_text)
+                                                .width(130.0)
+                                                .show_ui(ui, |ui| {
+                                                    ui.selectable_value(&mut self.pending_settings.appearance.custom_harmony, crate::settings::ColorHarmony::Complementary, "Complementary");
+                                                    ui.selectable_value(&mut self.pending_settings.appearance.custom_harmony, crate::settings::ColorHarmony::SplitComplementary, "Split-Complementary");
+                                                    ui.selectable_value(&mut self.pending_settings.appearance.custom_harmony, crate::settings::ColorHarmony::Analogous, "Analogous");
+                                                    ui.selectable_value(&mut self.pending_settings.appearance.custom_harmony, crate::settings::ColorHarmony::Triadic, "Triadic");
+                                                    ui.selectable_value(&mut self.pending_settings.appearance.custom_harmony, crate::settings::ColorHarmony::Tetradic, "Tetradic");
+                                                    ui.selectable_value(&mut self.pending_settings.appearance.custom_harmony, crate::settings::ColorHarmony::Monochromatic, "Monochromatic");
+                                                });
+                                        });
+                                    });
+
+                                    if self.pending_settings.appearance.custom_theme_mode != crate::settings::CustomMode::Custom {
+                                        ui.add_space(6.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label("Background Tint");
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                let bg_l = match self.pending_settings.appearance.custom_theme_mode {
+                                                    crate::settings::CustomMode::Dark => 0.08,
+                                                    crate::settings::CustomMode::Light => 0.96,
+                                                    _ => unreachable!(),
+                                                };
+                                                let bg_rgb = crate::ui::theme::oklch_to_rgb(
+                                                    bg_l,
+                                                    self.pending_settings.appearance.custom_bg_chroma,
+                                                    self.pending_settings.appearance.custom_neutral_hue,
+                                                );
+                                                
+                                                let mut rgb_array = [bg_rgb.r(), bg_rgb.g(), bg_rgb.b()];
+                                                if ui.color_edit_button_srgb(&mut rgb_array).changed() {
+                                                    let (_, c, h) = crate::ui::theme::rgb_to_oklch(rgb_array[0], rgb_array[1], rgb_array[2]);
+                                                    self.pending_settings.appearance.custom_bg_chroma = c;
+                                                    self.pending_settings.appearance.custom_neutral_hue = h;
+                                                }
+                                            });
+                                        });
+                                    }
+
+                                    ui.add_space(6.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Secondary Color");
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            let accent_h = self.pending_settings.appearance.custom_theme_hue;
+                                            let accent_l = match self.pending_settings.appearance.custom_theme_mode {
+                                                crate::settings::CustomMode::Dark => 0.65,
+                                                crate::settings::CustomMode::Light => 0.55,
+                                                crate::settings::CustomMode::Custom => self.pending_settings.appearance.custom_accent_lightness,
+                                            };
+                                            let secondary_h = match self.pending_settings.appearance.custom_harmony {
+                                                crate::settings::ColorHarmony::Complementary => (accent_h + 180.0) % 360.0,
+                                                crate::settings::ColorHarmony::SplitComplementary => (accent_h + 150.0) % 360.0,
+                                                crate::settings::ColorHarmony::Analogous => (accent_h + 30.0) % 360.0,
+                                                crate::settings::ColorHarmony::Triadic => (accent_h + 120.0) % 360.0,
+                                                crate::settings::ColorHarmony::Tetradic => (accent_h + 90.0) % 360.0,
+                                                crate::settings::ColorHarmony::Monochromatic => accent_h,
+                                            };
+                                            let is_dark = match self.pending_settings.appearance.custom_theme_mode {
+                                                crate::settings::CustomMode::Dark => true,
+                                                crate::settings::CustomMode::Light => false,
+                                                crate::settings::CustomMode::Custom => self.pending_settings.appearance.custom_bg_lightness < 0.5,
+                                            };
+                                            let secondary_l = if is_dark {
+                                                (accent_l - 0.1).max(0.3)
+                                            } else {
+                                                (accent_l + 0.1).min(0.8)
+                                            };
+                                            
+                                            let sec_rgb = crate::ui::theme::oklch_to_rgb(
+                                                secondary_l,
+                                                self.pending_settings.appearance.custom_secondary_chroma,
+                                                secondary_h,
+                                            );
+                                            
+                                            // A nice rounded color swatch preview on the right
+                                            let (rect, response) = ui.allocate_exact_size(egui::vec2(24.0, 16.0), egui::Sense::hover());
+                                            ui.painter().rect_filled(rect, 4.0, sec_rgb);
+                                            response.on_hover_text("Preview of the generated secondary color");
+                                            
+                                            // Slider to control the chroma/intensity of the secondary color
+                                            ui.add(egui::Slider::new(&mut self.pending_settings.appearance.custom_secondary_chroma, 0.0..=0.3).show_value(false));
+                                        });
+                                    });
+                                    
+                                    if self.pending_settings.appearance.custom_theme_mode == crate::settings::CustomMode::Custom {
+                                        ui.add_space(6.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label("Background Color");
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                let bg_rgb = crate::ui::theme::oklch_to_rgb(
+                                                    self.pending_settings.appearance.custom_bg_lightness,
+                                                    self.pending_settings.appearance.custom_bg_chroma,
+                                                    self.pending_settings.appearance.custom_neutral_hue,
+                                                );
+                                                
+                                                let mut rgb_array = [bg_rgb.r(), bg_rgb.g(), bg_rgb.b()];
+                                                if ui.color_edit_button_srgb(&mut rgb_array).changed() {
+                                                    let (l, c, h) = crate::ui::theme::rgb_to_oklch(rgb_array[0], rgb_array[1], rgb_array[2]);
+                                                    self.pending_settings.appearance.custom_bg_lightness = l;
+                                                    self.pending_settings.appearance.custom_bg_chroma = c;
+                                                    self.pending_settings.appearance.custom_neutral_hue = h;
+                                                }
+                                            });
+                                        });
+                                    }
+                                });
+                        }
                     });
                     ui.add_space(12.0);
 
@@ -390,15 +587,18 @@ impl MainApp {
                 });
             });
 
+        // If the appearance settings changed while the modal is open, apply them instantly in real time.
+        if self.settings.appearance != self.pending_settings.appearance {
+            self.settings.appearance = self.pending_settings.appearance.clone();
+            configure_theme(ctx, &self.settings.appearance);
+            self.settings.save();
+        }
+
         if close_modal {
-            let theme_changed = self.settings.appearance.theme != self.pending_settings.appearance.theme;
-            // Commit pending settings → live settings
+            // Commit remaining pending settings → live settings
             self.settings = self.pending_settings.clone();
             self.settings.save();
             self.show_settings_modal = false;
-            if theme_changed {
-                configure_theme(ctx, self.settings.appearance.theme);
-            }
         }
     }
 }
@@ -429,8 +629,8 @@ fn configure_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-fn configure_theme(ctx: &egui::Context, theme: crate::settings::Theme) {
-    let palette = get_palette(theme);
+fn configure_theme(ctx: &egui::Context, appearance: &crate::settings::AppearanceSettings) {
+    let palette = get_palette(appearance);
     let mut style = (*ctx.global_style()).clone();
     
     let mut visuals = if palette.is_dark {
@@ -446,25 +646,43 @@ fn configure_theme(ctx: &egui::Context, theme: crate::settings::Theme) {
     visuals.widgets.noninteractive.bg_fill = palette.card_bg;
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, palette.border_color);
     visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, palette.text_normal);
+    visuals.widgets.noninteractive.expansion = 0.0;
 
     visuals.widgets.inactive.bg_fill = palette.widget_inactive_bg;
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, palette.border_color);
     visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, palette.text_normal);
     visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+    visuals.widgets.inactive.expansion = 0.0;
  
+    // Calculate a contrasting text color for active/selected items based on accent color luminance
+    let accent_lum = 0.2126 * (palette.accent.r() as f32) + 0.7152 * (palette.accent.g() as f32) + 0.0722 * (palette.accent.b() as f32);
+    let active_text_color = if accent_lum > 128.0 {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
+    };
+
     visuals.widgets.hovered.bg_fill = palette.widget_hovered_bg;
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, palette.accent);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, palette.widget_hovered_bg);
     visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, if palette.is_dark { egui::Color32::WHITE } else { egui::Color32::BLACK });
     visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+    visuals.widgets.hovered.expansion = 0.0;
  
     visuals.widgets.active.bg_fill = palette.accent;
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, palette.accent_hover);
-    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, if palette.is_dark { egui::Color32::WHITE } else { egui::Color32::BLACK });
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, palette.accent);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, active_text_color);
     visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
+    visuals.widgets.active.expansion = 0.0;
+
+    visuals.widgets.open.bg_fill = palette.accent;
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, palette.accent);
+    visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, active_text_color);
+    visuals.widgets.open.corner_radius = egui::CornerRadius::same(6);
+    visuals.widgets.open.expansion = 0.0;
 
     // Selection styling
     visuals.selection.bg_fill = palette.accent;
-    visuals.selection.stroke = egui::Stroke::new(1.0, palette.accent_hover);
+    visuals.selection.stroke = egui::Stroke::new(0.0, active_text_color);
 
     // Global layout roundings
     visuals.window_corner_radius = egui::CornerRadius::same(12);
@@ -475,9 +693,12 @@ fn configure_theme(ctx: &egui::Context, theme: crate::settings::Theme) {
         color: egui::Color32::from_black_alpha(40),
     };
 
+    visuals.extreme_bg_color = palette.timeline_track_bg;
+
     style.visuals = visuals;
-    style.spacing.item_spacing = egui::vec2(10.0, 10.0);
+    style.spacing.item_spacing = egui::vec2(10.0, 2.0);
     style.spacing.button_padding = egui::vec2(12.0, 8.0);
+    style.spacing.scroll.floating = true;
     ctx.set_global_style(style);
 }
 
@@ -715,7 +936,7 @@ fn draw_scissor_icon(painter: &egui::Painter, rect: egui::Rect, color: Color32) 
     painter.line_segment([blade2_start, blade2_end], egui::Stroke::new(stroke_width, color));
 }
 
-fn toggle_switch(ui: &mut egui::Ui, theme: crate::settings::Theme, cut_mode: &mut bool) -> egui::Response {
+fn toggle_switch(ui: &mut egui::Ui, appearance: &crate::settings::AppearanceSettings, cut_mode: &mut bool) -> egui::Response {
     let desired_size = egui::vec2(34.0, 18.0);
     let (rect, mut response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
     
@@ -725,7 +946,7 @@ fn toggle_switch(ui: &mut egui::Ui, theme: crate::settings::Theme, cut_mode: &mu
     }
     
     let painter = ui.painter();
-    let palette = get_palette(theme);
+    let palette = get_palette(appearance);
     
     // Background color: red if cut_mode, green if keep_mode
     let bg_color = if *cut_mode {
@@ -752,7 +973,7 @@ fn toggle_switch(ui: &mut egui::Ui, theme: crate::settings::Theme, cut_mode: &mu
 
 fn playback_control_button(
     ui: &mut egui::Ui,
-    theme: crate::settings::Theme,
+    appearance: &crate::settings::AppearanceSettings,
     icon: PlaybackIcon,
     is_play_btn: bool,
     tooltip: &str,
@@ -766,7 +987,7 @@ fn playback_control_button(
     let response = response.on_hover_text(tooltip);
 
     let painter = ui.painter();
-    let palette = get_palette(theme);
+    let palette = get_palette(appearance);
     
     // Determine background color based on hover, click states
     let bg_color = if response.clicked() || response.is_pointer_button_down_on() {
@@ -830,7 +1051,7 @@ impl MainApp {
         &mut self,
         ui: &mut egui::Ui,
     ) -> egui::Response {
-        let palette = get_palette(self.settings.appearance.theme);
+        let palette = get_palette(&self.settings.appearance);
         let height = 12.0; // Interaction height
         let (rect, response) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), height),
@@ -1015,7 +1236,7 @@ impl MainApp {
 
 impl eframe::App for MainApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let palette = get_palette(self.settings.appearance.theme);
+        let palette = get_palette(&self.settings.appearance);
         let ctx = ui.ctx().clone();
         let wants_kb = ctx.egui_wants_keyboard_input();
         let mut prev_pressed = !wants_kb && ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
@@ -1097,26 +1318,34 @@ impl eframe::App for MainApp {
 
         // --- Notification banners ---
         // Collect data first so the rendering closure doesn't hold a live borrow on self.notifications.
-        let notif_data: Vec<(Color32, Color32, &'static str, String)> = self
+        let notif_data: Vec<(Color32, Color32, Color32, &'static str, String)> = self
             .notifications
             .items
             .iter()
             .map(|n| {
-                let (bg, border, icon) = match n.kind {
-                    NotificationKind::Error   => (Color32::from_rgb(60, 15, 15), Color32::from_rgb(200, 50, 50), "✕ "),
-                    NotificationKind::Warning => (Color32::from_rgb(50, 35, 5),  Color32::from_rgb(200, 150, 50), "⚠ "),
-                    NotificationKind::Info    => (Color32::from_rgb(10, 25, 50), Color32::from_rgb(80, 140, 220), "ℹ "),
+                let (bg, border, text_color, icon) = if palette.is_dark {
+                    match n.kind {
+                        NotificationKind::Error   => (Color32::from_rgb(60, 15, 15), Color32::from_rgb(200, 50, 50), Color32::from_rgb(230, 230, 230), "✕ "),
+                        NotificationKind::Warning => (Color32::from_rgb(50, 35, 5),  Color32::from_rgb(200, 150, 50), Color32::from_rgb(230, 230, 230), "⚠ "),
+                        NotificationKind::Info    => (Color32::from_rgb(10, 25, 50), Color32::from_rgb(80, 140, 220), Color32::from_rgb(230, 230, 230), "ℹ "),
+                    }
+                } else {
+                    match n.kind {
+                        NotificationKind::Error   => (Color32::from_rgb(254, 226, 226), Color32::from_rgb(239, 68, 68), Color32::from_rgb(153, 27, 27), "✕ "),
+                        NotificationKind::Warning => (Color32::from_rgb(254, 243, 199), Color32::from_rgb(245, 158, 11), Color32::from_rgb(146, 64, 14), "⚠ "),
+                        NotificationKind::Info    => (Color32::from_rgb(219, 234, 254), Color32::from_rgb(59, 130, 246), Color32::from_rgb(30, 64, 175), "ℹ "),
+                    }
                 };
-                (bg, border, icon, n.message.clone())
+                (bg, border, text_color, icon, n.message.clone())
             })
             .collect();
         let mut dismiss_idx: Option<usize> = None;
-        for (idx, (bg, border, icon, message)) in notif_data.iter().enumerate() {
+        for (idx, (bg, border, text_color, icon, message)) in notif_data.iter().enumerate() {
             egui::Panel::top(format!("notif_{idx}"))
                 .frame(egui::Frame::NONE.fill(*bg).stroke(egui::Stroke::new(1.0, *border)).inner_margin(egui::Margin::symmetric(14, 8)))
                 .show_inside(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("{}{}", icon, message)).color(Color32::from_rgb(230, 230, 230)).size(13.0));
+                        ui.label(egui::RichText::new(format!("{}{}", icon, message)).color(*text_color).size(13.0));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("✕").on_hover_text("Dismiss").clicked() {
                                 dismiss_idx = Some(idx);
@@ -1151,7 +1380,7 @@ impl eframe::App for MainApp {
                         ui.label(
                             egui::RichText::new(self.frame_to_time(self.playback.current_frame()))
                                 .size(16.0)
-                                .color(Color32::WHITE)
+                                .color(palette.text_normal)
                         );
                         ui.label(format!("/ {}", self.frame_to_time(self.playback.total_frames())));
                         
@@ -1163,9 +1392,15 @@ impl eframe::App for MainApp {
                             }
                             
                             // Zoom slider
+                            let old_active_bg = ui.style().visuals.widgets.active.bg_fill;
+                            let old_hovered_bg = ui.style().visuals.widgets.hovered.bg_fill;
+                            ui.style_mut().visuals.widgets.active.bg_fill = palette.secondary;
+                            ui.style_mut().visuals.widgets.hovered.bg_fill = palette.secondary_hover;
                             ui.add(egui::Slider::new(&mut self.zoom_level, 0.0..=1.0)
                                 .show_value(false)
                                 .text("Zoom"));
+                            ui.style_mut().visuals.widgets.active.bg_fill = old_active_bg;
+                            ui.style_mut().visuals.widgets.hovered.bg_fill = old_hovered_bg;
 
                             // Zoom Out button (-)
                             if ui.small_button("−").on_hover_text("Zoom out filmstrip (show more overview)").clicked() {
@@ -1210,11 +1445,26 @@ impl eframe::App for MainApp {
                         egui::pos2(filmstrip_rect.right(), filmstrip_rect.bottom() - sprocket_height),
                     );
 
+                    // Draw celluloid borders (top and bottom margins)
+                    let celluloid_bg = Color32::from_rgb(18, 18, 22);
+                    let top_margin = egui::Rect::from_min_max(
+                        egui::pos2(filmstrip_rect.left(), filmstrip_rect.top()),
+                        egui::pos2(filmstrip_rect.right(), filmstrip_rect.top() + sprocket_height),
+                    );
+                    let bottom_margin = egui::Rect::from_min_max(
+                        egui::pos2(filmstrip_rect.left(), filmstrip_rect.bottom() - sprocket_height),
+                        egui::pos2(filmstrip_rect.right(), filmstrip_rect.bottom()),
+                    );
+                    painter.rect_filled(top_margin, 0.0, celluloid_bg);
+                    painter.rect_filled(bottom_margin, 0.0, celluloid_bg);
+
                     // Draw sprockets on top and bottom margins (stretching full width)
                     let sprocket_width = 8.0;
                     let sprocket_h = 5.0;
                     let num_sprockets = ((total_width / 16.0) as usize).max(5);
                     let sprocket_gap = (total_width - (sprocket_width * num_sprockets as f32)) / (num_sprockets - 1) as f32;
+                    let sprocket_hole_fill = palette.panel_bg; 
+
                     for s in 0..num_sprockets {
                         let sx = filmstrip_rect.left() + s as f32 * (sprocket_width + sprocket_gap);
                         
@@ -1223,14 +1473,14 @@ impl eframe::App for MainApp {
                             egui::pos2(sx, filmstrip_rect.top() + (sprocket_height - sprocket_h) * 0.5),
                             egui::vec2(sprocket_width, sprocket_h),
                         );
-                        painter.rect_filled(top_sprocket_rect, 1.0, palette.panel_bg);
+                        painter.rect_filled(top_sprocket_rect, 1.0, sprocket_hole_fill);
 
                         // Bottom sprocket hole
                         let bottom_sprocket_rect = egui::Rect::from_min_size(
                             egui::pos2(sx, filmstrip_rect.bottom() - (sprocket_height + sprocket_h) * 0.5),
                             egui::vec2(sprocket_width, sprocket_h),
                         );
-                        painter.rect_filled(bottom_sprocket_rect, 1.0, palette.panel_bg);
+                        painter.rect_filled(bottom_sprocket_rect, 1.0, sprocket_hole_fill);
                     }
 
                     // Calculate logarithmic delta step
@@ -1280,9 +1530,9 @@ impl eframe::App for MainApp {
 
                         let is_cut = self.is_frame_cut(target_frame);
                         let tint = if is_cut {
-                            palette.text_muted // Dimmed
+                            Color32::from_rgba_unmultiplied(255, 255, 255, 100) // Dimmed with opacity multiplier
                         } else {
-                            palette.text_normal
+                            Color32::WHITE // Full original colors
                         };
 
                         if let Some(texture) = self.thumbnail_cache.get(&target_frame) {
@@ -1299,13 +1549,13 @@ impl eframe::App for MainApp {
                                 painter.rect_filled(
                                     thub_rect,
                                     0.0,
-                                    Color32::from_rgba_unmultiplied(239, 68, 68, 20),
+                                    Color32::from_rgba_unmultiplied(palette.cut_color.r(), palette.cut_color.g(), palette.cut_color.b(), 20),
                                 );
                                 // Draw diagonal hatching lines
                                 draw_hatching(
                                     &painter,
                                     thub_rect,
-                                    Color32::from_rgba_unmultiplied(239, 68, 68, 45),
+                                    Color32::from_rgba_unmultiplied(palette.cut_color.r(), palette.cut_color.g(), palette.cut_color.b(), 45),
                                     1.0,
                                     12.0,
                                 );
@@ -1651,7 +1901,7 @@ impl eframe::App for MainApp {
 
                         // Inline Mode Toggle Switch on the right
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let switch_resp = toggle_switch(ui, self.settings.appearance.theme, &mut self.cut_mode);
+                            let switch_resp = toggle_switch(ui, &self.settings.appearance, &mut self.cut_mode);
                             let tooltip_text = if self.cut_mode {
                                 "Mode: CUT (Snippets define what to crop out; rest is kept)"
                             } else {
@@ -1822,7 +2072,7 @@ impl eframe::App for MainApp {
                             ui.add_enabled_ui(has_ranges, |ui| {
                                 if playback_control_button(
                                     ui,
-                                    self.settings.appearance.theme,
+                                    &self.settings.appearance,
                                     PlaybackIcon::ExportVideo,
                                     false,
                                     "export video",
@@ -1836,7 +2086,7 @@ impl eframe::App for MainApp {
                             // Load button
                             if playback_control_button(
                                 ui,
-                                self.settings.appearance.theme,
+                                &self.settings.appearance,
                                 PlaybackIcon::LoadVideo,
                                 false,
                                 "Load video file",
@@ -1868,8 +2118,8 @@ impl eframe::App for MainApp {
                     let canvas_height = ui.available_height() - controls_height - 10.0;
 
                     egui::Frame::NONE
-                        .fill(Color32::from_rgb(12, 11, 20))
-                        .stroke(egui::Stroke::new(1.0, Color32::from_rgb(26, 25, 43)))
+                        .fill(palette.timeline_track_bg)
+                        .stroke(egui::Stroke::new(1.0, palette.border_color))
                         .corner_radius(8.0)
                         .show(ui, |ui| {
                             let available_space = egui::vec2(ui.available_width(), canvas_height);
@@ -1946,9 +2196,9 @@ impl eframe::App for MainApp {
                                                 let icon_painter = ui.painter_at(icon_rect);
                                                 
                                                 let icon_color = if icon_resp.hovered() {
-                                                    Color32::from_rgb(129, 140, 248) // Lighter Indigo
+                                                    palette.accent_hover
                                                 } else {
-                                                    Color32::from_rgb(99, 102, 241) // Normal Indigo
+                                                    palette.accent
                                                 };
 
                                                 icon_painter.rect_stroke(
@@ -1995,7 +2245,7 @@ impl eframe::App for MainApp {
                                                     egui::RichText::new("No Video Source")
                                                         .size(20.0)
                                                         .strong()
-                                                        .color(Color32::WHITE)
+                                                        .color(palette.text_normal)
                                                 );
 
                                                 ui.add_space(8.0);
@@ -2016,8 +2266,7 @@ impl eframe::App for MainApp {
                                                         .strong()
                                                         .color(Color32::WHITE)
                                                 )
-                                                .fill(palette.panel_bg.linear_multiply(0.9))
-                                                .stroke(egui::Stroke::new(1.0, palette.border_color))
+                                                .fill(palette.accent)
                                                 .corner_radius(6.0)
                                                 .min_size(egui::vec2(150.0, 32.0));
 
@@ -2084,9 +2333,9 @@ impl eframe::App for MainApp {
                                         .show(ui, |ui| {
                                             ui.vertical(|ui| {
                                                 ui.horizontal(|ui| {
-                                                    ui.label(egui::RichText::new("⚡ AV SYNC TELEMETRY").strong().color(palette.accent_hover));
+                                                    ui.label(egui::RichText::new("⚡ AV SYNC TELEMETRY").strong().color(palette.secondary));
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        let active_color = if self.playback.is_playing() { Color32::from_rgb(74, 222, 128) } else { Color32::from_rgb(156, 163, 175) };
+                                                        let active_color = if self.playback.is_playing() { palette.keep_color } else { palette.text_muted };
                                                         ui.label(egui::RichText::new(if self.playback.is_playing() { "● ACTIVE" } else { "■ PAUSED" }).color(active_color).font(egui::FontId::monospace(10.0)));
                                                     });
                                                 });
@@ -2113,7 +2362,7 @@ impl eframe::App for MainApp {
                                                     });
                                                 });
                                                 
-                                                let drift_color = if drift.abs() > 0.15 { Color32::LIGHT_RED } else { Color32::LIGHT_GREEN };
+                                                let drift_color = if drift.abs() > 0.15 { palette.cut_color } else { palette.keep_color };
                                                 ui.horizontal(|ui| {
                                                     ui.label("AV Sync Drift:");
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2148,7 +2397,7 @@ impl eframe::App for MainApp {
                                                 ui.horizontal(|ui| {
                                                     ui.label("Decode FPS  :");
                                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                        let fps_color = if self.decode_fps >= 20.0 { Color32::LIGHT_GREEN } else { Color32::LIGHT_RED };
+                                                        let fps_color = if self.decode_fps >= 20.0 { palette.keep_color } else { palette.cut_color };
                                                         ui.label(egui::RichText::new(format!("{:.1} fps", self.decode_fps)).monospace().color(fps_color));
                                                     });
                                                 });
@@ -2197,38 +2446,38 @@ impl eframe::App for MainApp {
                                 |ui| {
                                     ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
 
-                                    if playback_control_button(ui, self.settings.appearance.theme, PlaybackIcon::Start, false, "Go to start of video").clicked() {
+                                    if playback_control_button(ui, &self.settings.appearance, PlaybackIcon::Start, false, "Go to start of video").clicked() {
                                         self.playback.seek_internal(0, false, true);
                                     }
-                                    let prev_resp = playback_control_button(ui, self.settings.appearance.theme, PlaybackIcon::PrevFrame, false, "Step backward one frame");
+                                    let prev_resp = playback_control_button(ui, &self.settings.appearance, PlaybackIcon::PrevFrame, false, "Step backward one frame");
                                     if prev_resp.clicked() {
                                         prev_pressed = true;
                                     }
                                     if prev_resp.is_pointer_button_down_on() {
                                         prev_down = true;
                                     }
-                                    if playback_control_button(ui, self.settings.appearance.theme, PlaybackIcon::SetIn, false, "Set In marker at current frame [").clicked() {
+                                    if playback_control_button(ui, &self.settings.appearance, PlaybackIcon::SetIn, false, "Set In marker at current frame [").clicked() {
                                         self.in_marker = Some(self.playback.current_frame());
                                     }
 
                                     // Play/pause button
                                     let play_icon = if self.playback.is_playing() { PlaybackIcon::Pause } else { PlaybackIcon::Play };
                                     let play_tooltip = if self.playback.is_playing() { "Pause playback" } else { "Start playback" };
-                                    if playback_control_button(ui, self.settings.appearance.theme, play_icon, true, play_tooltip).clicked() {
+                                    if playback_control_button(ui, &self.settings.appearance, play_icon, true, play_tooltip).clicked() {
                                         self.playback.toggle_playback();
                                     }
 
-                                    if playback_control_button(ui, self.settings.appearance.theme, PlaybackIcon::SetOut, false, "Set Out marker at current frame ]").clicked() {
+                                    if playback_control_button(ui, &self.settings.appearance, PlaybackIcon::SetOut, false, "Set Out marker at current frame ]").clicked() {
                                         self.out_marker = Some(self.playback.current_frame());
                                     }
-                                    let next_resp = playback_control_button(ui, self.settings.appearance.theme, PlaybackIcon::NextFrame, false, "Step forward one frame");
+                                    let next_resp = playback_control_button(ui, &self.settings.appearance, PlaybackIcon::NextFrame, false, "Step forward one frame");
                                     if next_resp.clicked() {
                                         next_pressed = true;
                                     }
                                     if next_resp.is_pointer_button_down_on() {
                                         next_down = true;
                                     }
-                                    if playback_control_button(ui, self.settings.appearance.theme, PlaybackIcon::End, false, "Go to end of video").clicked() {
+                                    if playback_control_button(ui, &self.settings.appearance, PlaybackIcon::End, false, "Go to end of video").clicked() {
                                         self.playback.seek_internal(self.playback.total_frames(), false, true);
                                     }
                                 },
@@ -2240,7 +2489,7 @@ impl eframe::App for MainApp {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let enabled = self.in_marker.is_some() && self.out_marker.is_some();
                             ui.add_enabled_ui(enabled, |ui| {
-                                if playback_control_button(ui, self.settings.appearance.theme, PlaybackIcon::AddSnippet, false, "Add current selection as a new snippet").clicked() {
+                                if playback_control_button(ui, &self.settings.appearance, PlaybackIcon::AddSnippet, false, "Add current selection as a new snippet").clicked() {
                                     clicked = true;
                                 }
                             });
@@ -2453,6 +2702,28 @@ mod tests {
         assert_eq!(ranges[1].id, 2);
         assert_eq!(ranges[1].in_frame, 40);
         assert_eq!(ranges[1].out_frame, 50);
+    }
+
+    #[test]
+    fn test_oklch_roundtrip() {
+        let red_rgb = (255, 0, 0);
+        let (_l, _c, h) = oklch_to_rgb_and_back(red_rgb.0, red_rgb.1, red_rgb.2);
+        assert!(h > 15.0 && h < 35.0);
+        
+        let blue_rgb = (0, 0, 255);
+        let (_, _, blue_h) = oklch_to_rgb_and_back(blue_rgb.0, blue_rgb.1, blue_rgb.2);
+        assert!(blue_h > 240.0 && blue_h < 280.0);
+    }
+
+    fn oklch_to_rgb_and_back(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+        let (l, c, h) = crate::ui::theme::rgb_to_oklch(r, g, b);
+        let rgb_back = crate::ui::theme::oklch_to_rgb(l, c, h);
+        let dist = ((r as f32 - rgb_back.r() as f32).powi(2)
+            + (g as f32 - rgb_back.g() as f32).powi(2)
+            + (b as f32 - rgb_back.b() as f32).powi(2))
+            .sqrt();
+        assert!(dist < 15.0, "Dist between original and round-tripped is too large: {dist} (original: {r},{g},{b}, returned: {rgb_back:?})");
+        (l, c, h)
     }
 }
 
