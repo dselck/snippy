@@ -90,6 +90,11 @@ impl PlaybackSession {
         self.video_fps
     }
 
+    pub fn metadata(&self) -> Option<VideoMetadata> {
+        self.metadata.clone()
+    }
+
+
     pub fn latest_frame(&self) -> Option<&DecodedFrame> {
         self.latest_frame.as_ref()
     }

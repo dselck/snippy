@@ -11,6 +11,7 @@ use lru::LruCache;
 use std::num::NonZeroUsize;
 
 
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExportRange {
     pub id: usize,
     pub in_frame: usize,
@@ -75,6 +76,9 @@ pub struct MainApp {
     pub show_settings_modal: bool,
     /// Scratch copy of settings edited inside the modal; committed on close.
     pub pending_settings: Settings,
+
+    pub export_status: std::sync::Arc<std::sync::Mutex<crate::media::types::ExportStatus>>,
+    pub export_cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MainApp {
@@ -135,6 +139,8 @@ impl MainApp {
             notifications,
             show_settings_modal: false,
             pending_settings,
+            export_status: std::sync::Arc::new(std::sync::Mutex::new(crate::media::types::ExportStatus::Idle)),
+            export_cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1237,6 +1243,33 @@ impl MainApp {
 impl eframe::App for MainApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let palette = get_palette(&self.settings.appearance);
+        
+        let mut status_changed = None;
+        {
+            let status_guard = self.export_status.lock().unwrap();
+            match &*status_guard {
+                crate::media::types::ExportStatus::Completed => status_changed = Some(crate::media::types::ExportStatus::Completed),
+                crate::media::types::ExportStatus::Failed(err) => status_changed = Some(crate::media::types::ExportStatus::Failed(err.clone())),
+                crate::media::types::ExportStatus::Cancelled => status_changed = Some(crate::media::types::ExportStatus::Cancelled),
+                _ => {}
+            }
+        }
+        if let Some(new_status) = status_changed {
+            let mut status_guard = self.export_status.lock().unwrap();
+            *status_guard = crate::media::types::ExportStatus::Idle;
+            match new_status {
+                crate::media::types::ExportStatus::Completed => {
+                self.notifications.push(Notification::info("Video exported successfully!".to_string()));
+                }
+                crate::media::types::ExportStatus::Failed(err) => {
+                    self.notifications.push(Notification::error(format!("Export failed: {}", err)));
+                }
+                crate::media::types::ExportStatus::Cancelled => {
+                    self.notifications.push(Notification::warning("Export cancelled.".to_string()));
+                }
+                _ => {}
+            }
+        }
         let ctx = ui.ctx().clone();
         let wants_kb = ctx.egui_wants_keyboard_input();
         let mut prev_pressed = !wants_kb && ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft));
@@ -2484,13 +2517,57 @@ impl eframe::App for MainApp {
                             );
                         });
 
-                        // 2. Right-justified Add Snippet button (placed at the end of the row)
+                        // 2. Right-justified Add Snippet and Export buttons
                         let mut clicked = false;
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let enabled = self.in_marker.is_some() && self.out_marker.is_some();
                             ui.add_enabled_ui(enabled, |ui| {
                                 if playback_control_button(ui, &self.settings.appearance, PlaybackIcon::AddSnippet, false, "Add current selection as a new snippet").clicked() {
                                     clicked = true;
+                                }
+                            });
+
+                            let can_export = self.video_path.is_some() && (!self.ranges.is_empty() || self.cut_mode);
+                            ui.add_enabled_ui(can_export, |ui| {
+                                if playback_control_button(ui, &self.settings.appearance, PlaybackIcon::ExportVideo, false, "Export video snippets").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("Video File", &["mp4", "mkv", "ts", "mov"])
+                                        .save_file()
+                                    {
+                                        let input_path = self.video_path.clone().unwrap();
+                                        let output_path = path.to_string_lossy().to_string();
+                                        let ranges = self.ranges.clone();
+                                        let cut_mode = self.cut_mode;
+                                        
+                                        if let Some(metadata) = self.playback.metadata() {
+                                            let status_clone = self.export_status.clone();
+                                            let cancel_clone = self.export_cancel_flag.clone();
+                                            
+                                            {
+                                                let mut status_guard = status_clone.lock().unwrap();
+                                                *status_guard = crate::media::types::ExportStatus::Exporting {
+                                                    progress: 0.0,
+                                                    message: "Starting export...".to_string(),
+                                                };
+                                            }
+                                            cancel_clone.store(false, std::sync::atomic::Ordering::Relaxed);
+                                            
+                                            std::thread::spawn(move || {
+                                                if let Err(e) = crate::media::export::export_video(
+                                                    &input_path,
+                                                    &output_path,
+                                                    ranges,
+                                                    cut_mode,
+                                                    metadata,
+                                                    status_clone.clone(),
+                                                    cancel_clone,
+                                                ) {
+                                                    let mut status_guard = status_clone.lock().unwrap();
+                                                    *status_guard = crate::media::types::ExportStatus::Failed(e.to_string());
+                                                }
+                                            });
+                                        }
+                                    }
                                 }
                             });
                         });
@@ -2527,6 +2604,43 @@ impl eframe::App for MainApp {
         }
         if next_released {
             self.playback.handle_input(media::InputEvent::ArrowRightReleased);
+        }
+
+        // Render Export Progress Modal
+        let export_status = self.export_status.clone();
+        let status_guard = export_status.lock().unwrap();
+        match &*status_guard {
+            crate::media::types::ExportStatus::Exporting { progress, message } => {
+                egui::Window::new("Exporting Video")
+                    .id(egui::Id::new("export_modal"))
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .fixed_size([400.0, 150.0])
+                    .frame(egui::Frame::window(&ui.style()).fill(palette.panel_bg).stroke(egui::Stroke::new(1.0, palette.border_color)))
+                    .show(ui.ctx(), |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(10.0);
+                            ui.label(egui::RichText::new("Exporting video snippet...").strong().size(16.0).color(palette.text_normal));
+                            ui.add_space(10.0);
+                            
+                            // Progress bar
+                            ui.add(egui::ProgressBar::new(*progress)
+                                .text(format!("{:.0}%", progress * 100.0))
+                                .fill(palette.accent)
+                            );
+                            
+                            ui.add_space(10.0);
+                            ui.label(egui::RichText::new(message).size(12.0).color(palette.text_muted));
+                            ui.add_space(15.0);
+                            
+                            if ui.button(egui::RichText::new("Cancel").color(palette.warn_color)).clicked() {
+                                self.export_cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        });
+                    });
+            }
+            _ => {}
         }
     }
 }
