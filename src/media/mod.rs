@@ -25,6 +25,9 @@ pub mod session;
 pub use crate::media::session::*;
 pub mod thumbnails;
 pub use thumbnails::*;
+pub mod export;
+pub use export::export_video;
+
 
 pub use crate::media::decoder_pipeline::*;
 pub use crate::media::ffmpeg_adapter::*;

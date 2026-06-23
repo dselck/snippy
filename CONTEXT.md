@@ -131,3 +131,16 @@ _Avoid_: Waveform data, audio profile, amplitude array
 **Loudness Bucket**:
 A single entry in the Loudness Profile representing the root-mean-square amplitude of the audio samples in one sub-frame time window.
 _Avoid_: Amplitude sample, waveform bar, loudness sample
+
+**Smart Render**:
+The video export technique where Fully Kept GOPs are copied directly (remuxed) and Partially Kept GOPs are decoded, filtered, and re-encoded.
+_Avoid_: Smart cut, direct copy, partial transcoding.
+
+**Remuxed GOP**:
+A Group of Pictures (GOP) where all video frames are kept, allowing the raw packets to be copied to the output container without decoding.
+_Avoid_: Copied GOP, stream copied GOP.
+
+**Transcoded GOP**:
+A Group of Pictures (GOP) that is cut in the middle, requiring its frames to be decoded, filtered, and re-encoded.
+_Avoid_: Re-encoded GOP, cut GOP.
+

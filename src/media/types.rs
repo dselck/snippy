@@ -113,3 +113,13 @@ pub fn get_nearest_keyframe(keyframes: &[usize], target: usize) -> usize {
         Err(i) => keyframes[i - 1],
     }
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExportStatus {
+    Idle,
+    Exporting { progress: f32, message: String },
+    Completed,
+    Failed(String),
+    Cancelled,
+}
+
