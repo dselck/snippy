@@ -456,3 +456,65 @@ pub fn export_video(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gop_classification() {
+        let keyframes = vec![0, 10, 20];
+        let total_frames = 30;
+        let metadata = VideoMetadata {
+            total_frames,
+            width: 640,
+            height: 480,
+            fps: 30.0,
+            has_audio: false,
+            keyframes,
+            keyframes_pts: vec![0, 10, 20],
+        };
+
+        // Scenario 1: cut_mode = false (keep ranges). Keep range = [0, 9] (GOP 0 kept, GOP 1 and 2 cut)
+        let ranges = vec![ExportRange { id: 1, in_frame: 0, out_frame: 9 }];
+        
+        let classify = |ranges: &[ExportRange]| {
+            let mut gops = Vec::new();
+            for i in 0..metadata.keyframes.len() {
+                let start_frame = metadata.keyframes[i];
+                let end_frame = if i + 1 < metadata.keyframes.len() {
+                    metadata.keyframes[i + 1]
+                } else {
+                    metadata.total_frames
+                };
+
+                let mut kept_count = 0;
+                let mut cut_count = 0;
+                for f in start_frame..end_frame {
+                    if crate::ui::is_frame_cut_helper(f, ranges, false) {
+                        cut_count += 1;
+                    } else {
+                        kept_count += 1;
+                    }
+                }
+
+                let gop_type = if kept_count == (end_frame - start_frame) {
+                    GopType::FullyKept
+                } else if cut_count == (end_frame - start_frame) {
+                    GopType::FullyCut
+                } else {
+                    GopType::PartiallyKept
+                };
+                gops.push(gop_type);
+            }
+            gops
+        };
+
+        assert_eq!(classify(&ranges), vec![GopType::FullyKept, GopType::FullyCut, GopType::FullyCut]);
+
+        // Scenario 2: Keep range = [5, 14]. GOP 0 is PartiallyKept, GOP 1 is PartiallyKept, GOP 2 is FullyCut
+        let ranges2 = vec![ExportRange { id: 1, in_frame: 5, out_frame: 14 }];
+        assert_eq!(classify(&ranges2), vec![GopType::PartiallyKept, GopType::PartiallyKept, GopType::FullyCut]);
+    }
+}
+
