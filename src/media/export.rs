@@ -184,7 +184,8 @@ pub fn export_video(
         video_enc.set_format(decoder.format());
         video_enc.set_time_base(video_in_time_base);
         video_enc.set_frame_rate(Some(input.stream(video_in_stream_idx.unwrap()).unwrap().rate()));
-        video_enc.set_max_b_frames(0); // `/ponytail`: simplify PTS/DTS re-encoding math
+        let max_b_frames = 0;
+        video_enc.set_max_b_frames(max_b_frames); // `/ponytail`: simplify PTS/DTS re-encoding math
 
         let mut opts = ffmpeg::Dictionary::new();
         if codec_id == ffmpeg::codec::Id::H264 {
@@ -193,7 +194,7 @@ pub fn export_video(
         } else if codec_id == ffmpeg::codec::Id::H265 {
             opts.set("crf", "24");
             opts.set("preset", "medium");
-            opts.set("x265-params", "bframes=0");
+            opts.set("x265-params", &format!("bframes={}", max_b_frames));
         }
         
         Some(video_enc.open_with(opts)?)
