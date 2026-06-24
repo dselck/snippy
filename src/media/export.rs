@@ -49,13 +49,6 @@ pub fn export_video(
     let fps = metadata.fps;
     let mut input_start_pts_sec = Vec::new();
     let mut output_start_pts_sec = Vec::new();
-    let mut current_output_sec = 0.0;
-
-    for &(start_frame, end_frame) in &kept_segments {
-        input_start_pts_sec.push(start_frame as f64 / fps);
-        output_start_pts_sec.push(current_output_sec);
-        current_output_sec += (end_frame - start_frame) as f64 / fps;
-    }
 
     // 2. Classify GOPs
     let mut gop_types = Vec::new();
@@ -128,8 +121,29 @@ pub fn export_video(
 
     output.write_header()?;
 
-    // Copy stream timebases to resolve borrow checker issues with `input`/`output` inside the loop
-    let video_in_time_base = input.stream(video_in_stream_idx.unwrap()).unwrap().time_base();
+    // Copy stream timebases and calculate video_start_time to resolve A/V offsets
+    let video_in_stream = input.stream(video_in_stream_idx.unwrap()).unwrap();
+    let video_in_time_base = video_in_stream.time_base();
+    let time_base_f64 = video_in_time_base.numerator() as f64 / video_in_time_base.denominator() as f64;
+    
+    let video_start_time = if video_in_stream.start_time() > -1_000_000_000_000 {
+        video_in_stream.start_time() as f64 * time_base_f64
+    } else {
+        0.0
+    };
+
+    let mut current_output_sec = 0.0;
+    for &(start_frame, end_frame) in &kept_segments {
+        let mut actual_start_pts = start_frame as f64 / fps;
+        if let Ok(idx) = metadata.keyframes.binary_search(&start_frame) {
+            let kf_pts = metadata.keyframes_pts[idx];
+            actual_start_pts = kf_pts as f64 * time_base_f64 - video_start_time;
+        }
+        input_start_pts_sec.push(actual_start_pts);
+        output_start_pts_sec.push(current_output_sec);
+        current_output_sec += (end_frame - start_frame) as f64 / fps;
+    }
+
     let audio_in_time_base = audio_in_stream_idx.map(|idx| input.stream(idx).unwrap().time_base());
 
     let video_out_time_base = output.stream(stream_mapping[video_in_stream_idx.unwrap()] as usize).unwrap().time_base();
@@ -179,6 +193,7 @@ pub fn export_video(
         } else if codec_id == ffmpeg::codec::Id::H265 {
             opts.set("crf", "24");
             opts.set("preset", "medium");
+            opts.set("x265-params", "bframes=0");
         }
         
         Some(video_enc.open_with(opts)?)
@@ -212,9 +227,9 @@ pub fn export_video(
         let is_audio = Some(ist_idx) == audio_in_stream_idx;
 
         if is_video {
-            // Calculate frame_idx based on PTS
+            // Calculate frame_idx based on PTS relative to video_start_time
             let time_base_f64 = video_in_time_base.numerator() as f64 / video_in_time_base.denominator() as f64;
-            let pts_sec = packet.pts().unwrap_or(0) as f64 * time_base_f64;
+            let pts_sec = packet.pts().unwrap_or(0) as f64 * time_base_f64 - video_start_time;
             let frame_idx = (pts_sec * fps).round() as usize;
 
             let gop_idx = match metadata.keyframes.binary_search(&frame_idx) {
@@ -229,7 +244,8 @@ pub fn export_video(
                     // Find segment
                     if let Some(seg_idx) = kept_segments.iter().position(|&(start, end)| frame_idx >= start && frame_idx < end) {
                         let offset_sec = output_start_pts_sec[seg_idx] - input_start_pts_sec[seg_idx];
-                        let offset_ticks_in = (offset_sec / time_base_f64).round() as i64;
+                        let total_offset_sec = -video_start_time + offset_sec;
+                        let offset_ticks_in = (total_offset_sec / time_base_f64).round() as i64;
                         
                         if let Some(pts) = packet.pts() {
                             packet.set_pts(Some(pts + offset_ticks_in));
@@ -265,16 +281,20 @@ pub fn export_video(
                         let mut decoded_frame = ffmpeg::util::frame::Video::empty();
                         while decoder.receive_frame(&mut decoded_frame).is_ok() {
                             let f_pts = decoded_frame.pts().unwrap_or(0);
-                            let f_pts_sec = f_pts as f64 * time_base_f64;
+                            let f_pts_sec = f_pts as f64 * time_base_f64 - video_start_time;
                             let f_idx = (f_pts_sec * fps).round() as usize;
 
                             if !crate::ui::is_frame_cut_helper(f_idx, &ranges, cut_mode) {
                                 if let Some(seg_idx) = kept_segments.iter().position(|&(start, end)| f_idx >= start && f_idx < end) {
-                                    let out_pts_sec = f_idx as f64 / fps - input_start_pts_sec[seg_idx] + output_start_pts_sec[seg_idx];
+                                    let start_frame = kept_segments[seg_idx].0;
+                                    let out_pts_sec = (f_idx - start_frame) as f64 / fps + output_start_pts_sec[seg_idx];
                                     let encoder = video_encoder.as_mut().unwrap();
                                     let enc_pts = (out_pts_sec / (encoder.time_base().numerator() as f64 / encoder.time_base().denominator() as f64)).round() as i64;
                                     
                                     decoded_frame.set_pts(Some(enc_pts));
+                                    unsafe {
+                                        (*decoded_frame.as_mut_ptr()).pict_type = ffmpeg::sys::AVPictureType::AV_PICTURE_TYPE_NONE;
+                                    }
                                     encoder.send_frame(&decoded_frame)?;
 
                                     let mut out_pkt = ffmpeg::Packet::empty();
@@ -325,13 +345,13 @@ pub fn export_video(
             let audio_out_tb = audio_out_time_base.unwrap();
             let time_base_f64 = audio_in_tb.numerator() as f64 / audio_in_tb.denominator() as f64;
             
-            let pts_sec = packet.pts().unwrap_or(0) as f64 * time_base_f64;
+            let pts_sec = packet.pts().unwrap_or(0) as f64 * time_base_f64 - video_start_time;
 
             // Check if audio fits into any kept video segment
             let mut found_seg = None;
             for (seg_idx, &(start_frame, end_frame)) in kept_segments.iter().enumerate() {
-                let start_sec = start_frame as f64 / fps;
-                let end_sec = end_frame as f64 / fps;
+                let start_sec = input_start_pts_sec[seg_idx];
+                let end_sec = start_sec + (end_frame - start_frame) as f64 / fps;
                 if pts_sec >= start_sec && pts_sec < end_sec {
                     found_seg = Some(seg_idx);
                     break;
@@ -340,7 +360,8 @@ pub fn export_video(
 
             if let Some(seg_idx) = found_seg {
                 let offset_sec = output_start_pts_sec[seg_idx] - input_start_pts_sec[seg_idx];
-                let offset_ticks_in = (offset_sec / time_base_f64).round() as i64;
+                let total_offset_sec = -video_start_time + offset_sec;
+                let offset_ticks_in = (total_offset_sec / time_base_f64).round() as i64;
 
                 if let Some(pts) = packet.pts() {
                     packet.set_pts(Some(pts + offset_ticks_in));
@@ -377,16 +398,20 @@ pub fn export_video(
         while decoder.receive_frame(&mut decoded_frame).is_ok() {
             let f_pts = decoded_frame.pts().unwrap_or(0);
             let time_base_f64 = video_in_time_base.numerator() as f64 / video_in_time_base.denominator() as f64;
-            let f_pts_sec = f_pts as f64 * time_base_f64;
+            let f_pts_sec = f_pts as f64 * time_base_f64 - video_start_time;
             let f_idx = (f_pts_sec * fps).round() as usize;
 
             if !crate::ui::is_frame_cut_helper(f_idx, &ranges, cut_mode) {
                 if let Some(seg_idx) = kept_segments.iter().position(|&(start, end)| f_idx >= start && f_idx < end) {
-                    let out_pts_sec = f_idx as f64 / fps - input_start_pts_sec[seg_idx] + output_start_pts_sec[seg_idx];
+                    let start_frame = kept_segments[seg_idx].0;
+                    let out_pts_sec = (f_idx - start_frame) as f64 / fps + output_start_pts_sec[seg_idx];
                     let encoder = video_encoder.as_mut().unwrap();
                     let enc_pts = (out_pts_sec / (encoder.time_base().numerator() as f64 / encoder.time_base().denominator() as f64)).round() as i64;
                     
                     decoded_frame.set_pts(Some(enc_pts));
+                    unsafe {
+                        (*decoded_frame.as_mut_ptr()).pict_type = ffmpeg::sys::AVPictureType::AV_PICTURE_TYPE_NONE;
+                    }
                     encoder.send_frame(&decoded_frame)?;
 
                     let mut out_pkt = ffmpeg::Packet::empty();
@@ -517,4 +542,3 @@ mod tests {
         assert_eq!(classify(&ranges2), vec![GopType::PartiallyKept, GopType::PartiallyKept, GopType::FullyCut]);
     }
 }
-

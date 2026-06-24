@@ -2101,8 +2101,8 @@ impl eframe::App for MainApp {
                             ui.add_space(4.0);
 
                             // Export button
-                            let has_ranges = !self.ranges.is_empty();
-                            ui.add_enabled_ui(has_ranges, |ui| {
+                            let can_export = self.video_path.is_some() && (!self.ranges.is_empty() || self.cut_mode);
+                            ui.add_enabled_ui(can_export, |ui| {
                                 if playback_control_button(
                                     ui,
                                     &self.settings.appearance,
@@ -2110,7 +2110,44 @@ impl eframe::App for MainApp {
                                     false,
                                     "export video",
                                 ).clicked() {
-                                    println!("Export clicked: exporting single video with {} ranges", self.ranges.len());
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("Video File", &["mp4", "mkv", "ts", "mov"])
+                                        .save_file()
+                                    {
+                                        let input_path = self.video_path.clone().unwrap();
+                                        let output_path = path.to_string_lossy().to_string();
+                                        let ranges = self.ranges.clone();
+                                        let cut_mode = self.cut_mode;
+                                        
+                                        if let Some(metadata) = self.playback.metadata() {
+                                            let status_clone = self.export_status.clone();
+                                            let cancel_clone = self.export_cancel_flag.clone();
+                                            
+                                            {
+                                                let mut status_guard = status_clone.lock().unwrap();
+                                                *status_guard = crate::media::types::ExportStatus::Exporting {
+                                                    progress: 0.0,
+                                                    message: "Starting export...".to_string(),
+                                                };
+                                            }
+                                            cancel_clone.store(false, std::sync::atomic::Ordering::Relaxed);
+                                            
+                                            std::thread::spawn(move || {
+                                                if let Err(e) = crate::media::export::export_video(
+                                                    &input_path,
+                                                    &output_path,
+                                                    ranges,
+                                                    cut_mode,
+                                                    metadata,
+                                                    status_clone.clone(),
+                                                    cancel_clone,
+                                                ) {
+                                                    let mut status_guard = status_clone.lock().unwrap();
+                                                    *status_guard = crate::media::types::ExportStatus::Failed(e.to_string());
+                                                }
+                                            });
+                                        }
+                                    }
                                 }
                             });
 
@@ -2517,57 +2554,13 @@ impl eframe::App for MainApp {
                             );
                         });
 
-                        // 2. Right-justified Add Snippet and Export buttons
+                        // 2. Right-justified Add Snippet button (placed at the end of the row)
                         let mut clicked = false;
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let enabled = self.in_marker.is_some() && self.out_marker.is_some();
                             ui.add_enabled_ui(enabled, |ui| {
                                 if playback_control_button(ui, &self.settings.appearance, PlaybackIcon::AddSnippet, false, "Add current selection as a new snippet").clicked() {
                                     clicked = true;
-                                }
-                            });
-
-                            let can_export = self.video_path.is_some() && (!self.ranges.is_empty() || self.cut_mode);
-                            ui.add_enabled_ui(can_export, |ui| {
-                                if playback_control_button(ui, &self.settings.appearance, PlaybackIcon::ExportVideo, false, "Export video snippets").clicked() {
-                                    if let Some(path) = rfd::FileDialog::new()
-                                        .add_filter("Video File", &["mp4", "mkv", "ts", "mov"])
-                                        .save_file()
-                                    {
-                                        let input_path = self.video_path.clone().unwrap();
-                                        let output_path = path.to_string_lossy().to_string();
-                                        let ranges = self.ranges.clone();
-                                        let cut_mode = self.cut_mode;
-                                        
-                                        if let Some(metadata) = self.playback.metadata() {
-                                            let status_clone = self.export_status.clone();
-                                            let cancel_clone = self.export_cancel_flag.clone();
-                                            
-                                            {
-                                                let mut status_guard = status_clone.lock().unwrap();
-                                                *status_guard = crate::media::types::ExportStatus::Exporting {
-                                                    progress: 0.0,
-                                                    message: "Starting export...".to_string(),
-                                                };
-                                            }
-                                            cancel_clone.store(false, std::sync::atomic::Ordering::Relaxed);
-                                            
-                                            std::thread::spawn(move || {
-                                                if let Err(e) = crate::media::export::export_video(
-                                                    &input_path,
-                                                    &output_path,
-                                                    ranges,
-                                                    cut_mode,
-                                                    metadata,
-                                                    status_clone.clone(),
-                                                    cancel_clone,
-                                                ) {
-                                                    let mut status_guard = status_clone.lock().unwrap();
-                                                    *status_guard = crate::media::types::ExportStatus::Failed(e.to_string());
-                                                }
-                                            });
-                                        }
-                                    }
                                 }
                             });
                         });
