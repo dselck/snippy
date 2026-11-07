@@ -83,16 +83,26 @@ impl MediaEngine {
         let (keyframes, keyframes_pts) = {
             let mut scan = ffmpeg_next::format::input(&path_str)?;
             let video_stream_idx = stream.index();
+            let scan_stream = scan.stream(video_stream_idx).unwrap();
+            let scan_time_base = scan_stream.time_base();
+            let tb_f64 = scan_time_base.numerator() as f64 / scan_time_base.denominator() as f64;
+            let scan_start_time = if scan_stream.start_time() > -1_000_000_000_000 {
+                scan_stream.start_time() as f64 * tb_f64
+            } else {
+                0.0
+            };
+
             let mut kfs = Vec::new();
             let mut kfs_pts = Vec::new();
-            let mut frame_idx: usize = 0;
             for (stream, packet) in scan.packets() {
                 if stream.index() == video_stream_idx {
                     if packet.is_key() {
-                        kfs.push(frame_idx);
-                        kfs_pts.push(packet.pts().unwrap_or(0));
+                        let pts = packet.pts().unwrap_or(0);
+                        let pts_sec = pts as f64 * tb_f64 - scan_start_time;
+                        let display_frame_idx = (pts_sec * fps).round() as usize;
+                        kfs.push(display_frame_idx);
+                        kfs_pts.push(pts);
                     }
-                    frame_idx += 1;
                 }
             }
             if kfs.is_empty() || kfs[0] != 0 {

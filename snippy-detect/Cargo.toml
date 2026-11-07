@@ -1,0 +1,25 @@
+[package]
+name = "snippy-detect"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+ffmpeg-next = "8.1.0"
+rayon = "1.8"
+ort = { version = "2.0.0-rc.12", features = ["ndarray"] } # ONNX Runtime bindings
+scte35-reader = "0.16.0" # SCTE-35 parser
+mpeg2ts-reader = "0.18.2" # MPEG-TS container reader
+ndarray = "0.17"
+nanogbm = "0.7.0" # Pure Rust GBDT classifier
+rand = { version = "0.8", features = ["small_rng"] }
+snippy-schema = { workspace = true }
+
+
+
+
+
+

@@ -27,6 +27,7 @@ anyhow = "1.0"
 bytemuck = { version = "1.25.0", features = ["derive"] }
 rfd = "0.17.2"
 pollster = "0.4.0"
+snippy-schema = { workspace = true }
 
 # Workaround for macOS strict Objective-C type checking panic in winit/objc2
 [profile.dev.package.objc2]
@@ -44,4 +45,15 @@ opt-level = 3
 
 [target.'cfg(unix)'.dependencies]
 pprof = { version = "0.15.0", features = ["flamegraph", "frame-pointer"] }
+
+[workspace]
+members = [
+    ".",
+    "snippy-detect",
+    "snippy-schema",
+]
+
+[workspace.dependencies]
+snippy-schema = { path = "./snippy-schema" }
+
 

@@ -117,7 +117,7 @@ pub fn get_nearest_keyframe(keyframes: &[usize], target: usize) -> usize {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExportStatus {
     Idle,
-    Exporting { progress: f32, message: String },
+    Exporting { progress: f32, message: String, is_encoding: bool, current_frame: usize },
     Completed,
     Failed(String),
     Cancelled,

@@ -79,6 +79,10 @@ pub struct MainApp {
 
     pub export_status: std::sync::Arc<std::sync::Mutex<crate::media::types::ExportStatus>>,
     pub export_cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub show_export_setup_modal: bool,
+    pub export_output_path: String,
+    pub export_format: String,
+    pub label_session: Option<crate::label_session::LabelSession>,
 }
 
 impl MainApp {
@@ -141,6 +145,10 @@ impl MainApp {
             pending_settings,
             export_status: std::sync::Arc::new(std::sync::Mutex::new(crate::media::types::ExportStatus::Idle)),
             export_cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            show_export_setup_modal: false,
+            export_output_path: String::new(),
+            export_format: "mp4".to_string(),
+            label_session: None,
         }
     }
 
@@ -1238,6 +1246,174 @@ impl MainApp {
 
         response
     }
+
+    fn draw_export_setup_modal(&mut self, ctx: &egui::Context) {
+        let palette = theme::get_palette(&self.settings.appearance);
+        
+        egui::Window::new("Export Settings")
+            .id(egui::Id::new("export_setup_modal"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size([500.0, 240.0])
+            .frame(egui::Frame::window(&ctx.global_style())
+                .fill(palette.panel_bg)
+                .stroke(egui::Stroke::new(1.0, palette.border_color))
+                .inner_margin(egui::Margin::same(16)))
+            .show(ctx, |ui| {
+                ui.set_width(468.0);
+                
+                // Title
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("📤  Export Video").size(18.0).color(palette.text_normal).strong());
+                });
+                ui.add_space(8.0);
+                ui.add(egui::Separator::default().spacing(1.0));
+                ui.add_space(12.0);
+                
+                // Format selection
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Format (Container):").strong().color(palette.text_normal));
+                    ui.add_space(8.0);
+                    
+                    for fmt in &["mp4", "mkv", "ts", "mov"] {
+                        if ui.radio_value(&mut self.export_format, fmt.to_string(), fmt.to_uppercase()).clicked() {
+                            // If format changed, update the extension of the output path
+                            if !self.export_output_path.is_empty() {
+                                let path = std::path::Path::new(&self.export_output_path);
+                                if let Some(parent) = path.parent() {
+                                    if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
+                                        let new_filename = format!("{}.{}", file_stem, self.export_format);
+                                        self.export_output_path = parent.join(new_filename).to_string_lossy().to_string();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+                ui.add_space(12.0);
+                
+                // Output path selection
+                ui.label(egui::RichText::new("Destination File:").strong().color(palette.text_normal));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.export_output_path)
+                            .desired_width(ui.available_width() - 80.0)
+                            .hint_text("Choose destination file...")
+                    );
+                    
+                    if ui.button("Browse...").clicked() {
+                        let mut dlg = rfd::FileDialog::new()
+                            .add_filter(&format!("{} Video", self.export_format.to_uppercase()), &[&self.export_format]);
+                        
+                        if !self.export_output_path.is_empty() {
+                            let path = std::path::Path::new(&self.export_output_path);
+                            if let Some(parent) = path.parent() {
+                                if parent.exists() {
+                                    dlg = dlg.set_directory(parent);
+                                }
+                            }
+                            if let Some(file_name) = path.file_name() {
+                                dlg = dlg.set_file_name(file_name.to_string_lossy().to_string());
+                            }
+                        }
+                        
+                        if let Some(path) = dlg.save_file() {
+                            self.export_output_path = path.to_string_lossy().to_string();
+                            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                                let ext_lower = ext.to_lowercase();
+                                if ["mp4", "mkv", "ts", "mov"].contains(&ext_lower.as_str()) {
+                                    self.export_format = ext_lower;
+                                }
+                            }
+                        }
+                    }
+                });
+                
+                ui.add_space(16.0);
+                ui.add(egui::Separator::default().spacing(1.0));
+                ui.add_space(12.0);
+                
+                // Action buttons
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let has_path = !self.export_output_path.is_empty();
+                        let start_export = ui.add_enabled(has_path, egui::Button::new(
+                            egui::RichText::new("Start Export").strong().color(palette.panel_bg)
+                        ).fill(palette.accent));
+                        
+                        if start_export.clicked() {
+                            self.show_export_setup_modal = false;
+                            
+                            // Enforce correct extension
+                            let mut final_output_path = self.export_output_path.clone();
+                            let path = std::path::Path::new(&final_output_path);
+                            let has_correct_ext = path.extension()
+                                .and_then(|e| e.to_str())
+                                .map(|ext| ext.to_lowercase() == self.export_format)
+                                .unwrap_or(false);
+                                
+                            if !has_correct_ext {
+                                let has_any_video_ext = path.extension()
+                                    .and_then(|e| e.to_str())
+                                    .map(|ext| ["mp4", "mkv", "ts", "mov"].contains(&ext.to_lowercase().as_str()))
+                                    .unwrap_or(false);
+                                    
+                                if has_any_video_ext {
+                                    if let Some(parent) = path.parent() {
+                                        if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
+                                            final_output_path = parent.join(format!("{}.{}", file_stem, self.export_format)).to_string_lossy().to_string();
+                                        }
+                                    }
+                                } else {
+                                    final_output_path = format!("{}.{}", final_output_path, self.export_format);
+                                }
+                            }
+                            
+                            let input_path = self.video_path.clone().unwrap();
+                            let ranges = self.ranges.clone();
+                            let cut_mode = self.cut_mode;
+                            
+                            if let Some(metadata) = self.playback.metadata() {
+                                let status_clone = self.export_status.clone();
+                                let cancel_clone = self.export_cancel_flag.clone();
+                                
+                                {
+                                    let mut status_guard = status_clone.lock().unwrap();
+                                    *status_guard = crate::media::types::ExportStatus::Exporting {
+                                        progress: 0.0,
+                                        message: "Starting export...".to_string(),
+                                        is_encoding: false,
+                                        current_frame: 0,
+                                    };
+                                }
+                                cancel_clone.store(false, std::sync::atomic::Ordering::Relaxed);
+                                
+                                std::thread::spawn(move || {
+                                    if let Err(e) = crate::media::export::export_video(
+                                        &input_path,
+                                        &final_output_path,
+                                        ranges,
+                                        cut_mode,
+                                        metadata,
+                                        status_clone.clone(),
+                                        cancel_clone,
+                                    ) {
+                                        let mut status_guard = status_clone.lock().unwrap();
+                                        *status_guard = crate::media::types::ExportStatus::Failed(e.to_string());
+                                    }
+                                });
+                            }
+                        }
+                        
+                        if ui.button("Cancel").clicked() {
+                            self.show_export_setup_modal = false;
+                        }
+                    });
+                });
+            });
+    }
 }
 
 impl eframe::App for MainApp {
@@ -1296,6 +1472,69 @@ impl eframe::App for MainApp {
                 self.show_settings_modal = true;
             }
         }
+
+        // --- Keyboard shortcuts for Label Mode ---
+        if let Some(session) = &mut self.label_session {
+            let save_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::S);
+            let ctrl_save_shortcut = egui::KeyboardShortcut::new(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::S);
+            if ctx.input_mut(|i| i.consume_shortcut(&save_shortcut) || i.consume_shortcut(&ctrl_save_shortcut)) {
+                match session.save() {
+                    Ok(_) => self.notifications.push(Notification::info("Ground truth saved successfully!".to_string())),
+                    Err(e) => self.notifications.push(Notification::error(format!("Failed to save: {}", e))),
+                }
+            }
+
+            if !wants_kb {
+                let current_frame = self.playback.current_frame() as u64;
+                if ctx.input(|i| i.key_pressed(egui::Key::B)) {
+                    session.add_break_at(current_frame);
+                    ctx.request_repaint();
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::Delete)) || ctx.input(|i| i.key_pressed(egui::Key::Backspace)) {
+                    if let Some(idx) = session.selected_break {
+                        session.remove_break(idx);
+                        ctx.request_repaint();
+                    }
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::N)) {
+                    if let Some(idx) = session.next_break_index(current_frame) {
+                        session.selected_break = Some(idx);
+                        let target = session.breaks[idx].start_cut_frame as usize;
+                        self.playback.seek_internal(target, false, false);
+                        ctx.request_repaint();
+                    }
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::P)) {
+                    if let Some(idx) = session.prev_break_index(current_frame) {
+                        session.selected_break = Some(idx);
+                        let target = session.breaks[idx].start_cut_frame as usize;
+                        self.playback.seek_internal(target, false, false);
+                        ctx.request_repaint();
+                    }
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::T)) {
+                    if let Some(idx) = session.selected_break {
+                        session.toggle_break_type(idx);
+                        ctx.request_repaint();
+                    }
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::OpenBracket)) {
+                    if let Some(idx) = session.selected_break {
+                        let new_start = session.breaks[idx].start_cut_frame.saturating_sub(1);
+                        session.set_start_frame(idx, new_start);
+                        ctx.request_repaint();
+                    }
+                }
+                if ctx.input(|i| i.key_pressed(egui::Key::CloseBracket)) {
+                    if let Some(idx) = session.selected_break {
+                        let new_start = session.breaks[idx].start_cut_frame.saturating_add(1);
+                        session.set_start_frame(idx, new_start);
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
+
 
         // Receive frames from the Media Engine
         let (latest_frame, frames_popped, loudness_updated) = self.playback.update();
@@ -1394,6 +1633,11 @@ impl eframe::App for MainApp {
         // --- Settings modal ---
         if self.show_settings_modal {
             self.draw_settings_modal(&ctx);
+        }
+
+        // --- Export Setup modal ---
+        if self.show_export_setup_modal {
+            self.draw_export_setup_modal(&ctx);
         }
 
         // 2. Bottom Panel: Timeline and Waveform Deck (Full width)
@@ -1875,12 +2119,152 @@ impl eframe::App for MainApp {
                         }
                     };
 
-                    if let Some(inf) = self.in_marker {
-                        draw_timeline_marker(&ui.painter(), inf, palette.warn_color, 1.0);
+                    if let Some(session) = &mut self.label_session {
+                        let mut new_start_frame = None;
+                        let mut new_end_frame = None;
+                        
+                        let breaks_len = session.breaks.len();
+                        for i in 0..breaks_len {
+                            let brk = session.breaks[i].clone();
+                            let start_frame = brk.start_cut_frame;
+                            let end_frame = brk.end_cut_frame;
+
+                            let start_time = start_frame as f64 / fps;
+                            let end_time = end_frame as f64 / fps;
+
+                            let start_x = scroll_offset_x + start_time * pixels_per_second;
+                            let end_x = scroll_offset_x + end_time * pixels_per_second;
+
+                            let band_left = (start_x as f32).max(filmstrip_rect.left());
+                            let band_right = (end_x as f32).min(filmstrip_rect.right());
+
+                            // Draw background colored band if visible
+                            if band_left < band_right {
+                                let band_color = match brk.break_type {
+                                    snippy_schema::BreakType::Commercial => {
+                                        if session.selected_break == Some(i) {
+                                            Color32::from_rgba_unmultiplied(230, 100, 0, 70)
+                                        } else {
+                                            Color32::from_rgba_unmultiplied(230, 100, 0, 35)
+                                        }
+                                    }
+                                    snippy_schema::BreakType::Promo => {
+                                        if session.selected_break == Some(i) {
+                                            Color32::from_rgba_unmultiplied(140, 50, 230, 70)
+                                        } else {
+                                            Color32::from_rgba_unmultiplied(140, 50, 230, 35)
+                                        }
+                                    }
+                                };
+                                let band_rect = egui::Rect::from_min_max(
+                                    egui::pos2(band_left, filmstrip_rect.top()),
+                                    egui::pos2(band_right, wave_rect.bottom())
+                                );
+                                ui.painter().rect_filled(band_rect, 0.0, band_color);
+
+                                // If selected, draw a border outline
+                                if session.selected_break == Some(i) {
+                                    ui.painter().rect_stroke(
+                                        band_rect,
+                                        0.0,
+                                        egui::Stroke::new(1.5, palette.accent),
+                                        egui::StrokeKind::Inside
+                                    );
+                                }
+
+                                // Interactive selection of the band itself
+                                let band_id = ui.make_persistent_id(format!("band_{}", i));
+                                let band_resp = ui.interact(band_rect, band_id, egui::Sense::click());
+                                if band_resp.clicked() {
+                                    session.selected_break = Some(i);
+                                }
+                            }
+
+                            // Start Handle
+                            let start_x_f32 = start_x as f32;
+                            if start_x_f32 >= filmstrip_rect.left() && start_x_f32 <= filmstrip_rect.right() {
+                                let handle_color = if session.selected_break == Some(i) {
+                                    palette.accent
+                                } else {
+                                    palette.text_muted
+                                };
+
+                                // Vertical line
+                                ui.painter().line_segment(
+                                    [egui::pos2(start_x_f32, filmstrip_rect.top()), egui::pos2(start_x_f32, wave_rect.bottom())],
+                                    egui::Stroke::new(1.5, handle_color),
+                                );
+
+                                // Handle knob at the top
+                                let knob_pos = egui::pos2(start_x_f32, filmstrip_rect.top() + 6.0);
+                                ui.painter().circle_filled(knob_pos, 5.0, handle_color);
+
+                                let handle_rect = egui::Rect::from_center_size(knob_pos, egui::vec2(16.0, 16.0));
+                                let handle_id = ui.make_persistent_id(format!("handle_{}_start", i));
+                                let handle_resp = ui.interact(handle_rect, handle_id, egui::Sense::drag());
+
+                                if handle_resp.dragged() {
+                                    if let Some(pointer_pos) = ui.input(|i| i.pointer.interact_pos()) {
+                                        let relative_x_scroll = pointer_pos.x as f64 - scroll_offset_x;
+                                        let new_time = relative_x_scroll / pixels_per_second;
+                                        let new_frame = (new_time * fps).round().max(0.0) as u64;
+                                        new_start_frame = Some((i, new_frame.min(total_frames as u64 - 1)));
+                                    }
+                                }
+                            }
+
+                            // End Handle
+                            let end_x_f32 = end_x as f32;
+                            if end_x_f32 >= filmstrip_rect.left() && end_x_f32 <= filmstrip_rect.right() {
+                                let handle_color = if session.selected_break == Some(i) {
+                                    palette.accent
+                                } else {
+                                    palette.text_muted
+                                };
+
+                                // Vertical line
+                                ui.painter().line_segment(
+                                    [egui::pos2(end_x_f32, filmstrip_rect.top()), egui::pos2(end_x_f32, wave_rect.bottom())],
+                                    egui::Stroke::new(1.5, handle_color),
+                                );
+
+                                // Handle knob at the top
+                                let knob_pos = egui::pos2(end_x_f32, filmstrip_rect.top() + 6.0);
+                                ui.painter().circle_filled(knob_pos, 5.0, handle_color);
+
+                                let handle_rect = egui::Rect::from_center_size(knob_pos, egui::vec2(16.0, 16.0));
+                                let handle_id = ui.make_persistent_id(format!("handle_{}_end", i));
+                                let handle_resp = ui.interact(handle_rect, handle_id, egui::Sense::drag());
+
+                                if handle_resp.dragged() {
+                                    if let Some(pointer_pos) = ui.input(|i| i.pointer.interact_pos()) {
+                                        let relative_x_scroll = pointer_pos.x as f64 - scroll_offset_x;
+                                        let new_time = relative_x_scroll / pixels_per_second;
+                                        let new_frame = (new_time * fps).round().max(0.0) as u64;
+                                        new_end_frame = Some((i, new_frame.min(total_frames as u64 - 1)));
+                                    }
+                                }
+                            }
+                        }
+
+                        // Apply updates safely after loop to prevent borrow checker conflicts
+                        if let Some((idx, frame)) = new_start_frame {
+                            session.set_start_frame(idx, frame);
+                            ctx.request_repaint();
+                        }
+                        if let Some((idx, frame)) = new_end_frame {
+                            session.set_end_frame(idx, frame);
+                            ctx.request_repaint();
+                        }
+                    } else {
+                        if let Some(inf) = self.in_marker {
+                            draw_timeline_marker(&ui.painter(), inf, palette.warn_color, 1.0);
+                        }
+                        if let Some(outf) = self.out_marker {
+                            draw_timeline_marker(&ui.painter(), outf, palette.accent, -1.0);
+                        }
                     }
-                    if let Some(outf) = self.out_marker {
-                        draw_timeline_marker(&ui.painter(), outf, palette.accent, -1.0);
-                    }
+
                 });
                 } else {
                     ui.centered_and_justified(|ui| {
@@ -1921,105 +2305,250 @@ impl eframe::App for MainApp {
                 .inner_margin(egui::Margin::same(16)))
             .show_inside(ui, |ui| {
                 ui.vertical(|ui| {
-                    // Title: [snippets] ✂ and Inline Toggle Switch
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
-                        ui.label(egui::RichText::new("[").strong().color(palette.accent).size(18.0));
-                        ui.label(egui::RichText::new("snippets").strong().color(palette.text_normal).size(18.0));
-                        ui.label(egui::RichText::new("]").strong().color(palette.accent).size(18.0));
-                        ui.add_space(6.0);
-                        
-                        let (scissor_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                        draw_scissor_icon(&ui.painter_at(scissor_rect), scissor_rect, palette.accent);
-
-                        // Inline Mode Toggle Switch on the right
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let switch_resp = toggle_switch(ui, &self.settings.appearance, &mut self.cut_mode);
-                            let tooltip_text = if self.cut_mode {
-                                "Mode: CUT (Snippets define what to crop out; rest is kept)"
-                            } else {
-                                "Mode: KEEP (Snippets define what to keep; rest is cut)"
-                            };
-                            let _switch_resp = switch_resp.on_hover_text(tooltip_text);
-
-                            ui.add_space(4.0);
-
-                            let label_text = if self.cut_mode { "CUT" } else { "KEEP" };
-                            let label_color = if self.cut_mode { palette.cut_color } else { palette.keep_color };
-                            ui.label(egui::RichText::new(label_text).strong().size(11.0).color(label_color));
+                    if let Some(session) = &mut self.label_session {
+                        // Title: [breaks] 🏷
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
+                            ui.label(egui::RichText::new("[").strong().color(palette.accent).size(18.0));
+                            ui.label(egui::RichText::new("breaks").strong().color(palette.text_normal).size(18.0));
+                            ui.label(egui::RichText::new("]").strong().color(palette.accent).size(18.0));
+                            ui.add_space(6.0);
+                            ui.label(egui::RichText::new("🏷").size(16.0));
                         });
-                    });
 
-                    ui.add_space(12.0);
-                    ui.separator();
-                    ui.add_space(12.0);
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(8.0);
 
-                    // Scrollable List of Snippets (Bracket Table Concept 10)
-                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        // Metadata Fields
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Channel:").color(palette.text_muted));
+                            if ui.text_edit_singleline(&mut session.channel).changed() {
+                                session.dirty = true;
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Region:").color(palette.text_muted));
+                            if ui.text_edit_singleline(&mut session.region).changed() {
+                                session.dirty = true;
+                            }
+                        });
+
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+
+                        // Scrollable List of Breaks
                         let mut to_delete = None;
+                        let mut type_toggle = None;
+                        let mut notes_change = None;
+                        let mut seek_to_frame = None;
                         
-                        egui::Grid::new("snippets_grid")
-                            .num_columns(4)
-                            .spacing(egui::vec2(8.0, 12.0))
-                            .show(ui, |ui| {
-                                for (idx, range) in self.ranges.iter().enumerate() {
-                                    // Column 1: Bracketed ID [01]
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
-                                        ui.label(egui::RichText::new("[").strong().color(palette.accent));
-                                        ui.label(egui::RichText::new(format!("{:02}", range.id)).strong().color(palette.text_normal));
-                                        ui.label(egui::RichText::new("]").strong().color(palette.accent));
+                        let fps_val = self.playback.video_fps();
+                        let frame_to_time_local = |frame: usize| -> String {
+                            let total_seconds = frame as f64 / fps_val;
+                            let hours = (total_seconds / 3600.0).floor() as usize;
+                            let minutes = ((total_seconds % 3600.0) / 60.0).floor() as usize;
+                            let seconds = total_seconds.floor() as usize % 60;
+                            let centiseconds = ((total_seconds - total_seconds.floor()) * 100.0).floor() as usize;
+                            format!("{:02}:{:02}:{:02}.{:02}", hours, minutes, seconds, centiseconds)
+                        };
+
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            let breaks_len = session.breaks.len();
+                            for i in 0..breaks_len {
+                                let brk = &session.breaks[i];
+                                let is_selected = session.selected_break == Some(i);
+
+                                // Draw break item in a frame/group
+                                let frame_color = if is_selected {
+                                    palette.widget_active_bg
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+
+                                egui::Frame::NONE
+                                    .fill(frame_color)
+                                    .corner_radius(4.0)
+                                    .inner_margin(egui::Margin::same(6))
+                                    .show(ui, |ui| {
+                                        ui.vertical(|ui| {
+                                            ui.horizontal(|ui| {
+                                                // ID Bracket
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
+                                                    ui.label(egui::RichText::new("[").strong().color(palette.accent));
+                                                    ui.label(egui::RichText::new(format!("{:02}", i + 1)).strong().color(palette.text_normal));
+                                                    ui.label(egui::RichText::new("]").strong().color(palette.accent));
+                                                });
+
+                                                // Time Range
+                                                let start_time_str = frame_to_time_local(brk.start_cut_frame as usize);
+                                                let end_time_str = frame_to_time_local(brk.end_cut_frame as usize);
+                                                let time_lbl = egui::Label::new(
+                                                    egui::RichText::new(format!("{}-{}", start_time_str, end_time_str))
+                                                        .monospace()
+                                                        .color(palette.text_normal)
+                                                ).sense(egui::Sense::click());
+
+                                                if ui.add(time_lbl).clicked() {
+                                                    seek_to_frame = Some((i, brk.start_cut_frame as usize));
+                                                }
+
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    // Delete button
+                                                    if ui.small_button("🗑").clicked() {
+                                                        to_delete = Some(i);
+                                                    }
+
+                                                    // Type Toggle
+                                                    let type_str = match brk.break_type {
+                                                        snippy_schema::BreakType::Commercial => "AD",
+                                                        snippy_schema::BreakType::Promo => "PROMO",
+                                                    };
+                                                    let type_color = match brk.break_type {
+                                                        snippy_schema::BreakType::Commercial => palette.cut_color,
+                                                        snippy_schema::BreakType::Promo => palette.accent,
+                                                    };
+                                                    let type_btn = egui::Button::new(
+                                                        egui::RichText::new(type_str).strong().size(10.0).color(Color32::WHITE)
+                                                    ).fill(type_color);
+                                                    if ui.add(type_btn).clicked() {
+                                                        type_toggle = Some(i);
+                                                    }
+                                                });
+                                            });
+
+                                            // Notes text box
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("✍").size(12.0));
+                                                let mut n = brk.notes.clone();
+                                                if ui.text_edit_singleline(&mut n).changed() {
+                                                    notes_change = Some((i, n));
+                                                }
+                                            });
+                                        });
                                     });
+                                ui.add_space(4.0);
+                            }
+                        });
 
-                                    // Column 2: In - Out times (monospaced)
-                                    let time_str = format!("{}-{}", self.frame_to_time(range.in_frame), self.frame_to_time(range.out_frame));
-                                    ui.label(egui::RichText::new(time_str).monospace().color(palette.text_normal));
-
-                                    // Column 3: Progress mini track
-                                    let (rect, _response) = ui.allocate_exact_size(
-                                        egui::vec2(40.0, 4.0),
-                                        egui::Sense::hover(),
-                                    );
-                                    let painter = ui.painter();
-                                    
-                                    // Draw background track
-                                    painter.rect_filled(rect, 2.0, palette.widget_inactive_bg);
-                                    
-                                    // Draw fill segment
-                                    if self.playback.total_frames() > 0 {
-                                        let start_pct = range.in_frame as f32 / self.playback.total_frames() as f32;
-                                        let len_pct = (range.out_frame - range.in_frame) as f32 / self.playback.total_frames() as f32;
-                                        
-                                        let fill_left = rect.left() + start_pct * rect.width();
-                                        let fill_width = len_pct * rect.width();
-                                        let fill_rect = egui::Rect::from_min_max(
-                                            egui::pos2(fill_left, rect.top()),
-                                            egui::pos2(fill_left + fill_width.max(1.0), rect.bottom()),
-                                        );
-                                        
-                                        let fill_color = if self.cut_mode {
-                                            palette.cut_color // cut is red
-                                        } else {
-                                            palette.keep_color // keep is green
-                                        };
-                                        painter.rect_filled(fill_rect, 2.0, fill_color);
-                                    }
-
-                                    // Column 4: Delete button
-                                    if ui.small_button("🗑").on_hover_text("Remove this snippet").clicked() {
-                                        to_delete = Some(idx);
-                                    }
-
-                                    ui.end_row();
-                                }
-                            });
-
+                        // Apply changes outside iterate loop
                         if let Some(idx) = to_delete {
-                            self.ranges.remove(idx);
-                            coalesce_and_reindex_ranges(&mut self.ranges);
-                            self.next_range_id = self.ranges.len() + 1;
+                            session.remove_break(idx);
                         }
-                    });
+                        if let Some(idx) = type_toggle {
+                            session.toggle_break_type(idx);
+                        }
+                        if let Some((idx, new_notes)) = notes_change {
+                            session.breaks[idx].notes = new_notes;
+                            session.dirty = true;
+                        }
+                        if let Some((i, frame)) = seek_to_frame {
+                            session.selected_break = Some(i);
+                            self.playback.seek_internal(frame, false, false);
+                        }
+                    } else {
+                        // Title: [snippets] ✂ and Inline Toggle Switch
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
+                            ui.label(egui::RichText::new("[").strong().color(palette.accent).size(18.0));
+                            ui.label(egui::RichText::new("snippets").strong().color(palette.text_normal).size(18.0));
+                            ui.label(egui::RichText::new("]").strong().color(palette.accent).size(18.0));
+                            ui.add_space(6.0);
+                            
+                            let (scissor_rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                            draw_scissor_icon(&ui.painter_at(scissor_rect), scissor_rect, palette.accent);
+
+                            // Inline Mode Toggle Switch on the right
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let switch_resp = toggle_switch(ui, &self.settings.appearance, &mut self.cut_mode);
+                                let tooltip_text = if self.cut_mode {
+                                    "Mode: CUT (Snippets define what to crop out; rest is kept)"
+                                } else {
+                                    "Mode: KEEP (Snippets define what to keep; rest is cut)"
+                                };
+                                let _switch_resp = switch_resp.on_hover_text(tooltip_text);
+
+                                ui.add_space(4.0);
+
+                                let label_text = if self.cut_mode { "CUT" } else { "KEEP" };
+                                let label_color = if self.cut_mode { palette.cut_color } else { palette.keep_color };
+                                ui.label(egui::RichText::new(label_text).strong().size(11.0).color(label_color));
+                            });
+                        });
+
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(12.0);
+
+                        // Scrollable List of Snippets (Bracket Table Concept 10)
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            let mut to_delete = None;
+                            
+                            egui::Grid::new("snippets_grid")
+                                .num_columns(4)
+                                .spacing(egui::vec2(8.0, 12.0))
+                                .show(ui, |ui| {
+                                    for (idx, range) in self.ranges.iter().enumerate() {
+                                        // Column 1: Bracketed ID [01]
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing = egui::vec2(2.0, 0.0);
+                                            ui.label(egui::RichText::new("[").strong().color(palette.accent));
+                                            ui.label(egui::RichText::new(format!("{:02}", range.id)).strong().color(palette.text_normal));
+                                            ui.label(egui::RichText::new("]").strong().color(palette.accent));
+                                        });
+
+                                        // Column 2: In - Out times (monospaced)
+                                        let time_str = format!("{}-{}", self.frame_to_time(range.in_frame), self.frame_to_time(range.out_frame));
+                                        ui.label(egui::RichText::new(time_str).monospace().color(palette.text_normal));
+
+                                        // Column 3: Progress mini track
+                                        let (rect, _response) = ui.allocate_exact_size(
+                                            egui::vec2(40.0, 4.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        let painter = ui.painter();
+                                        
+                                        // Draw background track
+                                        painter.rect_filled(rect, 2.0, palette.widget_inactive_bg);
+                                        
+                                        // Draw fill segment
+                                        if self.playback.total_frames() > 0 {
+                                            let start_pct = range.in_frame as f32 / self.playback.total_frames() as f32;
+                                            let len_pct = (range.out_frame - range.in_frame) as f32 / self.playback.total_frames() as f32;
+                                            
+                                            let fill_left = rect.left() + start_pct * rect.width();
+                                            let fill_width = len_pct * rect.width();
+                                            let fill_rect = egui::Rect::from_min_max(
+                                                egui::pos2(fill_left, rect.top()),
+                                                egui::pos2(fill_left + fill_width.max(1.0), rect.bottom()),
+                                            );
+                                            
+                                            let fill_color = if self.cut_mode {
+                                                palette.cut_color // cut is red
+                                            } else {
+                                                palette.keep_color // keep is green
+                                            };
+                                            painter.rect_filled(fill_rect, 2.0, fill_color);
+                                        }
+
+                                        // Column 4: Delete button
+                                        if ui.small_button("🗑").on_hover_text("Remove this snippet").clicked() {
+                                            to_delete = Some(idx);
+                                        }
+
+                                        ui.end_row();
+                                    }
+                                });
+
+                            if let Some(idx) = to_delete {
+                                self.ranges.remove(idx);
+                                coalesce_and_reindex_ranges(&mut self.ranges);
+                                self.next_range_id = self.ranges.len() + 1;
+                            }
+                        });
+                    }
 
 
                 });
@@ -2100,56 +2629,105 @@ impl eframe::App for MainApp {
 
                             ui.add_space(4.0);
 
-                            // Export button
-                            let can_export = self.video_path.is_some() && (!self.ranges.is_empty() || self.cut_mode);
-                            ui.add_enabled_ui(can_export, |ui| {
-                                if playback_control_button(
-                                    ui,
-                                    &self.settings.appearance,
-                                    PlaybackIcon::ExportVideo,
-                                    false,
-                                    "export video",
-                                ).clicked() {
-                                    if let Some(path) = rfd::FileDialog::new()
-                                        .add_filter("Video File", &["mp4", "mkv", "ts", "mov"])
-                                        .save_file()
-                                    {
-                                        let input_path = self.video_path.clone().unwrap();
-                                        let output_path = path.to_string_lossy().to_string();
-                                        let ranges = self.ranges.clone();
-                                        let cut_mode = self.cut_mode;
-                                        
-                                        if let Some(metadata) = self.playback.metadata() {
-                                            let status_clone = self.export_status.clone();
-                                            let cancel_clone = self.export_cancel_flag.clone();
-                                            
-                                            {
-                                                let mut status_guard = status_clone.lock().unwrap();
-                                                *status_guard = crate::media::types::ExportStatus::Exporting {
-                                                    progress: 0.0,
-                                                    message: "Starting export...".to_string(),
-                                                };
-                                            }
-                                            cancel_clone.store(false, std::sync::atomic::Ordering::Relaxed);
-                                            
-                                            std::thread::spawn(move || {
-                                                if let Err(e) = crate::media::export::export_video(
-                                                    &input_path,
-                                                    &output_path,
-                                                    ranges,
-                                                    cut_mode,
-                                                    metadata,
-                                                    status_clone.clone(),
-                                                    cancel_clone,
-                                                ) {
-                                                    let mut status_guard = status_clone.lock().unwrap();
-                                                    *status_guard = crate::media::types::ExportStatus::Failed(e.to_string());
-                                                }
-                                            });
-                                        }
+                            if let Some(session) = &mut self.label_session {
+                                // Save Ground Truth button
+                                let save_btn = egui::Button::new(
+                                    egui::RichText::new(if session.dirty { "💾 Save GT*" } else { "💾 Save GT" })
+                                        .color(if session.dirty { palette.warn_color } else { palette.text_normal })
+                                );
+                                if ui.add(save_btn).on_hover_text("Save Ground Truth (⌘⇧S)").clicked() {
+                                    match session.save() {
+                                        Ok(_) => self.notifications.push(Notification::info("Ground truth saved successfully!".to_string())),
+                                        Err(e) => self.notifications.push(Notification::error(format!("Failed to save: {}", e))),
                                     }
                                 }
-                            });
+
+                                ui.add_space(4.0);
+
+                                // Load Detection sidecar button
+                                if session.detection_output_path.is_none() {
+                                    let load_det_btn = egui::Button::new("🔍 Load Detection");
+                                    if ui.add(load_det_btn).on_hover_text("Seed from a .snippy-detect.json file").clicked() {
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .add_filter("Detection JSON", &["json"])
+                                            .pick_file()
+                                        {
+                                            match session.load_detection_output(&path) {
+                                                Ok(_) => self.notifications.push(Notification::info("Imported detected breaks".to_string())),
+                                                Err(e) => self.notifications.push(Notification::error(format!("Failed to load detection JSON: {}", e))),
+                                            }
+                                        }
+                                    }
+                                    ui.add_space(4.0);
+                                }
+
+                                // Exit Label Mode button
+                                let exit_btn = egui::Button::new("❌ Exit Label Mode");
+                                if ui.add(exit_btn).clicked() {
+                                    if session.dirty {
+                                        let _ = session.save(); // autosave
+                                    }
+                                    self.label_session = None;
+                                }
+                            } else {
+                                // Export button (Edit Mode only)
+                                let can_export = self.video_path.is_some() && (!self.ranges.is_empty() || self.cut_mode);
+                                ui.add_enabled_ui(can_export, |ui| {
+                                    if playback_control_button(
+                                        ui,
+                                        &self.settings.appearance,
+                                        PlaybackIcon::ExportVideo,
+                                        false,
+                                        "export video",
+                                    ).clicked() {
+                                        self.show_export_setup_modal = true;
+                                        
+                                        // Pre-populate export settings based on current video
+                                        if let Some(ref input_path) = self.video_path {
+                                            let path = std::path::Path::new(input_path);
+                                            let parent = path.parent().unwrap_or_else(|| std::path::Path::new(""));
+                                            let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("export");
+                                            
+                                            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("mp4").to_lowercase();
+                                            let format = if ["mp4", "mkv", "ts", "mov"].contains(&ext.as_str()) {
+                                                ext
+                                            } else {
+                                                "mp4".to_string()
+                                            };
+                                            self.export_format = format.clone();
+                                            
+                                            let export_name = format!("{}_export.{}", file_stem, format);
+                                            let default_out = parent.join(export_name);
+                                            self.export_output_path = default_out.to_string_lossy().to_string();
+                                        }
+                                    }
+                                });
+
+                                ui.add_space(4.0);
+
+                                // Enter Label Mode button (only if video is loaded)
+                                if let Some(ref path_str) = self.video_path {
+                                    let enter_btn = egui::Button::new("🏷 Label Mode");
+                                    if ui.add(enter_btn).on_hover_text("Switch to training data labelling mode").clicked() {
+                                        let total_f = self.playback.total_frames() as u64;
+                                        let fps_val = self.playback.video_fps();
+                                        let p = std::path::PathBuf::from(path_str);
+                                        let mut sess = crate::label_session::LabelSession::new(p, total_f, fps_val);
+                                        
+                                        // Try auto-loading existing ground-truth sidecar
+                                        let gt_path = sess.ground_truth_path.clone();
+                                        if gt_path.exists() {
+                                            if let Err(e) = sess.load_ground_truth(&gt_path) {
+                                                self.notifications.push(Notification::error(format!("Failed to load existing ground truth: {}", e)));
+                                            } else {
+                                                self.notifications.push(Notification::info("Resumed existing ground truth session".to_string()));
+                                            }
+                                        }
+                                        self.label_session = Some(sess);
+                                    }
+                                    ui.add_space(4.0);
+                                }
+                            }
 
                             ui.add_space(4.0);
 
@@ -2177,11 +2755,32 @@ impl eframe::App for MainApp {
                                     self.video_path = Some(path_str.clone());
                                     self.in_marker = None;
                                     self.out_marker = None;
+                                    self.label_session = None; // Reset label session when a new video is loaded
                                 }
                         });
                     });
                     
                     ui.add_space(10.0);
+
+                    if self.label_session.is_some() {
+                        egui::Frame::NONE
+                            .fill(Color32::from_rgba_unmultiplied(230, 100, 0, 20))
+                            .stroke(egui::Stroke::new(1.0, palette.warn_color))
+                            .corner_radius(6.0)
+                            .inner_margin(egui::Margin::symmetric(12, 6))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("🏷").size(14.0));
+                                    ui.label(
+                                        egui::RichText::new("LABEL MODE — Adjust boundaries, tag promos/commercials, or add missing breaks. Changes affect training data, not the video file.")
+                                            .color(palette.text_normal)
+                                            .font(egui::FontId::proportional(13.0))
+                                    );
+                                });
+                            });
+                        ui.add_space(8.0);
+                    }
+
 
                     // Video canvas viewport drawing card
                     let controls_height = 80.0; // Expanded to accommodate progress slider
@@ -2603,29 +3202,171 @@ impl eframe::App for MainApp {
         let export_status = self.export_status.clone();
         let status_guard = export_status.lock().unwrap();
         match &*status_guard {
-            crate::media::types::ExportStatus::Exporting { progress, message } => {
+            crate::media::types::ExportStatus::Exporting { progress, message, is_encoding, current_frame } => {
                 egui::Window::new("Exporting Video")
                     .id(egui::Id::new("export_modal"))
                     .collapsible(false)
                     .resizable(false)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .fixed_size([400.0, 150.0])
+                    .fixed_size([460.0, 220.0])
                     .frame(egui::Frame::window(&ui.style()).fill(palette.panel_bg).stroke(egui::Stroke::new(1.0, palette.border_color)))
                     .show(ui.ctx(), |ui| {
                         ui.vertical_centered(|ui| {
                             ui.add_space(10.0);
                             ui.label(egui::RichText::new("Exporting video snippet...").strong().size(16.0).color(palette.text_normal));
-                            ui.add_space(10.0);
+                            ui.add_space(12.0);
                             
-                            // Progress bar
+                            let bar_color = if *is_encoding {
+                                palette.warn_color
+                            } else {
+                                palette.keep_color
+                            };
+                            
+                            // 1. Refined numeric progress bar
                             ui.add(egui::ProgressBar::new(*progress)
                                 .text(format!("{:.0}%", progress * 100.0))
-                                .fill(palette.accent)
+                                .fill(bar_color)
                             );
                             
                             ui.add_space(10.0);
+
+                            // 2. Custom Segmented GOP Timeline Bar
+                            if let Some(ref meta) = self.playback.metadata() {
+                                let keyframes = &meta.keyframes;
+                                let total_frames = meta.total_frames;
+                                
+                                if total_frames > 0 && !keyframes.is_empty() {
+                                    let desired_size = egui::vec2(ui.available_width(), 16.0);
+                                    let (rect, _response) = ui.allocate_at_least(desired_size, egui::Sense::hover());
+                                    
+                                    let painter = ui.painter();
+                                    
+                                    // Draw base track background (cut / ignored by default)
+                                    painter.rect_filled(rect, 4.0, palette.timeline_track_bg);
+                                    
+                                    // Classify and draw GOP segments
+                                    let mut current_type: Option<(bool, egui::Color32)> = None; // (is_kept, color)
+                                    let mut segment_start = 0;
+                                    
+                                    for i in 0..keyframes.len() {
+                                        let start_frame = keyframes[i];
+                                        let end_frame = if i + 1 < keyframes.len() {
+                                            keyframes[i + 1]
+                                        } else {
+                                            total_frames
+                                        };
+                                        
+                                        // Classify GOP
+                                        let mut kept_count = 0;
+                                        let mut cut_count = 0;
+                                        for f in start_frame..end_frame {
+                                            if is_frame_cut_helper(f, &self.ranges, self.cut_mode) {
+                                                cut_count += 1;
+                                            } else {
+                                                kept_count += 1;
+                                            }
+                                        }
+                                        
+                                        let gop_type = if kept_count == (end_frame - start_frame) {
+                                            crate::media::export::GopType::Copy
+                                        } else if cut_count == (end_frame - start_frame) {
+                                            crate::media::export::GopType::Cut
+                                        } else {
+                                            crate::media::export::GopType::Transcode
+                                        };
+                                        
+                                        for f in start_frame..end_frame {
+                                            let is_frame_cut = is_frame_cut_helper(f, &self.ranges, self.cut_mode);
+                                            let color = match gop_type {
+                                                crate::media::export::GopType::Copy => palette.keep_color,
+                                                crate::media::export::GopType::Cut => palette.timeline_track_bg,
+                                                crate::media::export::GopType::Transcode => {
+                                                    if is_frame_cut {
+                                                        palette.timeline_track_bg
+                                                    } else {
+                                                        palette.warn_color
+                                                    }
+                                                }
+                                            };
+                                            let is_kept = !is_frame_cut && gop_type != crate::media::export::GopType::Cut;
+                                            
+                                            if let Some((last_kept_state, last_color)) = current_type {
+                                                if last_kept_state != is_kept || last_color != color {
+                                                    // Draw previous segment
+                                                    if last_kept_state {
+                                                        let start_pct = segment_start as f32 / total_frames as f32;
+                                                        let end_pct = f as f32 / total_frames as f32;
+                                                        let seg_rect = egui::Rect::from_min_max(
+                                                            egui::pos2(rect.left() + rect.width() * start_pct, rect.top()),
+                                                            egui::pos2(rect.left() + rect.width() * end_pct, rect.bottom()),
+                                                        );
+                                                        painter.rect_filled(seg_rect, 0.0, last_color);
+                                                    }
+                                                    segment_start = f;
+                                                    current_type = Some((is_kept, color));
+                                                }
+                                            } else {
+                                                segment_start = f;
+                                                current_type = Some((is_kept, color));
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Draw final segment
+                                    if let Some((last_kept_state, last_color)) = current_type {
+                                        if last_kept_state {
+                                            let start_pct = segment_start as f32 / total_frames as f32;
+                                            let end_pct = total_frames as f32 / total_frames as f32;
+                                            let seg_rect = egui::Rect::from_min_max(
+                                                egui::pos2(rect.left() + rect.width() * start_pct, rect.top()),
+                                                egui::pos2(rect.left() + rect.width() * end_pct, rect.bottom()),
+                                            );
+                                            painter.rect_filled(seg_rect, 0.0, last_color);
+                                        }
+                                    }
+                                    
+                                    // Draw border around the track
+                                    painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, palette.border_color), egui::StrokeKind::Inside);
+                                    
+                                    // Draw playhead at current_frame
+                                    let playhead_pct = (*current_frame as f32 / total_frames as f32).clamp(0.0, 1.0);
+                                    let playhead_x = rect.left() + rect.width() * playhead_pct;
+                                    painter.line_segment(
+                                        [egui::pos2(playhead_x, rect.top() - 2.0), egui::pos2(playhead_x, rect.bottom() + 2.0)],
+                                        egui::Stroke::new(2.5, palette.accent),
+                                    );
+                                }
+                            }
+                            
+                            // 3. Timeline Legend
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_justify(false), |ui| {
+                                    let total_width = 360.0;
+                                    let space = (ui.available_width() - total_width).max(0.0) / 2.0;
+                                    ui.add_space(space);
+                                    
+                                    let (rect, _) = ui.allocate_at_least(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                                    ui.painter().circle_filled(rect.center(), 4.0, palette.keep_color);
+                                    ui.label(egui::RichText::new("Pass-through").size(10.0).color(palette.text_muted));
+                                    
+                                    ui.add_space(10.0);
+                                    
+                                    let (rect, _) = ui.allocate_at_least(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                                    ui.painter().circle_filled(rect.center(), 4.0, palette.warn_color);
+                                    ui.label(egui::RichText::new("Re-encode").size(10.0).color(palette.text_muted));
+                                    
+                                    ui.add_space(10.0);
+                                    
+                                    let (rect, _) = ui.allocate_at_least(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                                    ui.painter().circle_filled(rect.center(), 4.0, palette.timeline_track_bg);
+                                    ui.label(egui::RichText::new("Cut / Ignored").size(10.0).color(palette.text_muted));
+                                });
+                            });
+                            
+                            ui.add_space(10.0);
                             ui.label(egui::RichText::new(message).size(12.0).color(palette.text_muted));
-                            ui.add_space(15.0);
+                            ui.add_space(12.0);
                             
                             if ui.button(egui::RichText::new("Cancel").color(palette.warn_color)).clicked() {
                                 self.export_cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
