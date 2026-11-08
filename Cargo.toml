@@ -8,12 +8,7 @@ eframe = { version = "0.34.3", features = ["wgpu"] }
 egui = "0.34.3"
 wgpu = { version = "29.0.3" }
 wgpu-hal = { version = "29.0.3" }
-objc2 = "0.6.4"
-objc2-metal = { version = "0.3.2", features = ["objc2-io-surface"] }
-objc2-io-surface = "0.3.2"
-core-video-sys = { version = "0.1.4", default-features = false, features = ["io_suface"] }
-core-foundation-sys = { version = "0.8.7" }
-ffmpeg-next = "8.1.0"
+ffmpeg-next = "9.0.0"
 cpal = "0.17.3"
 ringbuf = "0.5.0"
 crossbeam-channel = "0.5.15"
@@ -28,6 +23,13 @@ bytemuck = { version = "1.25.0", features = ["derive"] }
 rfd = "0.17.2"
 pollster = "0.4.0"
 snippy-schema = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-metal = { version = "0.3.2", features = ["objc2-io-surface"] }
+objc2-io-surface = "0.3.2"
+core-video-sys = { version = "0.1.4", default-features = false, features = ["io_suface"] }
+core-foundation-sys = { version = "0.8.7" }
 
 # Workaround for macOS strict Objective-C type checking panic in winit/objc2
 [profile.dev.package.objc2]

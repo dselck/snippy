@@ -1,2 +1,5 @@
 [build]
-rustflags = ["-A", "unexpected_cfgs"]
+rustflags = ["-A", "unexpected_cfgs", "-C", "target-cpu=native"]
+
+[env]
+BINDGEN_EXTRA_CLANG_ARGS = "-isystem /usr/lib/clang/23/include"

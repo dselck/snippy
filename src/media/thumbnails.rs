@@ -207,23 +207,7 @@ fn worker_thread(
         Err(_) => return,
     };
     if hw_accel {
-        unsafe {
-            let mut hw_device_ctx: *mut ffmpeg_next::sys::AVBufferRef = std::ptr::null_mut();
-            #[cfg(target_os = "macos")]
-            let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
-            #[cfg(target_os = "windows")]
-            let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
-            #[cfg(target_os = "linux")]
-            let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI;
-            let res = ffmpeg_next::sys::av_hwdevice_ctx_create(
-                &mut hw_device_ctx, hw_type, std::ptr::null(), std::ptr::null_mut(), 0,
-            );
-            if res == 0 && !hw_device_ctx.is_null() {
-                (*codec_ctx.as_mut_ptr()).hw_device_ctx =
-                    ffmpeg_next::sys::av_buffer_ref(hw_device_ctx);
-                ffmpeg_next::sys::av_buffer_unref(&mut hw_device_ctx);
-            }
-        }
+        let _ = crate::media::hw_context::probe_and_attach_hw_context(&mut codec_ctx);
     }
     let mut decoder = match codec_ctx.decoder().video() {
         Ok(d) => d,
@@ -290,9 +274,7 @@ fn worker_thread(
 
                         // Scale once per GOP group — all targets share the same RGBA pixels.
                         if collected_rgba.is_none() {
-                            let actual = if raw_frame.format() == ffmpeg_next::format::Pixel::VIDEOTOOLBOX
-                                || raw_frame.format() == ffmpeg_next::format::Pixel::D3D11
-                            {
+                            let actual = if crate::media::hw_context::is_hw_pixel_format(raw_frame.format()) {
                                 let mut sw = ffmpeg_next::util::frame::Video::empty();
                                 let ok = unsafe {
                                     ffmpeg_next::sys::av_hwframe_transfer_data(
@@ -391,6 +373,10 @@ mod tests {
     #[test]
     fn test_thumbnail_decoder_lifecycle() {
         let test_file = format!("{}/test-files/bbb_sunflower_2160p_60fps_normal.mp4", env!("CARGO_MANIFEST_DIR"));
+        if !std::path::Path::new(&test_file).exists() {
+            eprintln!("Skipping thumbnail test: test-files/bbb_sunflower_2160p_60fps_normal.mp4 not found");
+            return;
+        }
         let keyframes = vec![0, 60, 120];
         let keyframes_pts = vec![0, 60 * 1000, 120 * 1000];
 
@@ -423,6 +409,10 @@ mod tests {
     #[test]
     fn test_thumbnail_decoder_preemption() {
         let test_file = format!("{}/test-files/bbb_sunflower_2160p_60fps_normal.mp4", env!("CARGO_MANIFEST_DIR"));
+        if !std::path::Path::new(&test_file).exists() {
+            eprintln!("Skipping thumbnail test: test-files/bbb_sunflower_2160p_60fps_normal.mp4 not found");
+            return;
+        }
         let keyframes = vec![0, 60, 120];
         let keyframes_pts = vec![0, 60 * 1000, 120 * 1000];
 

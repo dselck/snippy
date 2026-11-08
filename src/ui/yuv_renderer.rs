@@ -305,6 +305,163 @@ impl YuvRenderer {
                 });
             }
         }
+
+        #[cfg(target_os = "linux")]
+        {
+            self.update_textures_from_linux_hw_frame(device, queue, &hw_frame.frame, color_space, color_range);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn update_textures_from_linux_hw_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: &ffmpeg_next::util::frame::Video,
+        color_space: ffmpeg_next::color::Space,
+        color_range: ffmpeg_next::color::Range,
+    ) {
+        let width = frame.width();
+        let height = frame.height();
+        let uv_width = width / 2;
+        let uv_height = height / 2;
+
+        let is_10bit = frame.format() == ffmpeg_next::format::Pixel::P010LE
+            || frame.format() == ffmpeg_next::format::Pixel::P010BE;
+        let (y_format, uv_format) = if is_10bit {
+            (wgpu::TextureFormat::R16Unorm, wgpu::TextureFormat::Rg16Unorm)
+        } else {
+            (wgpu::TextureFormat::R8Unorm, wgpu::TextureFormat::Rg8Unorm)
+        };
+
+        let needs_recreate = match (&self.y_texture, &self.u_texture) {
+            (Some(y), Some(uv)) => {
+                y.width() != width
+                    || y.height() != height
+                    || y.format() != y_format
+                    || uv.width() != uv_width
+                    || uv.height() != uv_height
+                    || uv.format() != uv_format
+                    || !self.is_nv12
+            }
+            _ => true,
+        };
+
+        if needs_recreate {
+            let tex_y = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("linux_hw_y_texture"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: y_format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+
+            let tex_uv = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("linux_hw_uv_texture"),
+                size: wgpu::Extent3d {
+                    width: uv_width,
+                    height: uv_height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: uv_format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+
+            let y_view = tex_y.create_view(&wgpu::TextureViewDescriptor::default());
+            let uv_view = tex_uv.create_view(&wgpu::TextureViewDescriptor::default());
+
+            self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("linux_nv12_bind_group"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&y_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&uv_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&uv_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.color_buffer.as_entire_binding(),
+                    },
+                ],
+            }));
+
+            self.y_texture = Some(tex_y);
+            self.u_texture = Some(tex_uv);
+            self.v_texture = None;
+            self.is_nv12 = true;
+        }
+
+        let uniforms = ColorUniforms::new(color_space, color_range, 1.0, 1.0);
+        queue.write_buffer(&self.color_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+        // Upload Plane 0: Y
+        if let Some(tex) = &self.y_texture {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                frame.data(0),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(frame.stride(0) as u32),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        // Upload Plane 1: UV interleaved
+        if let Some(tex) = &self.u_texture {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                frame.data(1),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(frame.stride(1) as u32),
+                    rows_per_image: Some(uv_height),
+                },
+                wgpu::Extent3d {
+                    width: uv_width,
+                    height: uv_height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
     }
 
     pub fn update_textures(
@@ -315,15 +472,21 @@ impl YuvRenderer {
         color_space: ffmpeg_next::color::Space,
         color_range: ffmpeg_next::color::Range,
     ) {
+        let was_nv12 = self.is_nv12;
         self.is_nv12 = false;
         let y_width = planes.width;
         let y_height = planes.height;
         let uv_width = y_width / 2;
         let uv_height = y_height / 2;
 
-        let needs_recreate = match &self.y_texture {
-            Some(tex) => tex.width() != y_width || tex.height() != y_height,
-            None => true,
+        let needs_recreate = match (&self.y_texture, &self.v_texture) {
+            (Some(tex), Some(_)) => {
+                tex.width() != y_width
+                    || tex.height() != y_height
+                    || tex.format() != wgpu::TextureFormat::R8Unorm
+                    || was_nv12
+            }
+            _ => true,
         };
 
         if needs_recreate {

@@ -12,7 +12,9 @@ pub mod types;
 pub mod cache;
 pub mod sinks;
 pub use crate::media::sinks::*;
+#[cfg(target_os = "macos")]
 pub mod mac_hw_surface;
+pub mod hw_context;
 
 pub mod decoder_pipeline;
 pub mod ffmpeg_adapter;
@@ -481,20 +483,10 @@ fn run_decoder_thread(
         let mut codec_ctx = ffmpeg_next::codec::context::Context::from_parameters(video_stream.parameters())?;
 
         if hw_accel {
-            unsafe {
-                let mut hw_device_ctx: *mut ffmpeg_next::sys::AVBufferRef = std::ptr::null_mut();
-                #[cfg(target_os = "macos")]
-                let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
-                #[cfg(target_os = "windows")]
-                let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA;
-                #[cfg(target_os = "linux")]
-                let hw_type = ffmpeg_next::sys::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI;
-
-                let res = ffmpeg_next::sys::av_hwdevice_ctx_create(&mut hw_device_ctx, hw_type, std::ptr::null(), std::ptr::null_mut(), 0);
-                if res == 0 && !hw_device_ctx.is_null() {
-                    (*codec_ctx.as_mut_ptr()).hw_device_ctx = ffmpeg_next::sys::av_buffer_ref(hw_device_ctx);
-                    ffmpeg_next::sys::av_buffer_unref(&mut hw_device_ctx);
-                }
+            if let Some(info) = crate::media::hw_context::probe_and_attach_hw_context(&mut codec_ctx) {
+                eprintln!("[INFO] Hardware decoding active: {} (device: {:?})", info.backend_name, info.device_path);
+            } else {
+                eprintln!("[WARN] Hardware decoding requested but no supported GPU backend available. Falling back to CPU software decode.");
             }
         }
         (idx, time_base_f64, start_time, codec_ctx.decoder().video()?)

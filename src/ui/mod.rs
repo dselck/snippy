@@ -2804,10 +2804,17 @@ impl eframe::App for MainApp {
                                 let (video_w, video_h) = match frame {
                                     media::DecodedFrame::Cpu { planes, .. } => (planes.width as f32, planes.height as f32),
                                     media::DecodedFrame::Gpu { descriptor, .. } => {
-                                        if let media::GpuFrameDescriptor::MacOsHwFrame(wrapper) = descriptor {
-                                            (wrapper.frame.width() as f32, wrapper.frame.height() as f32)
-                                        } else {
-                                            (0.0, 0.0)
+                                        match descriptor {
+                                            #[cfg(target_os = "macos")]
+                                            media::GpuFrameDescriptor::MacOsHwFrame(wrapper) => {
+                                                (wrapper.frame.width() as f32, wrapper.frame.height() as f32)
+                                            }
+                                            #[cfg(target_os = "linux")]
+                                            media::GpuFrameDescriptor::LinuxHwFrame(wrapper) => {
+                                                (wrapper.frame.width() as f32, wrapper.frame.height() as f32)
+                                            }
+                                            #[allow(unreachable_patterns)]
+                                            _ => (0.0, 0.0),
                                         }
                                     }
                                 };
@@ -3398,8 +3405,17 @@ impl eframe::egui_wgpu::CallbackTrait for YuvCallback {
                     renderer.update_textures(device, queue, planes, *color_space, *color_range);
                 }
                 crate::media::DecodedFrame::Gpu { descriptor, color_space, color_range, .. } => {
-                    if let crate::media::GpuFrameDescriptor::MacOsHwFrame(wrapper) = descriptor {
-                        renderer.update_textures_from_hw_frame(device, queue, wrapper.clone(), *color_space, *color_range);
+                    match descriptor {
+                        #[cfg(target_os = "macos")]
+                        crate::media::GpuFrameDescriptor::MacOsHwFrame(wrapper) => {
+                            renderer.update_textures_from_hw_frame(device, queue, wrapper.clone(), *color_space, *color_range);
+                        }
+                        #[cfg(target_os = "linux")]
+                        crate::media::GpuFrameDescriptor::LinuxHwFrame(wrapper) => {
+                            renderer.update_textures_from_hw_frame(device, queue, wrapper.clone(), *color_space, *color_range);
+                        }
+                        #[allow(unreachable_patterns)]
+                        _ => {}
                     }
                 }
             }

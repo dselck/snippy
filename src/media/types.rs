@@ -14,9 +14,14 @@ unsafe impl Sync for HwFrameWrapper {}
 
 #[derive(Clone, Debug)]
 pub enum GpuFrameDescriptor {
+    #[cfg(target_os = "macos")]
     CVPixelBuffer(*const std::ffi::c_void),
     // macOS VideoToolbox HW frame
+    #[cfg(target_os = "macos")]
     MacOsHwFrame(std::sync::Arc<HwFrameWrapper>),
+    // Linux generic HW frame (VAAPI, CUDA, Vulkan, VDPAU)
+    #[cfg(target_os = "linux")]
+    LinuxHwFrame(std::sync::Arc<HwFrameWrapper>),
 }
 
 unsafe impl Send for GpuFrameDescriptor {}

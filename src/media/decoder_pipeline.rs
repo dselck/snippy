@@ -218,9 +218,20 @@ mod tests {
             self.fallback_frame_idx = frame_idx + 1;
 
             if self.is_gpu {
+                #[cfg(target_os = "macos")]
+                let descriptor = crate::media::types::GpuFrameDescriptor::CVPixelBuffer(std::ptr::null());
+                #[cfg(target_os = "linux")]
+                let descriptor = crate::media::types::GpuFrameDescriptor::LinuxHwFrame(std::sync::Arc::new(
+                    crate::media::types::HwFrameWrapper {
+                        frame: ffmpeg_next::util::frame::Video::empty(),
+                    },
+                ));
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                let descriptor = panic!("Unsupported OS for GPU frame in mock");
+
                 Ok(Some(DecodedFrame::Gpu {
                     frame_idx,
-                    descriptor: crate::media::types::GpuFrameDescriptor::CVPixelBuffer(std::ptr::null()),
+                    descriptor,
                     sequence_id: 0,
                     pts_sec,
                     color_space: ffmpeg_next::color::Space::Unspecified,
