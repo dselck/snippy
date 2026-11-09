@@ -42,6 +42,28 @@ impl Default for ZoomBehavior {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum PlayheadMode {
+    CenterAnchored,
+    FreeTravelling,
+}
+
+impl Default for PlayheadMode {
+    fn default() -> Self {
+        PlayheadMode::CenterAnchored
+    }
+}
+
+impl PlayheadMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            PlayheadMode::CenterAnchored => "Center Locked",
+            PlayheadMode::FreeTravelling => "Free Moving",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum Theme {
     #[serde(alias = "dark")]
     VideoEditorDark,
@@ -116,6 +138,10 @@ pub struct PlaybackSettings {
     /// RMS values below this floor are rendered as flat silence (0% height).
     /// Set to 0.0 or positive to use linear scaling.
     pub waveform_db_floor: f32,
+    /// Timeline playhead navigation mode (Center-locked scrolling vs Free-moving)
+    pub playhead_mode: PlayheadMode,
+    /// Selected audio stream index (None = use primary/best audio stream)
+    pub selected_audio_track: Option<usize>,
 }
 
 impl Default for PlaybackSettings {
@@ -123,6 +149,8 @@ impl Default for PlaybackSettings {
         Self {
             volume: 1.0,
             waveform_db_floor: -45.0,
+            playhead_mode: PlayheadMode::CenterAnchored,
+            selected_audio_track: None,
         }
     }
 }

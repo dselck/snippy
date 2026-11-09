@@ -566,6 +566,16 @@ impl PlaybackSession {
     pub fn is_stepping(&self) -> bool {
         matches!(self.arrow_seek_state, ArrowSeekState::SteppingLeft { .. } | ArrowSeekState::SteppingRight { .. })
     }
+
+    pub fn step_forward(&mut self) {
+        self.handle_input(InputEvent::ArrowRightPressed);
+        self.handle_input(InputEvent::ArrowRightReleased);
+    }
+
+    pub fn step_backward(&mut self) {
+        self.handle_input(InputEvent::ArrowLeftPressed);
+        self.handle_input(InputEvent::ArrowLeftReleased);
+    }
 }
 
 #[cfg(test)]

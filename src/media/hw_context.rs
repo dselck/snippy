@@ -96,7 +96,7 @@ pub unsafe extern "C" fn generic_get_hw_format(
 unsafe fn attach_hw_device_ctx(
     codec_ctx: &mut ffmpeg_next::codec::context::Context,
     mut hw_device_ctx: *mut ffmpeg_next::sys::AVBufferRef,
-) {
+) { unsafe {
     let ptr = codec_ctx.as_mut_ptr();
     if !(*ptr).hw_device_ctx.is_null() {
         ffmpeg_next::sys::av_buffer_unref(&mut (*ptr).hw_device_ctx);
@@ -104,7 +104,7 @@ unsafe fn attach_hw_device_ctx(
     (*ptr).hw_device_ctx = ffmpeg_next::sys::av_buffer_ref(hw_device_ctx);
     (*ptr).get_format = Some(generic_get_hw_format);
     ffmpeg_next::sys::av_buffer_unref(&mut hw_device_ctx);
-}
+}}
 
 /// Discovers and attaches the best available hardware device context to `codec_ctx`.
 ///
