@@ -71,6 +71,8 @@ mod tests {
             pts_sec: 0.0,
             color_space: ffmpeg_next::color::Space::Unspecified,
             color_range: ffmpeg_next::color::Range::Unspecified,
+            is_concealed: false,
+            held_frame_idx: None,
         };
 
         sink.push(vec![dummy_frame.clone(), dummy_frame.clone(), dummy_frame.clone()]);

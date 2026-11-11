@@ -5,6 +5,8 @@ use crossbeam_channel::{Receiver, Sender};
 use ringbuf::{storage::Heap, traits::*, SharedRb};
 use std::time::{Duration, Instant};
 use std::thread;
+use std::sync::{Arc, RwLock};
+use crate::media::types::{DefectMap, StreamTypeMask, DefectErrorType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrowSeekState {
@@ -58,6 +60,11 @@ pub struct PlaybackSession {
     loudness_rx: Option<crossbeam_channel::Receiver<(usize, f32)>>,
     pub(crate) loudness_shutdown_tx: Option<Sender<()>>,
     loudness_threads: Vec<thread::JoinHandle<()>>,
+
+    pub(crate) defect_map: Arc<RwLock<DefectMap>>,
+    concealment_active: bool,
+    concealed_held_frame: Option<usize>,
+    concealment_start_time: Option<Instant>,
 }
 
 impl Default for PlaybackSession {
@@ -103,6 +110,18 @@ impl PlaybackSession {
         self.master_clock.clone()
     }
 
+    pub fn defect_map(&self) -> Arc<RwLock<DefectMap>> {
+        Arc::clone(&self.defect_map)
+    }
+
+    pub fn concealment_telemetry(&self) -> (bool, Option<usize>, f64) {
+        (
+            self.concealment_active,
+            self.concealed_held_frame,
+            self.concealment_start_time.map_or(0.0, |t| t.elapsed().as_secs_f64()),
+        )
+    }
+
     pub fn new() -> Self {
         Self {
             current_frame: 0,
@@ -130,6 +149,10 @@ impl PlaybackSession {
             loudness_rx: None,
             loudness_shutdown_tx: None,
             loudness_threads: Vec::new(),
+            defect_map: Arc::new(RwLock::new(DefectMap::new())),
+            concealment_active: false,
+            concealed_held_frame: None,
+            concealment_start_time: None,
         }
     }
 
@@ -152,6 +175,10 @@ impl PlaybackSession {
     pub fn load_video(&mut self, path: &str, settings: &crate::settings::Settings) {
         self.shutdown_thumbnail_thread();
         self.shutdown_loudness_thread();
+        self.defect_map = Arc::new(RwLock::new(DefectMap::new()));
+        self.concealment_active = false;
+        self.concealed_held_frame = None;
+        self.concealment_start_time = None;
         if let Ok(mut ae) = AudioEngine::new() {
             let channels = ae.channels;
             let audio_tx = ae.tx.take().unwrap();
@@ -201,8 +228,19 @@ impl PlaybackSession {
                 let loudness_tx_clone = loudness_tx;
                 let path_clone = path.to_string();
                 let fps_clone = meta.fps;
+                let defect_map_clone = Arc::clone(&self.defect_map);
+                let keyframes_clone = meta.keyframes.clone();
+                let keyframes_pts_clone = meta.keyframes_pts.clone();
                 let handle = thread::spawn(move || {
-                    run_entire_audio_decoder(path_clone, fps_clone, shutdown_rx, loudness_tx_clone);
+                    run_background_media_scanner(
+                        path_clone,
+                        fps_clone,
+                        shutdown_rx,
+                        loudness_tx_clone,
+                        defect_map_clone,
+                        keyframes_clone,
+                        keyframes_pts_clone,
+                    );
                 });
                 self.loudness_shutdown_tx = Some(shutdown_tx);
                 self.loudness_threads = vec![handle];
@@ -354,8 +392,19 @@ impl PlaybackSession {
                 let loudness_tx_clone = loudness_tx;
                 let path_clone = path.to_string();
                 let fps_clone = meta.fps;
+                let defect_map_clone = Arc::clone(&self.defect_map);
+                let keyframes_clone = meta.keyframes.clone();
+                let keyframes_pts_clone = meta.keyframes_pts.clone();
                 let handle = thread::spawn(move || {
-                    run_entire_audio_decoder(path_clone, fps_clone, shutdown_rx, loudness_tx_clone);
+                    run_background_media_scanner(
+                        path_clone,
+                        fps_clone,
+                        shutdown_rx,
+                        loudness_tx_clone,
+                        defect_map_clone,
+                        keyframes_clone,
+                        keyframes_pts_clone,
+                    );
                 });
                 self.loudness_shutdown_tx = Some(shutdown_tx);
                 self.loudness_threads = vec![handle];
@@ -381,6 +430,18 @@ impl PlaybackSession {
 
             if let Some(frame) = &self.latest_frame
                 && got_frame {
+                    if frame.is_concealed() {
+                        if !self.concealment_active {
+                            self.concealment_active = true;
+                            self.concealment_start_time = Some(Instant::now());
+                            self.concealed_held_frame = frame.held_frame_idx();
+                        }
+                    } else {
+                        self.concealment_active = false;
+                        self.concealment_start_time = None;
+                        self.concealed_held_frame = None;
+                    }
+
                     let frame_idx = frame.frame_idx();
                     
                     if self.in_flight_seek_seq.is_some_and(|seq| frame.sequence_id() >= seq) {
@@ -674,49 +735,169 @@ mod tests {
             _ => panic!("Expected Seek command"),
         }
     }
+
+    #[test]
+    fn test_playback_session_defect_map() {
+        let session = PlaybackSession::new();
+        let map_arc = session.defect_map();
+        let (ranges, max_sec, total_pkts) = map_arc.read().unwrap().summary();
+        assert_eq!(ranges, 0);
+        assert_eq!(total_pkts, 0);
+        assert_eq!(max_sec, 0.0);
+
+        map_arc.write().unwrap().insert_or_coalesce(
+            2.5,
+            0.1,
+            StreamTypeMask::VIDEO,
+            DefectErrorType::CorruptBitstreamPayload,
+            Some(3),
+        );
+
+        let (ranges_after, _, total_after) = session.defect_map().read().unwrap().summary();
+        assert_eq!(ranges_after, 1);
+        assert_eq!(total_after, 1);
+    }
+
+    #[test]
+    fn test_playback_session_concealment_telemetry() {
+        let mut session = PlaybackSession::new();
+        let (active, held, dur) = session.concealment_telemetry();
+        assert!(!active);
+        assert_eq!(held, None);
+        assert_eq!(dur, 0.0);
+
+        let (frame_tx, frame_rx) = crossbeam_channel::unbounded();
+        session.frame_rx = Some(frame_rx);
+
+        // Send a concealed frame holding frame index 10
+        let concealed_frame = DecodedFrame::Cpu {
+            frame_idx: 12,
+            planes: std::sync::Arc::new(crate::media::types::YuvPlanes::default()),
+            sequence_id: 0,
+            pts_sec: 0.5,
+            color_space: ffmpeg_next::color::Space::Unspecified,
+            color_range: ffmpeg_next::color::Range::Unspecified,
+            is_concealed: true,
+            held_frame_idx: Some(10),
+        };
+        frame_tx.send(concealed_frame).unwrap();
+
+        session.update();
+        let (active2, held2, dur2) = session.concealment_telemetry();
+        assert!(active2);
+        assert_eq!(held2, Some(10));
+        assert!(dur2 >= 0.0);
+
+        // Send a regular (non-concealed) frame
+        let normal_frame = DecodedFrame::Cpu {
+            frame_idx: 13,
+            planes: std::sync::Arc::new(crate::media::types::YuvPlanes::default()),
+            sequence_id: 0,
+            pts_sec: 0.54,
+            color_space: ffmpeg_next::color::Space::Unspecified,
+            color_range: ffmpeg_next::color::Range::Unspecified,
+            is_concealed: false,
+            held_frame_idx: None,
+        };
+        frame_tx.send(normal_frame).unwrap();
+
+        session.update();
+        let (active3, held3, dur3) = session.concealment_telemetry();
+        assert!(!active3);
+        assert_eq!(held3, None);
+        assert_eq!(dur3, 0.0);
+    }
 }
 
-fn run_entire_audio_decoder(
+struct PendingDefect {
+    pts_sec: f64,
+    duration_sec: f64,
+    stream: StreamTypeMask,
+    error: DefectErrorType,
+    gop_idx: Option<usize>,
+}
+
+fn flush_pending_defects(
+    defect_map: &Arc<RwLock<DefectMap>>,
+    pending: &mut Vec<PendingDefect>,
+) {
+    if !pending.is_empty() {
+        if let Ok(mut map) = defect_map.write() {
+            for d in pending.drain(..) {
+                map.insert_or_coalesce(d.pts_sec, d.duration_sec, d.stream, d.error, d.gop_idx);
+            }
+        }
+    }
+}
+
+pub fn run_background_media_scanner(
     path: String,
     fps: f64,
     shutdown_rx: Receiver<()>,
     loudness_tx: Sender<(usize, f32)>,
+    defect_map: Arc<RwLock<DefectMap>>,
+    keyframes: Vec<usize>,
+    keyframes_pts: Vec<i64>,
 ) {
+    let _ = keyframes;
     ffmpeg_next::init().ok();
     let mut input = match ffmpeg_next::format::input(&path) {
         Ok(i) => i,
         Err(_) => return,
     };
 
-    let stream = match input.streams().best(ffmpeg_next::media::Type::Audio) {
-        Some(s) => s,
-        None => return,
+    let video_stream_info = input.streams().best(ffmpeg_next::media::Type::Video).map(|s| {
+        let idx = s.index();
+        let tb = s.time_base();
+        let tb_f64 = if tb.denominator() > 0 {
+            tb.numerator() as f64 / tb.denominator() as f64
+        } else {
+            1.0 / 1_000_000.0
+        };
+        (idx, tb_f64)
+    });
+
+    let audio_stream_info = input.streams().best(ffmpeg_next::media::Type::Audio).map(|s| {
+        let idx = s.index();
+        let tb = s.time_base();
+        let tb_f64 = if tb.denominator() > 0 {
+            tb.numerator() as f64 / tb.denominator() as f64
+        } else {
+            1.0 / 1_000_000.0
+        };
+        let params = s.parameters();
+        (idx, tb_f64, params)
+    });
+
+    let mut audio_pipeline = if let Some((_, audio_tb_f64, ref params)) = audio_stream_info {
+        if let Ok(codec_ctx) = ffmpeg_next::codec::context::Context::from_parameters(params.clone()) {
+            if let Ok(decoder) = codec_ctx.decoder().audio() {
+                Some(crate::media::audio_pipeline::AudioDecoderPipeline::new(
+                    decoder,
+                    48000,
+                    1,
+                    audio_tb_f64,
+                    0.0,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
     };
 
-    let audio_stream_index = stream.index();
-    let audio_codec_ctx = match ffmpeg_next::codec::context::Context::from_parameters(stream.parameters()) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
+    let nominal_video_frame_interval = if fps > 0.0 { 1.0 / fps } else { 1.0 / 24.0 };
+    let mut nominal_audio_frame_duration = 1024.0 / 48000.0;
 
-    let audio_decoder = match audio_codec_ctx.decoder().audio() {
-        Ok(d) => d,
-        Err(_) => return,
-    };
-
-    let audio_time_base = stream.time_base();
-    let audio_tb_f64 = audio_time_base.numerator() as f64 / audio_time_base.denominator() as f64;
-
-    let mut pipeline = crate::media::audio_pipeline::AudioDecoderPipeline::new(
-        audio_decoder,
-        48000,
-        1,
-        audio_tb_f64,
-        0.0,
-    );
+    let mut last_video_dts: Option<f64> = None;
+    let mut last_audio_pts: Option<f64> = None;
+    let mut pending_defects: Vec<PendingDefect> = Vec::with_capacity(32);
 
     let mut packets = input.packets();
-    let mut check_counter = 0;
+    let mut check_counter = 0usize;
 
     while let Some((stream, packet)) = packets.next() {
         check_counter += 1;
@@ -724,19 +905,123 @@ fn run_entire_audio_decoder(
             if shutdown_rx.try_recv().is_ok() {
                 break;
             }
+            flush_pending_defects(&defect_map, &mut pending_defects);
         }
 
-        if stream.index() == audio_stream_index {
-            if pipeline.send_packet(&packet).is_ok() {
-                if let Ok(chunks) = pipeline.receive_samples() {
-                    for chunk in chunks {
-                        let buckets = crate::media::audio_pipeline::compute_rms_buckets(&chunk, fps, 1, 48000);
-                        for (b_idx, rms) in buckets {
-                            let _ = loudness_tx.send((b_idx, rms));
+        let s_idx = stream.index();
+
+        if let Some((video_idx, video_tb_f64)) = video_stream_info {
+            if s_idx == video_idx {
+                let is_corrupt = packet.is_corrupt()
+                    || (packet.flags().bits() & (ffmpeg_next::sys::AV_PKT_FLAG_CORRUPT as i32)) != 0;
+
+                let pkt_pts_sec = packet
+                    .pts()
+                    .or_else(|| packet.dts())
+                    .map(|p| p as f64 * video_tb_f64)
+                    .unwrap_or(0.0);
+
+                let pkt_dur_sec = if packet.duration() > 0 {
+                    (packet.duration() as f64 * video_tb_f64).max(0.001)
+                } else {
+                    nominal_video_frame_interval
+                };
+
+                let gop_idx = if keyframes_pts.is_empty() {
+                    None
+                } else {
+                    let pkt_pts_i64 = packet.pts().or_else(|| packet.dts()).unwrap_or(0);
+                    match keyframes_pts.binary_search(&pkt_pts_i64) {
+                        Ok(idx) => Some(idx),
+                        Err(0) => Some(0),
+                        Err(idx) => Some(idx - 1),
+                    }
+                };
+
+                if is_corrupt {
+                    pending_defects.push(PendingDefect {
+                        pts_sec: pkt_pts_sec,
+                        duration_sec: pkt_dur_sec,
+                        stream: StreamTypeMask::VIDEO,
+                        error: DefectErrorType::CorruptBitstreamPayload,
+                        gop_idx,
+                    });
+                }
+
+                if let Some(dts) = packet.dts().or_else(|| packet.pts()) {
+                    let current_dts = dts as f64 * video_tb_f64;
+                    if let Some(last_dts) = last_video_dts {
+                        let delta_dts = current_dts - last_dts;
+                        if delta_dts > 2.0 * nominal_video_frame_interval || delta_dts < -0.001 {
+                            let defect_dur = if delta_dts > 2.0 * nominal_video_frame_interval {
+                                (delta_dts - nominal_video_frame_interval).max(nominal_video_frame_interval)
+                            } else {
+                                nominal_video_frame_interval
+                            };
+                            pending_defects.push(PendingDefect {
+                                pts_sec: pkt_pts_sec,
+                                duration_sec: defect_dur,
+                                stream: StreamTypeMask::VIDEO,
+                                error: DefectErrorType::TimestampDiscontinuity,
+                                gop_idx,
+                            });
+                        }
+                    }
+                    last_video_dts = Some(current_dts);
+                }
+            }
+        }
+
+        if let Some((audio_idx, audio_tb_f64, _)) = audio_stream_info {
+            if s_idx == audio_idx {
+                if let Some(pts) = packet.pts().or_else(|| packet.dts()) {
+                    let current_pts = pts as f64 * audio_tb_f64;
+                    let pkt_dur = if packet.duration() > 0 {
+                        packet.duration() as f64 * audio_tb_f64
+                    } else {
+                        nominal_audio_frame_duration
+                    };
+                    if pkt_dur > 0.001 {
+                        nominal_audio_frame_duration = pkt_dur;
+                    }
+
+                    if let Some(last_pts) = last_audio_pts {
+                        let delta_pts = current_pts - last_pts;
+                        if delta_pts > 1.5 * nominal_audio_frame_duration {
+                            let defect_dur = (delta_pts - nominal_audio_frame_duration).max(nominal_audio_frame_duration);
+                            pending_defects.push(PendingDefect {
+                                pts_sec: last_pts + nominal_audio_frame_duration,
+                                duration_sec: defect_dur,
+                                stream: StreamTypeMask::AUDIO,
+                                error: DefectErrorType::TimestampDiscontinuity,
+                                gop_idx: None,
+                            });
+                        }
+                    }
+                    last_audio_pts = Some(current_pts);
+                }
+
+                if let Some(ref mut pipeline) = audio_pipeline {
+                    if pipeline.send_packet(&packet).is_ok() {
+                        if let Ok(chunks) = pipeline.receive_samples() {
+                            for chunk in chunks {
+                                let buckets = crate::media::audio_pipeline::compute_rms_buckets(
+                                    &chunk, fps, 1, 48000,
+                                );
+                                for (b_idx, rms) in buckets {
+                                    let _ = loudness_tx.send((b_idx, rms));
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+
+        if pending_defects.len() >= 64 {
+            flush_pending_defects(&defect_map, &mut pending_defects);
+        }
     }
+
+    flush_pending_defects(&defect_map, &mut pending_defects);
 }

@@ -245,6 +245,7 @@ impl MainApp {
         let final_output = self.export_output_path.clone();
         let ranges = self.ranges.clone();
         let cut_mode = self.cut_mode;
+        let defect_map = Some(self.playback.defect_map());
 
         if let Some(metadata) = self.playback.metadata() {
             let status_clone = self.export_status.clone();
@@ -270,6 +271,7 @@ impl MainApp {
                     metadata,
                     status_clone.clone(),
                     cancel_clone,
+                    defect_map,
                 ) {
                     let mut status_guard = status_clone.lock().unwrap();
                     *status_guard = crate::media::types::ExportStatus::Failed(e.to_string());
@@ -305,6 +307,10 @@ impl MainApp {
     pub fn reindex_ranges(&mut self) {
         coalesce_and_reindex_ranges(&mut self.ranges);
         self.next_range_id = self.ranges.len() + 1;
+    }
+
+    pub fn coalesce_and_reindex_ranges(&mut self) {
+        self.reindex_ranges();
     }
 
     pub fn toggle_label_mode(&mut self) {

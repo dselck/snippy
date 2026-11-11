@@ -1,5 +1,5 @@
 use eframe::egui::{self, Color32, RichText, Stroke, vec2};
-use crate::settings::{CustomMode, PlayheadMode, Settings, Theme};
+use crate::settings::{CustomMode, PlayheadMode, ProlongedDropoutBehavior, Settings, Theme};
 use crate::ui::theme::{self, oklch_to_rgb, rgb_to_oklch};
 use crate::ui::MainApp;
 
@@ -188,6 +188,48 @@ fn render_playback_settings(app: &mut MainApp, ui: &mut egui::Ui, palette: &crat
         });
     });
     ui.add(egui::Slider::new(&mut app.pending_settings.playback.waveform_db_floor, -80.0..=0.0).show_value(false));
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(6.0);
+    ui.label(RichText::new("STREAM FAULT TOLERANCE").size(10.0).strong().color(palette.accent));
+    ui.add_space(6.0);
+
+    // Prolonged dropout behavior
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Prolonged Dropout (>3s):").strong().size(11.0).color(palette.text_normal));
+        let cur_behavior = app.pending_settings.playback.prolonged_dropout_behavior;
+        let behavior_str = match cur_behavior {
+            ProlongedDropoutBehavior::CutToBlack => "Cut to Black",
+            ProlongedDropoutBehavior::HoldFrame => "Hold Last Good Frame",
+        };
+        egui::ComboBox::from_id_salt("prolonged_dropout_behavior_combo")
+            .selected_text(behavior_str)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(
+                    &mut app.pending_settings.playback.prolonged_dropout_behavior,
+                    ProlongedDropoutBehavior::CutToBlack,
+                    "Cut to Black",
+                );
+                ui.selectable_value(
+                    &mut app.pending_settings.playback.prolonged_dropout_behavior,
+                    ProlongedDropoutBehavior::HoldFrame,
+                    "Hold Last Good Frame",
+                );
+            });
+    });
+
+    ui.add_space(4.0);
+    ui.checkbox(
+        &mut app.pending_settings.playback.show_concealment_badges,
+        "Show Concealment Badges",
+    );
+
+    ui.add_space(4.0);
+    ui.checkbox(
+        &mut app.pending_settings.timeline.show_timeline_defect_markers,
+        "Show Defect Markers on Timeline",
+    );
 }
 
 fn render_appearance_settings(app: &mut MainApp, ui: &mut egui::Ui, palette: &crate::ui::ThemePalette, ctx: &egui::Context) {
@@ -331,5 +373,33 @@ fn render_shortcuts_reference(ui: &mut egui::Ui, palette: &crate::ui::ThemePalet
             });
         });
         ui.separator();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_render_playback_settings_fault_tolerance() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = MainApp::new(&cc);
+
+        let palette = app.theme_palette();
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            render_playback_settings(&mut app, ui, &palette);
+        });
+
+        // Test mutating the fault tolerance pending settings
+        app.pending_settings.playback.prolonged_dropout_behavior = ProlongedDropoutBehavior::HoldFrame;
+        app.pending_settings.playback.show_concealment_badges = false;
+        app.pending_settings.timeline.show_timeline_defect_markers = false;
+
+        app.commit_settings(&ctx);
+
+        assert_eq!(app.settings.playback.prolonged_dropout_behavior, ProlongedDropoutBehavior::HoldFrame);
+        assert!(!app.settings.playback.show_concealment_badges);
+        assert!(!app.settings.timeline.show_timeline_defect_markers);
     }
 }

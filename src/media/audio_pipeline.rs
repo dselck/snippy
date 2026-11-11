@@ -19,6 +19,7 @@ pub struct AudioDecoderPipeline {
     is_first_audio_frame: bool,
     current_audio_time: f64,
     pub frames_written_total: u64,
+    last_emitted_pts: Option<f64>,
 }
 
 impl AudioDecoderPipeline {
@@ -40,7 +41,12 @@ impl AudioDecoderPipeline {
             is_first_audio_frame: true,
             current_audio_time: 0.0,
             frames_written_total: 0,
+            last_emitted_pts: None,
         }
+    }
+
+    pub fn last_emitted_pts(&self) -> Option<f64> {
+        self.last_emitted_pts
     }
 
     pub fn handle_seek(&mut self, target_time: f64) {
@@ -50,6 +56,7 @@ impl AudioDecoderPipeline {
         self.is_first_audio_frame = true;
         self.current_audio_time = self.video_start_time + target_time;
         self.frames_written_total = 0;
+        self.last_emitted_pts = None;
     }
 
     pub fn update_current_time_from_pts(&mut self, pts: i64) {
@@ -155,10 +162,49 @@ impl AudioDecoderPipeline {
                         }
                         self.is_first_audio_frame = false;
                     } else {
-                        let pts_us = ((pts_sec - self.video_start_time).max(0.0) * 1_000_000.0) as u64;
-                        chunks.push(AudioChunk { data, tag: Some((self.frames_written_total, pts_us)) });
+                        if let Some(last_pts) = self.last_emitted_pts {
+                            let delta = pts_sec - last_pts - duration_sec;
+                            if delta > 1.5 * duration_sec {
+                                // Positive gap: packet dropout! Synthesize silence to keep Master Clock monotonically in sync
+                                // Clamp gap to at most 10 seconds to safeguard against unbounded allocations on malformed timestamps
+                                let effective_delta = delta.min(10.0);
+                                let missing_samples = (effective_delta * self.target_sample_rate as f64).round() as usize;
+                                let pad_data = vec![0.0_f32; missing_samples * self.target_channels];
+                                let gap_pts_us = ((last_pts + duration_sec).max(0.0) * 1_000_000.0) as u64;
+                                chunks.push(AudioChunk {
+                                    data: pad_data,
+                                    tag: Some((self.frames_written_total, gap_pts_us)),
+                                });
+                                self.frames_written_total += missing_samples as u64;
+
+                                // Apply linear gain ramp on the incoming valid frame's samples (e.g. ramp over first 128 samples)
+                                let ramp_frames = 128.min(data.len() / self.target_channels);
+                                for f in 0..ramp_frames {
+                                    let gain = f as f32 / 128.0;
+                                    for c in 0..self.target_channels {
+                                        data[f * self.target_channels + c] *= gain;
+                                    }
+                                }
+                            } else if delta < -0.001 {
+                                // Negative gap: overlap from duplicate packets or splices. Trim overlapping samples so frames_written_total doesn't run ahead of container PTS.
+                                let overlap_sec = -delta;
+                                let discard_frames = (overlap_sec * self.target_sample_rate as f64).round() as usize;
+                                let discard_samples = (discard_frames * self.target_channels).min(data.len());
+                                data = data[discard_samples..].to_vec();
+                                data_frames = (data.len() / self.target_channels) as u64;
+                            }
+                        }
+
+                        if !data.is_empty() {
+                            let pts_us = ((pts_sec - self.video_start_time).max(0.0) * 1_000_000.0) as u64;
+                            chunks.push(AudioChunk {
+                                data,
+                                tag: Some((self.frames_written_total, pts_us)),
+                            });
+                        }
                     }
                     self.frames_written_total += data_frames;
+                    self.last_emitted_pts = Some(pts_sec);
                 }
             }
         }
@@ -287,5 +333,56 @@ mod tests_rms {
         let result = compute_rms_buckets(&chunk, 30.0, 1, 44100);
         assert!(!result.is_empty());
         assert_eq!(result[0].0, 12, "wrong bucket index");
+    }
+}
+
+#[cfg(test)]
+mod tests_padding {
+    #[test]
+    fn test_silence_padding_gain_ramp_and_overlap_math() {
+        let target_sample_rate = 48000;
+        let target_channels = 2;
+        let last_pts = 1.0f64;
+        let duration_sec = 0.02f64; // nominal frame duration
+        let pts_sec = 1.10f64; // gap of 0.08s after frame at 1.00s..1.02s
+
+        let delta = pts_sec - last_pts - duration_sec;
+        assert!(delta > 1.5 * duration_sec);
+
+        let missing_samples = (delta * target_sample_rate as f64).round() as usize;
+        let pad_data = vec![0.0_f32; missing_samples * target_channels];
+        let gap_pts_us = ((last_pts + duration_sec).max(0.0) * 1_000_000.0) as u64;
+
+        assert_eq!(missing_samples, (0.08 * 48000.0) as usize);
+        assert_eq!(pad_data.len(), missing_samples * 2);
+        assert_eq!(gap_pts_us, 1_020_000);
+
+        // Test linear gain ramp on resumption:
+        let mut data = vec![1.0_f32; 256 * target_channels];
+        let ramp_frames = 128.min(data.len() / target_channels);
+        for f in 0..ramp_frames {
+            let gain = f as f32 / 128.0;
+            for c in 0..target_channels {
+                data[f * target_channels + c] *= gain;
+            }
+        }
+        // First sample frame is 0.0
+        assert_eq!(data[0], 0.0);
+        assert_eq!(data[1], 0.0);
+        // Halfway through ramp (frame 64) is 0.5
+        assert!((data[64 * 2] - 0.5).abs() < 1e-4);
+        assert!((data[64 * 2 + 1] - 0.5).abs() < 1e-4);
+        // Frame 128 (after ramp) is 1.0
+        assert_eq!(data[128 * 2], 1.0);
+
+        // Test overlap trimming formula:
+        let overlap_delta = -0.005f64; // 5ms overlap
+        let overlap_sec = -overlap_delta;
+        let discard_frames = (overlap_sec * target_sample_rate as f64).round() as usize;
+        let discard_samples = (discard_frames * target_channels).min(data.len());
+        let trimmed_data = data[discard_samples..].to_vec();
+        assert_eq!(discard_frames, 240);
+        assert_eq!(discard_samples, 240 * 2);
+        assert_eq!(trimmed_data.len(), data.len() - 240 * 2);
     }
 }

@@ -13,11 +13,17 @@ pub struct FfmpegDecoderAdapter {
 
 impl FfmpegDecoderAdapter {
     pub fn new(
-        video_decoder: ffmpeg_next::decoder::Video,
+        mut video_decoder: ffmpeg_next::decoder::Video,
         time_base_f64: f64,
         video_start_time: f64,
         fps: f64,
     ) -> Self {
+        unsafe {
+            let ctx = &mut *video_decoder.as_mut_ptr();
+            ctx.error_concealment = ffmpeg_next::sys::FF_EC_GUESS_MVS | ffmpeg_next::sys::FF_EC_DEBLOCK;
+            ctx.err_recognition = ffmpeg_next::sys::AV_EF_COMPLIANT;
+        }
+
         Self {
             video_decoder,
             scaler: None,
@@ -75,6 +81,8 @@ impl DecoderAdapter for FfmpegDecoderAdapter {
                         pts_sec,
                         color_space: frame.color_space(),
                         color_range: frame.color_range(),
+                        is_concealed: false,
+                        held_frame_idx: None,
                     }));
                 }
 
@@ -110,6 +118,8 @@ impl DecoderAdapter for FfmpegDecoderAdapter {
                             pts_sec,
                             color_space: frame.color_space(),
                             color_range: frame.color_range(),
+                            is_concealed: false,
+                            held_frame_idx: None,
                         }));
                     }
 
@@ -165,9 +175,12 @@ impl DecoderAdapter for FfmpegDecoderAdapter {
                     pts_sec,
                     color_space: actual_color_space,
                     color_range: actual_color_range,
+                    is_concealed: false,
+                    held_frame_idx: None,
                 }))
             }
             Err(ffmpeg_next::Error::Eof) => Ok(None),
+            Err(ffmpeg_next::Error::Other { errno }) if errno == ffmpeg_next::sys::EAGAIN => Ok(None),
             Err(e) => {
                 if e.to_string().contains("EAGAIN") || e.to_string().contains("Resource temporarily unavailable") {
                     Ok(None)

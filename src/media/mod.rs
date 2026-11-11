@@ -519,7 +519,12 @@ fn run_decoder_thread(
             video_start_time,
             fps,
         ));
-        crate::media::decoder_pipeline::VideoDecoderPipeline::new(adapter, keyframes.clone())
+        crate::media::decoder_pipeline::VideoDecoderPipeline::new(
+            adapter,
+            keyframes.clone(),
+            fps,
+            video_time_base_f64,
+        )
     };
 
     let mut video_sink = crate::media::sinks::CrossbeamFrameSink::new(play_queue_tx, 20);

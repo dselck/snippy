@@ -58,6 +58,10 @@ impl NotificationQueue {
         self.items.push_back(n);
     }
 
+    pub fn push_back(&mut self, n: Notification) {
+        self.push(n);
+    }
+
     pub fn dismiss(&mut self, index: usize) {
         self.items.remove(index);
     }

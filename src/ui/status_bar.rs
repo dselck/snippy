@@ -1,4 +1,5 @@
 use eframe::egui::{self, RichText, Stroke, pos2, vec2};
+use crate::ui::inspector::InspectorTab;
 use crate::ui::MainApp;
 
 pub const STATUS_BAR_HEIGHT: f32 = 22.0;
@@ -61,6 +62,29 @@ pub fn render_status_bar(app: &mut MainApp, ui: &mut egui::Ui) {
                 );
             }
 
+            // Stream Health Pill
+            let (defect_count, total_sec, _) = app.playback.defect_map().read().unwrap().summary();
+            let (health_text, health_color) = if defect_count == 0 {
+                ("● HEALTH: CLEAN".to_string(), palette.keep_color)
+            } else {
+                (format!("● HEALTH: {} DEFECTS ({:.1}s)", defect_count, total_sec), palette.warn_color)
+            };
+
+            let health_btn = egui::Button::new(
+                RichText::new(health_text)
+                    .size(10.0)
+                    .strong()
+                    .monospace()
+                    .color(health_color)
+            )
+            .frame(false);
+
+            if ui.add(health_btn).on_hover_text("Stream health status. Click to open Stream Health inspector.").clicked() {
+                app.show_snippets_hud = true;
+                app.snippets_hud_collapsed = false;
+                app.active_inspector_tab = InspectorTab::StreamHealth;
+            }
+
             // 2. Right: Telemetry (Sync drift, Decode FPS, Zoom level)
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing = vec2(12.0, 0.0);
@@ -107,4 +131,35 @@ pub fn render_status_bar(app: &mut MainApp, ui: &mut egui::Ui) {
             });
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::types::{DefectErrorType, StreamTypeMask};
+
+    #[test]
+    fn test_render_status_bar_clean_and_defects() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = MainApp::new(&cc);
+
+        // 1. Clean state
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            render_status_bar(&mut app, ui);
+        });
+
+        // 2. State with defect
+        app.playback.defect_map().write().unwrap().insert_or_coalesce(
+            1.5,
+            0.5,
+            StreamTypeMask::VIDEO,
+            DefectErrorType::CorruptBitstreamPayload,
+            None,
+        );
+
+        let _ = ctx.run_ui(Default::default(), |ui| {
+            render_status_bar(&mut app, ui);
+        });
+    }
 }

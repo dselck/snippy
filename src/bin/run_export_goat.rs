@@ -8,7 +8,7 @@ use snippy2::ui::ExportRange;
 
 fn scan_metadata(path_str: &str) -> Result<VideoMetadata, anyhow::Error> {
     ffmpeg::init()?;
-    let mut input = ffmpeg::format::input(&path_str)?;
+    let input = ffmpeg::format::input(&path_str)?;
     let stream = input
         .streams()
         .best(ffmpeg::media::Type::Video)
@@ -147,6 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         metadata,
         status.clone(),
         cancel_flag,
+        None,
     )?;
 
     println!("Export completed successfully!");

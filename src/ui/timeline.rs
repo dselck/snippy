@@ -215,6 +215,24 @@ pub fn render_timeline(app: &mut MainApp, ui: &mut egui::Ui, anim_height: f32) {
         }
     }
 
+    // Defect Warning Markers on Filmstrip
+    if app.settings.timeline.show_timeline_defect_markers {
+        let defect_ranges = app.playback.defect_map().read().unwrap().ranges().to_vec();
+        for range in &defect_ranges {
+            let start_x = (filmstrip_rect.left() as f64 + scroll_offset_x + range.start_pts_sec * pps) as f32;
+            let end_x = (filmstrip_rect.left() as f64 + scroll_offset_x + range.end_pts_sec * pps) as f32;
+            let left = start_x.max(filmstrip_rect.left());
+            let right = end_x.max(start_x + 2.0).min(filmstrip_rect.right());
+            if left < right {
+                let defect_rect = Rect::from_min_max(
+                    pos2(left, filmstrip_rect.top()),
+                    pos2(right, filmstrip_rect.top() + 5.0),
+                );
+                filmstrip_painter.rect_filled(defect_rect, 0.0, Color32::from_rgba_unmultiplied(230, 160, 30, 180));
+            }
+        }
+    }
+
     // Scrub handling on filmstrip
     if filmstrip_response.dragged() || filmstrip_response.clicked() {
         app.playback.set_playing(false);
@@ -673,6 +691,17 @@ fn render_slim_timeline_overview(
                 let fill = if app.cut_mode { cut_col } else { keep_col };
                 let seg_rect = Rect::from_min_max(pos2(x0, track_rect.top()), pos2(x1, track_rect.bottom()));
                 p.rect_filled(seg_rect, 1.0, fill);
+            }
+        }
+
+        // Defect Warning Markers on Mini-map Track
+        if app.settings.timeline.show_timeline_defect_markers && dur_sec > 0.0 {
+            let defect_ranges = app.playback.defect_map().read().map_or(vec![], |m| m.ranges().to_vec());
+            for range in &defect_ranges {
+                let x0 = track_rect.left() + (range.start_pts_sec / dur_sec).clamp(0.0, 1.0) as f32 * track_rect.width();
+                let x1 = (track_rect.left() + (range.end_pts_sec / dur_sec).clamp(0.0, 1.0) as f32 * track_rect.width()).max(x0 + 2.0);
+                let defect_rect = Rect::from_min_max(pos2(x0, track_rect.top()), pos2(x1, track_rect.top() + 3.0));
+                p.rect_filled(defect_rect, 0.0, Color32::from_rgba_unmultiplied(230, 160, 30, 180));
             }
         }
 

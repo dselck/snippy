@@ -112,6 +112,14 @@ impl Default for ColorHarmony {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProlongedDropoutBehavior {
+    #[default]
+    CutToBlack,
+    HoldFrame,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticStyle {
@@ -142,6 +150,10 @@ pub struct PlaybackSettings {
     pub playhead_mode: PlayheadMode,
     /// Selected audio stream index (None = use primary/best audio stream)
     pub selected_audio_track: Option<usize>,
+    /// Behavior when video dropout exceeds 3.0s (Cut to black vs hold frame)
+    pub prolonged_dropout_behavior: ProlongedDropoutBehavior,
+    /// Whether to show concealment badges when freeze-frame concealment is active
+    pub show_concealment_badges: bool,
 }
 
 impl Default for PlaybackSettings {
@@ -151,6 +163,8 @@ impl Default for PlaybackSettings {
             waveform_db_floor: -45.0,
             playhead_mode: PlayheadMode::CenterAnchored,
             selected_audio_track: None,
+            prolonged_dropout_behavior: ProlongedDropoutBehavior::CutToBlack,
+            show_concealment_badges: true,
         }
     }
 }
@@ -256,6 +270,8 @@ pub struct TimelineSettings {
     pub max_zoom_unit: ZoomUnit,
     /// Zoom curve shape: exponential or linear
     pub zoom_behavior: ZoomBehavior,
+    /// Whether to display defect markers along the timeline filmstrip
+    pub show_timeline_defect_markers: bool,
 }
 
 impl Default for TimelineSettings {
@@ -268,6 +284,7 @@ impl Default for TimelineSettings {
             max_zoom_value: 30.0,
             max_zoom_unit: ZoomUnit::Seconds,
             zoom_behavior: ZoomBehavior::Exponential,
+            show_timeline_defect_markers: true,
         }
     }
 }
@@ -486,6 +503,12 @@ volume = 1.0
 # Default: -45.0. Set to 0.0 or a positive value to use linear scaling.
 waveform_db_floor = -45.0
 
+# Behavior when video dropout exceeds 3.0s ("cut_to_black" or "hold_frame").
+prolonged_dropout_behavior = "cut_to_black"
+
+# Whether to show concealment badges when freeze-frame concealment is active.
+show_concealment_badges = true
+
 [hardware]
 # Enable GPU-accelerated video decoding.
 # Uses VideoToolbox on macOS, D3D11 on Windows, VAAPI on Linux.
@@ -535,6 +558,9 @@ max_zoom_unit = "seconds"  # "seconds" or "frames"
 # "linear" gives uniform steps across the full range.
 zoom_behavior = "exponential"  # "exponential" or "linear"
 
+# Whether to show defect warning markers on the timeline filmstrip.
+show_timeline_defect_markers = true
+
 [general]
 # Recently opened files — managed automatically (newest first, max 10).
 recent_files = []
@@ -563,6 +589,27 @@ mod tests {
     fn test_default_waveform_db_floor() {
         let settings = Settings::default();
         assert_eq!(settings.playback.waveform_db_floor, -45.0);
+    }
+
+    #[test]
+    fn test_fault_tolerance_settings_defaults_and_parse() {
+        let settings = Settings::default();
+        assert_eq!(settings.playback.prolonged_dropout_behavior, ProlongedDropoutBehavior::CutToBlack);
+        assert!(settings.playback.show_concealment_badges);
+        assert!(settings.timeline.show_timeline_defect_markers);
+
+        let toml_str = r#"
+            [playback]
+            prolonged_dropout_behavior = "hold_frame"
+            show_concealment_badges = false
+
+            [timeline]
+            show_timeline_defect_markers = false
+        "#;
+        let parsed: Settings = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.playback.prolonged_dropout_behavior, ProlongedDropoutBehavior::HoldFrame);
+        assert!(!parsed.playback.show_concealment_badges);
+        assert!(!parsed.timeline.show_timeline_defect_markers);
     }
 }
 

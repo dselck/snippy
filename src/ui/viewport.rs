@@ -100,6 +100,7 @@ pub fn render_viewport(app: &mut MainApp, ui: &mut egui::Ui) {
             let painter = ui.painter_at(rect);
 
             let mut rendered = false;
+            let mut active_video_rect = None;
             if let Some(frame) = app.playback.latest_frame() {
                 let (video_w, video_h) = match frame {
                     media::DecodedFrame::Cpu { planes, .. } => (planes.width as f32, planes.height as f32),
@@ -141,6 +142,7 @@ pub fn render_viewport(app: &mut MainApp, ui: &mut egui::Ui) {
                     );
                     painter.add(callback);
                     rendered = true;
+                    active_video_rect = Some(target_rect);
 
                     // Subtle monitor bezel border around the active video area
                     painter.rect_stroke(
@@ -199,6 +201,43 @@ pub fn render_viewport(app: &mut MainApp, ui: &mut egui::Ui) {
                         "Decoding frame...",
                         egui::FontId::proportional(13.0),
                         palette.text_muted,
+                    );
+                }
+            }
+
+            // Concealment Telemetry (Dropout Blackout and HUD Badge)
+            let (is_concealed, held_frame_idx, concealed_dur_sec) = app.playback.concealment_telemetry();
+            if is_concealed {
+                let target_rect = active_video_rect.unwrap_or(rect);
+                if concealed_dur_sec >= 3.0
+                    && app.settings.playback.prolonged_dropout_behavior == crate::settings::ProlongedDropoutBehavior::CutToBlack
+                {
+                    painter.rect_filled(target_rect, 0.0, Color32::BLACK);
+                }
+
+                if concealed_dur_sec >= 1.0 && app.settings.playback.show_concealment_badges {
+                    let badge_text = format!("[CONCEALED: HOLDING FRAME #{}]", held_frame_idx.unwrap_or(0));
+                    let galley = painter.layout_no_wrap(
+                        badge_text,
+                        egui::FontId::monospace(12.0),
+                        palette.warn_color,
+                    );
+                    let badge_size = galley.size() + vec2(16.0, 10.0);
+                    let badge_rect = Rect::from_center_size(
+                        pos2(rect.center().x, rect.bottom() - 25.0),
+                        badge_size,
+                    );
+                    painter.rect_filled(badge_rect, 3.0, Color32::from_black_alpha(200));
+                    painter.rect_stroke(
+                        badge_rect,
+                        3.0,
+                        Stroke::new(1.0_f32, palette.warn_color.linear_multiply(0.7)),
+                        StrokeKind::Inside,
+                    );
+                    painter.galley(
+                        pos2(badge_rect.left() + 8.0, badge_rect.top() + 5.0),
+                        galley,
+                        Color32::WHITE,
                     );
                 }
             }

@@ -144,3 +144,23 @@ _Avoid_: Copied GOP, stream copied GOP.
 A Group of Pictures (GOP) that is cut in the middle, requiring its frames to be decoded, filtered, and re-encoded.
 _Avoid_: Re-encoded GOP, cut GOP.
 
+**DefectMap**:
+The centralized, thread-safe collection of container and bitstream defect ranges discovered across the media file by the background scanner.
+_Avoid_: Error list, corruption map, glitch tracker
+
+**ContiguousDefectRange**:
+A clustered time interval of transmission defects coalesced within a 500ms sliding window.
+_Avoid_: Defect block, error span, bad packet cluster
+
+**Compromised GOP**:
+A Group of Pictures containing corrupted reference slices or packets, causing subsequent inter-frame decoding to be suppressed.
+_Avoid_: Broken GOP, corrupt GOP, damaged keyframe group
+
+**Concealment Mode**:
+The playback state where the viewport holds the last clean video frame (or solid black) across corrupted presentation slots.
+_Avoid_: Freeze frame mode, pause fallback, error hold
+
+**Silence Padding**:
+The synthesis of zero-amplitude PCM samples injected into the audio stream to maintain Master Clock monotonicity across dropped packets.
+_Avoid_: Zero fill, mute insert, blank audio
+

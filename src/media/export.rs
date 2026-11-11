@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use ffmpeg_next as ffmpeg;
-use crate::media::types::{ExportStatus, VideoMetadata};
+use crate::media::types::{DefectMap, ExportStatus, VideoMetadata};
 use crate::ui::ExportRange;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -10,6 +10,194 @@ pub enum GopType {
     Copy,
     Transcode,
     Cut,
+}
+
+pub fn classify_gops(
+    metadata: &VideoMetadata,
+    ranges: &[ExportRange],
+    cut_mode: bool,
+    defect_map: Option<&DefectMap>,
+) -> Vec<GopType> {
+    let mut gop_types = Vec::with_capacity(metadata.keyframes.len());
+
+    for i in 0..metadata.keyframes.len() {
+        let start_frame = metadata.keyframes[i];
+        let end_frame = if i + 1 < metadata.keyframes.len() {
+            metadata.keyframes[i + 1]
+        } else {
+            metadata.total_frames
+        };
+
+        let mut kept_count = 0;
+        let mut cut_count = 0;
+        for f in start_frame..end_frame {
+            if crate::ui::is_frame_cut_helper(f, ranges, cut_mode) {
+                cut_count += 1;
+            } else {
+                kept_count += 1;
+            }
+        }
+
+        let mut gop_type = if kept_count == (end_frame - start_frame) {
+            GopType::Copy
+        } else if cut_count == (end_frame - start_frame) {
+            GopType::Cut
+        } else {
+            GopType::Transcode
+        };
+
+        if let Some(map) = defect_map {
+            let gop_start_sec = start_frame as f64 / metadata.fps;
+            let gop_end_sec = end_frame as f64 / metadata.fps;
+            if gop_type == GopType::Copy && map.intersects_video_gop(gop_start_sec, gop_end_sec) {
+                gop_type = GopType::Transcode;
+            }
+        }
+
+        gop_types.push(gop_type);
+    }
+
+    gop_types
+}
+
+fn clone_video_frame(src: &ffmpeg::util::frame::Video) -> ffmpeg::util::frame::Video {
+    let mut dst = ffmpeg::util::frame::Video::empty();
+    unsafe {
+        ffmpeg_next::sys::av_frame_ref(dst.as_mut_ptr(), src.as_ptr());
+    }
+    dst
+}
+
+fn create_blank_frame(format: ffmpeg::format::Pixel, width: u32, height: u32) -> ffmpeg::util::frame::Video {
+    let fmt = if format == ffmpeg::format::Pixel::None {
+        ffmpeg::format::Pixel::YUV420P
+    } else {
+        format
+    };
+    let mut frame = ffmpeg::util::frame::Video::new(fmt, width.max(16), height.max(16));
+    unsafe {
+        let ptr = frame.as_mut_ptr();
+        for buf_ref in (*ptr).buf {
+            if !buf_ref.is_null() {
+                let buf_ptr = (*buf_ref).data;
+                let buf_size = (*buf_ref).size as usize;
+                if !buf_ptr.is_null() && buf_size > 0 {
+                    std::ptr::write_bytes(buf_ptr, 0x00, buf_size);
+                }
+            }
+        }
+    }
+    frame
+}
+
+fn get_transcode_gop_span(gop_idx: usize, gop_types: &[GopType]) -> (usize, usize) {
+    let mut start = gop_idx;
+    while start > 0 && gop_types[start - 1] == GopType::Transcode {
+        start -= 1;
+    }
+    let mut end = gop_idx;
+    while end + 1 < gop_types.len() && gop_types[end + 1] == GopType::Transcode {
+        end += 1;
+    }
+    (start, end)
+}
+
+fn send_frame_to_encoder(
+    frame: &mut ffmpeg::util::frame::Video,
+    f_idx: usize,
+    encoder: &mut ffmpeg::codec::encoder::Video,
+    output: &mut ffmpeg::format::context::Output,
+    kept_segments: &[(usize, usize)],
+    output_start_pts_sec: &[f64],
+    fps: f64,
+    video_codec_id: ffmpeg::codec::Id,
+    video_out_time_base: ffmpeg::Rational,
+    last_video_dts: &mut Option<i64>,
+    ost_idx: usize,
+    max_written_pts_sec: &mut f64,
+) -> Result<(), anyhow::Error> {
+    if let Some(seg_idx) = kept_segments.iter().position(|&(start, end)| f_idx >= start && f_idx < end) {
+        let start_frame = kept_segments[seg_idx].0;
+        let out_pts_sec = (f_idx - start_frame) as f64 / fps + output_start_pts_sec[seg_idx];
+        *max_written_pts_sec = (*max_written_pts_sec).max(out_pts_sec);
+
+        let enc_tb = encoder.time_base();
+        let enc_pts = (out_pts_sec / (enc_tb.numerator() as f64 / enc_tb.denominator() as f64)).round() as i64;
+
+        frame.set_pts(Some(enc_pts));
+        unsafe {
+            (*frame.as_mut_ptr()).pict_type = ffmpeg::sys::AVPictureType::AV_PICTURE_TYPE_NONE;
+        }
+        encoder.send_frame(frame)?;
+
+        let mut out_pkt = ffmpeg::Packet::empty();
+        while encoder.receive_packet(&mut out_pkt).is_ok() {
+            out_pkt.rescale_ts(encoder.time_base(), video_out_time_base);
+            write_video_packet(
+                out_pkt,
+                video_codec_id,
+                last_video_dts,
+                ost_idx,
+                output,
+            )?;
+            out_pkt = ffmpeg::Packet::empty();
+        }
+    }
+    Ok(())
+}
+
+fn synthesize_missing_frames(
+    target_idx: Option<usize>,
+    span_kept_frames: &[usize],
+    last_encoded_frame_idx: &mut Option<usize>,
+    last_decoded_frame: &Option<ffmpeg::util::frame::Video>,
+    decoder: &ffmpeg::codec::decoder::Video,
+    encoder: &mut ffmpeg::codec::encoder::Video,
+    output: &mut ffmpeg::format::context::Output,
+    kept_segments: &[(usize, usize)],
+    output_start_pts_sec: &[f64],
+    fps: f64,
+    video_codec_id: ffmpeg::codec::Id,
+    video_out_time_base: ffmpeg::Rational,
+    last_video_dts: &mut Option<i64>,
+    ost_idx: usize,
+    max_written_pts_sec: &mut f64,
+) -> Result<(), anyhow::Error> {
+    for &k in span_kept_frames {
+        let should_synthesize = match *last_encoded_frame_idx {
+            Some(last) => k > last,
+            None => true,
+        } && match target_idx {
+            Some(target) => k < target,
+            None => true,
+        };
+
+        if should_synthesize {
+            eprintln!("[WARN] Synthesizing missing frame {} due to decode error/drop to preserve monotonicity", k);
+            let mut synth_frame = if let Some(last_frame) = last_decoded_frame {
+                clone_video_frame(last_frame)
+            } else {
+                create_blank_frame(decoder.format(), decoder.width(), decoder.height())
+            };
+
+            send_frame_to_encoder(
+                &mut synth_frame,
+                k,
+                encoder,
+                output,
+                kept_segments,
+                output_start_pts_sec,
+                fps,
+                video_codec_id,
+                video_out_time_base,
+                last_video_dts,
+                ost_idx,
+                max_written_pts_sec,
+            )?;
+            *last_encoded_frame_idx = Some(k);
+        }
+    }
+    Ok(())
 }
 
 fn create_video_encoder(
@@ -41,6 +229,22 @@ fn create_video_encoder(
     let max_b_frames = 0;
     video_enc.set_max_b_frames(max_b_frames); // `/ponytail`: simplify PTS/DTS re-encoding math
 
+    // Preserve color and profile/level parameters from source decoder
+    video_enc.set_colorspace(decoder.color_space());
+    video_enc.set_color_range(decoder.color_range());
+    unsafe {
+        let dec_ptr = decoder.as_ptr();
+        let enc_ptr = video_enc.as_mut_ptr();
+        (*enc_ptr).color_primaries = (*dec_ptr).color_primaries;
+        (*enc_ptr).color_trc = (*dec_ptr).color_trc;
+        if (*dec_ptr).profile != ffmpeg_next::sys::AV_PROFILE_UNKNOWN {
+            (*enc_ptr).profile = (*dec_ptr).profile;
+        }
+        if (*dec_ptr).level != ffmpeg_next::sys::AV_LEVEL_UNKNOWN {
+            (*enc_ptr).level = (*dec_ptr).level;
+        }
+    }
+
     // We do NOT set GLOBAL_HEADER here. This forces the encoder to write VPS, SPS, and PPS
     // headers in-band at the start of keyframes. This is critical for smart rendering
     // because it allows the decoder to switch parameters between copied and transcoded segments.
@@ -53,7 +257,7 @@ fn create_video_encoder(
         // Force libx264 to repeat headers in-band so that SPS/PPS are written on every keyframe,
         // allowing decoders to recover when transitioning from transcoded to copied segments.
         opts.set("x264-params", "repeat-headers=1");
-    } else if codec_id == ffmpeg::codec::Id::H265 {
+    } else if codec_id == ffmpeg::codec::Id::H265 || codec_id == ffmpeg::codec::Id::HEVC {
         opts.set("crf", "24");
         opts.set("preset", "medium");
         // Force libx265 to repeat headers in-band at every keyframe.
@@ -264,8 +468,7 @@ fn flush_and_reset_video_pipeline(
     decoder: &mut Option<ffmpeg::codec::decoder::Video>,
     encoder: &mut Option<ffmpeg::codec::encoder::Video>,
     output: &mut ffmpeg::format::context::Output,
-    stream_mapping: &[isize],
-    video_in_stream_idx: usize,
+    ost_idx: usize,
     video_codec_id: ffmpeg::codec::Id,
     video_in_time_base: ffmpeg::Rational,
     video_out_time_base: ffmpeg::Rational,
@@ -276,14 +479,23 @@ fn flush_and_reset_video_pipeline(
     fps: f64,
     output_start_pts_sec: &[f64],
     video_start_time: f64,
+    span_kept_frames: &[usize],
+    last_encoded_frame_idx: &mut Option<usize>,
+    last_decoded_frame: &mut Option<ffmpeg::util::frame::Video>,
+    max_written_pts_sec: &mut f64,
 ) -> Result<(), anyhow::Error> {
     let decoder = match decoder.as_mut() {
         Some(d) => d,
         None => return Ok(()),
     };
+    if encoder.is_none() {
+        return Ok(());
+    }
     
     // 1. Send empty packet to decoder to flush it
-    decoder.send_packet(&ffmpeg::Packet::empty())?;
+    if let Err(e) = decoder.send_packet(&ffmpeg::Packet::empty()) {
+        eprintln!("[WARN] Note while flushing decoder: {:?}", e);
+    }
     
     let mut decoded_frame = ffmpeg::util::frame::Video::empty();
     while decoder.receive_frame(&mut decoded_frame).is_ok() {
@@ -293,55 +505,88 @@ fn flush_and_reset_video_pipeline(
         let f_idx = (f_pts_sec * fps).round() as usize;
 
         if !crate::ui::is_frame_cut_helper(f_idx, ranges, cut_mode) {
-            if let Some(seg_idx) = kept_segments.iter().position(|&(start, end)| f_idx >= start && f_idx < end) {
-                let start_frame = kept_segments[seg_idx].0;
-                let out_pts_sec = (f_idx - start_frame) as f64 / fps + output_start_pts_sec[seg_idx];
-                
-                if let Some(enc) = encoder {
-                    let enc_pts = (out_pts_sec / (enc.time_base().numerator() as f64 / enc.time_base().denominator() as f64)).round() as i64;
-                    decoded_frame.set_pts(Some(enc_pts));
-                    unsafe {
-                        (*decoded_frame.as_mut_ptr()).pict_type = ffmpeg::sys::AVPictureType::AV_PICTURE_TYPE_NONE;
-                    }
-                    enc.send_frame(&decoded_frame)?;
+            let enc = encoder.as_mut().unwrap();
+            synthesize_missing_frames(
+                Some(f_idx),
+                span_kept_frames,
+                last_encoded_frame_idx,
+                last_decoded_frame,
+                decoder,
+                enc,
+                output,
+                kept_segments,
+                output_start_pts_sec,
+                fps,
+                video_codec_id,
+                video_out_time_base,
+                last_video_dts,
+                ost_idx,
+                max_written_pts_sec,
+            )?;
 
-                    let mut out_pkt = ffmpeg::Packet::empty();
-                    while enc.receive_packet(&mut out_pkt).is_ok() {
-                        out_pkt.rescale_ts(enc.time_base(), video_out_time_base);
-                        write_video_packet(
-                            out_pkt,
-                            video_codec_id,
-                            last_video_dts,
-                            stream_mapping[video_in_stream_idx] as usize,
-                            output,
-                        )?;
-                        out_pkt = ffmpeg::Packet::empty();
-                    }
-                }
+            if last_encoded_frame_idx.map_or(true, |last| f_idx > last) {
+                send_frame_to_encoder(
+                    &mut decoded_frame,
+                    f_idx,
+                    enc,
+                    output,
+                    kept_segments,
+                    output_start_pts_sec,
+                    fps,
+                    video_codec_id,
+                    video_out_time_base,
+                    last_video_dts,
+                    ost_idx,
+                    max_written_pts_sec,
+                )?;
+                *last_encoded_frame_idx = Some(f_idx);
+                *last_decoded_frame = Some(clone_video_frame(&decoded_frame));
             }
+        } else {
+            *last_decoded_frame = Some(clone_video_frame(&decoded_frame));
         }
     }
 
+    // Synthesize any remaining missing frames up to the end of span_kept_frames
+    let enc = encoder.as_mut().unwrap();
+    synthesize_missing_frames(
+        None,
+        span_kept_frames,
+        last_encoded_frame_idx,
+        last_decoded_frame,
+        decoder,
+        enc,
+        output,
+        kept_segments,
+        output_start_pts_sec,
+        fps,
+        video_codec_id,
+        video_out_time_base,
+        last_video_dts,
+        ost_idx,
+        max_written_pts_sec,
+    )?;
+
     // 2. Send EOF to encoder to flush it
-    if let Some(enc) = encoder {
-        enc.send_eof()?;
-        let mut out_pkt = ffmpeg::Packet::empty();
-        while enc.receive_packet(&mut out_pkt).is_ok() {
-            out_pkt.rescale_ts(enc.time_base(), video_out_time_base);
-            write_video_packet(
-                out_pkt,
-                video_codec_id,
-                last_video_dts,
-                stream_mapping[video_in_stream_idx] as usize,
-                output,
-            )?;
-            out_pkt = ffmpeg::Packet::empty();
-        }
+    enc.send_eof()?;
+    let mut out_pkt = ffmpeg::Packet::empty();
+    while enc.receive_packet(&mut out_pkt).is_ok() {
+        out_pkt.rescale_ts(enc.time_base(), video_out_time_base);
+        write_video_packet(
+            out_pkt,
+            video_codec_id,
+            last_video_dts,
+            ost_idx,
+            output,
+        )?;
+        out_pkt = ffmpeg::Packet::empty();
     }
 
     // 3. Clear/reset decoder & drop encoder
     decoder.flush();
     *encoder = None;
+    *last_encoded_frame_idx = None;
+    *last_decoded_frame = None;
 
     Ok(())
 }
@@ -355,6 +600,7 @@ pub fn export_video(
     metadata: VideoMetadata,
     status: Arc<Mutex<ExportStatus>>,
     cancel_flag: Arc<AtomicBool>,
+    defect_map: Option<Arc<RwLock<DefectMap>>>,
 ) -> Result<(), anyhow::Error> {
     // 1. Group frames into contiguous kept segments
     let mut kept_segments: Vec<(usize, usize)> = Vec::new();
@@ -387,36 +633,8 @@ pub fn export_video(
     let mut output_start_pts_sec = Vec::new();
 
     // 2. Classify GOPs
-    let mut gop_types = Vec::new();
-
-    for i in 0..metadata.keyframes.len() {
-        let start_frame = metadata.keyframes[i];
-        let end_frame = if i + 1 < metadata.keyframes.len() {
-            metadata.keyframes[i + 1]
-        } else {
-            metadata.total_frames
-        };
-
-        let mut kept_count = 0;
-        let mut cut_count = 0;
-        for f in start_frame..end_frame {
-            if crate::ui::is_frame_cut_helper(f, &ranges, cut_mode) {
-                cut_count += 1;
-            } else {
-                kept_count += 1;
-            }
-        }
-
-        let gop_type = if kept_count == (end_frame - start_frame) {
-            GopType::Copy
-        } else if cut_count == (end_frame - start_frame) {
-            GopType::Cut
-        } else {
-            GopType::Transcode
-        };
-
-        gop_types.push(gop_type);
-    }
+    let defect_guard = defect_map.as_ref().and_then(|dm| dm.read().ok());
+    let gop_types = classify_gops(&metadata, &ranges, cut_mode, defect_guard.as_deref());
 
     // Initialize FFmpeg
     ffmpeg::init()?;
@@ -532,6 +750,9 @@ pub fn export_video(
     let mut last_video_dts: Option<i64> = None;
     let mut last_audio_dts: Option<i64> = None;
     let mut last_gop_type: Option<GopType> = None;
+    let mut current_span_kept_frames: Vec<usize> = Vec::new();
+    let mut last_encoded_frame_idx: Option<usize> = None;
+    let mut last_decoded_frame: Option<ffmpeg::util::frame::Video> = None;
 
     let video_in_stream_rate = video_in_stream_idx.map(|idx| input.stream(idx).unwrap().rate()).unwrap_or(ffmpeg::Rational(24, 1));
     let total_packets = metadata.total_frames; // approximation for progress scale
@@ -574,8 +795,7 @@ pub fn export_video(
                         &mut video_decoder,
                         &mut video_encoder,
                         &mut output,
-                        &stream_mapping,
-                        video_in_stream_idx.unwrap(),
+                        stream_mapping[video_in_stream_idx.unwrap()] as usize,
                         video_codec_id,
                         video_in_time_base,
                         video_out_time_base,
@@ -586,7 +806,12 @@ pub fn export_video(
                         fps,
                         &output_start_pts_sec,
                         video_start_time,
+                        &current_span_kept_frames,
+                        &mut last_encoded_frame_idx,
+                        &mut last_decoded_frame,
+                        &mut max_written_pts_sec,
                     )?;
+                    current_span_kept_frames.clear();
                 }
             }
             last_gop_type = Some(gop_type);
@@ -665,8 +890,23 @@ pub fn export_video(
                                 video_in_time_base,
                                 video_in_stream_rate,
                             )?);
+                            let (span_start_gop, span_end_gop) = get_transcode_gop_span(gop_idx, &gop_types);
+                            let span_start_frame = metadata.keyframes[span_start_gop];
+                            let span_end_frame = if span_end_gop + 1 < metadata.keyframes.len() {
+                                metadata.keyframes[span_end_gop + 1]
+                            } else {
+                                metadata.total_frames
+                            };
+                            current_span_kept_frames = (span_start_frame..span_end_frame)
+                                .filter(|&f| !crate::ui::is_frame_cut_helper(f, &ranges, cut_mode))
+                                .collect();
+                            last_encoded_frame_idx = None;
+                            last_decoded_frame = None;
                         }
-                        decoder.send_packet(&packet)?;
+
+                        if let Err(e) = decoder.send_packet(&packet) {
+                            eprintln!("[WARN] Decoding error on damaged GOP packet (frame ~ {}): {:?}", frame_idx, e);
+                        }
                         
                         let mut decoded_frame = ffmpeg::util::frame::Video::empty();
                         while decoder.receive_frame(&mut decoded_frame).is_ok() {
@@ -675,73 +915,85 @@ pub fn export_video(
                             let f_idx = (f_pts_sec * fps).round() as usize;
 
                             if !crate::ui::is_frame_cut_helper(f_idx, &ranges, cut_mode) {
-                                if let Some(seg_idx) = kept_segments.iter().position(|&(start, end)| f_idx >= start && f_idx < end) {
-                                    let start_frame = kept_segments[seg_idx].0;
-                                    let out_pts_sec = (f_idx - start_frame) as f64 / fps + output_start_pts_sec[seg_idx];
-                                    max_written_pts_sec = max_written_pts_sec.max(out_pts_sec);
+                                let encoder = video_encoder.as_mut().unwrap();
+                                synthesize_missing_frames(
+                                    Some(f_idx),
+                                    &current_span_kept_frames,
+                                    &mut last_encoded_frame_idx,
+                                    &last_decoded_frame,
+                                    decoder,
+                                    encoder,
+                                    &mut output,
+                                    &kept_segments,
+                                    &output_start_pts_sec,
+                                    fps,
+                                    video_codec_id,
+                                    video_out_time_base,
+                                    &mut last_video_dts,
+                                    ost_idx as usize,
+                                    &mut max_written_pts_sec,
+                                )?;
 
-                                    let encoder = video_encoder.as_mut().unwrap();
-                                    let enc_pts = (out_pts_sec / (encoder.time_base().numerator() as f64 / encoder.time_base().denominator() as f64)).round() as i64;
-                                    
-                                    decoded_frame.set_pts(Some(enc_pts));
-                                    unsafe {
-                                        (*decoded_frame.as_mut_ptr()).pict_type = ffmpeg::sys::AVPictureType::AV_PICTURE_TYPE_NONE;
-                                    }
-                                    encoder.send_frame(&decoded_frame)?;
-
-                                    let mut out_pkt = ffmpeg::Packet::empty();
-                                    while encoder.receive_packet(&mut out_pkt).is_ok() {
-                                        out_pkt.rescale_ts(encoder.time_base(), video_out_time_base);
-                                        write_video_packet(
-                                            out_pkt,
-                                            video_codec_id,
-                                            &mut last_video_dts,
-                                            ost_idx as usize,
-                                            &mut output,
-                                        )?;
-                                        out_pkt = ffmpeg::Packet::empty();
-                                    }
-
-                                    // Update encoding status for every frame
-                                    let gop_idx = match metadata.keyframes.binary_search(&f_idx) {
-                                        Ok(i) => i,
-                                        Err(0) => 0,
-                                        Err(i) => i - 1,
-                                    };
-                                    let gop_start = metadata.keyframes[gop_idx];
-                                    let gop_end = if gop_idx + 1 < metadata.keyframes.len() {
-                                        metadata.keyframes[gop_idx + 1]
-                                    } else {
-                                        metadata.total_frames
-                                    };
-                                    let mut total_gop_transcode_frames = 0;
-                                    for f in gop_start..gop_end {
-                                        if !crate::ui::is_frame_cut_helper(f, &ranges, cut_mode) {
-                                            total_gop_transcode_frames += 1;
-                                        }
-                                    }
-                                    let mut current_gop_transcode_idx = 0;
-                                    for f in gop_start..=f_idx {
-                                        if !crate::ui::is_frame_cut_helper(f, &ranges, cut_mode) {
-                                            current_gop_transcode_idx += 1;
-                                        }
-                                    }
-                                    let msg = format!(
-                                        "Encoding frame {} of {} in GOP {}/{}",
-                                        current_gop_transcode_idx,
-                                        total_gop_transcode_frames,
-                                        gop_idx + 1,
-                                        metadata.keyframes.len()
-                                    );
-                                    let progress = get_progress(max_written_pts_sec);
-                                    let mut status_guard = status.lock().unwrap();
-                                    *status_guard = ExportStatus::Exporting {
-                                        progress,
-                                        message: msg,
-                                        is_encoding: true,
-                                        current_frame: f_idx,
-                                    };
+                                if last_encoded_frame_idx.map_or(true, |last| f_idx > last) {
+                                    send_frame_to_encoder(
+                                        &mut decoded_frame,
+                                        f_idx,
+                                        encoder,
+                                        &mut output,
+                                        &kept_segments,
+                                        &output_start_pts_sec,
+                                        fps,
+                                        video_codec_id,
+                                        video_out_time_base,
+                                        &mut last_video_dts,
+                                        ost_idx as usize,
+                                        &mut max_written_pts_sec,
+                                    )?;
+                                    last_encoded_frame_idx = Some(f_idx);
+                                    last_decoded_frame = Some(clone_video_frame(&decoded_frame));
                                 }
+
+                                // Update encoding status for every frame
+                                let gop_idx = match metadata.keyframes.binary_search(&f_idx) {
+                                    Ok(i) => i,
+                                    Err(0) => 0,
+                                    Err(i) => i - 1,
+                                };
+                                let gop_start = metadata.keyframes[gop_idx];
+                                let gop_end = if gop_idx + 1 < metadata.keyframes.len() {
+                                    metadata.keyframes[gop_idx + 1]
+                                } else {
+                                    metadata.total_frames
+                                };
+                                let mut total_gop_transcode_frames = 0;
+                                for f in gop_start..gop_end {
+                                    if !crate::ui::is_frame_cut_helper(f, &ranges, cut_mode) {
+                                        total_gop_transcode_frames += 1;
+                                    }
+                                }
+                                let mut current_gop_transcode_idx = 0;
+                                for f in gop_start..=f_idx {
+                                    if !crate::ui::is_frame_cut_helper(f, &ranges, cut_mode) {
+                                        current_gop_transcode_idx += 1;
+                                    }
+                                }
+                                let msg = format!(
+                                    "Encoding frame {} of {} in GOP {}/{}",
+                                    current_gop_transcode_idx,
+                                    total_gop_transcode_frames,
+                                    gop_idx + 1,
+                                    metadata.keyframes.len()
+                                );
+                                let progress = get_progress(max_written_pts_sec);
+                                let mut status_guard = status.lock().unwrap();
+                                *status_guard = ExportStatus::Exporting {
+                                    progress,
+                                    message: msg,
+                                    is_encoding: true,
+                                    current_frame: f_idx,
+                                };
+                            } else {
+                                last_decoded_frame = Some(clone_video_frame(&decoded_frame));
                             }
                         }
                     }
@@ -826,8 +1078,7 @@ pub fn export_video(
         &mut video_decoder,
         &mut video_encoder,
         &mut output,
-        &stream_mapping,
-        video_in_stream_idx.unwrap(),
+        stream_mapping[video_in_stream_idx.unwrap()] as usize,
         video_codec_id,
         video_in_time_base,
         video_out_time_base,
@@ -838,7 +1089,12 @@ pub fn export_video(
         fps,
         &output_start_pts_sec,
         video_start_time,
+        &current_span_kept_frames,
+        &mut last_encoded_frame_idx,
+        &mut last_decoded_frame,
+        &mut max_written_pts_sec,
     )?;
+    current_span_kept_frames.clear();
 
     output.write_trailer()?;
 
@@ -875,44 +1131,119 @@ mod tests {
 
         // Scenario 1: cut_mode = false (keep ranges). Keep range = [0, 9] (GOP 0 kept, GOP 1 and 2 cut)
         let ranges = vec![ExportRange { id: 1, in_frame: 0, out_frame: 9 }];
-        
-        let classify = |ranges: &[ExportRange]| {
-            let mut gops = Vec::new();
-            for i in 0..metadata.keyframes.len() {
-                let start_frame = metadata.keyframes[i];
-                let end_frame = if i + 1 < metadata.keyframes.len() {
-                    metadata.keyframes[i + 1]
-                } else {
-                    metadata.total_frames
-                };
-
-                let mut kept_count = 0;
-                let mut cut_count = 0;
-                for f in start_frame..end_frame {
-                    if crate::ui::is_frame_cut_helper(f, ranges, false) {
-                        cut_count += 1;
-                    } else {
-                        kept_count += 1;
-                    }
-                }
-
-                let gop_type = if kept_count == (end_frame - start_frame) {
-                    GopType::Copy
-                } else if cut_count == (end_frame - start_frame) {
-                    GopType::Cut
-                } else {
-                    GopType::Transcode
-                };
-                gops.push(gop_type);
-            }
-            gops
-        };
-
-        assert_eq!(classify(&ranges), vec![GopType::Copy, GopType::Cut, GopType::Cut]);
+        assert_eq!(
+            classify_gops(&metadata, &ranges, false, None),
+            vec![GopType::Copy, GopType::Cut, GopType::Cut]
+        );
 
         // Scenario 2: Keep range = [5, 14]. GOP 0 is PartiallyKept (Transcode), GOP 1 is PartiallyKept (Transcode), GOP 2 is FullyCut (Cut)
         let ranges2 = vec![ExportRange { id: 1, in_frame: 5, out_frame: 14 }];
-        assert_eq!(classify(&ranges2), vec![GopType::Transcode, GopType::Transcode, GopType::Cut]);
+        assert_eq!(
+            classify_gops(&metadata, &ranges2, false, None),
+            vec![GopType::Transcode, GopType::Transcode, GopType::Cut]
+        );
+
+        // Scenario 3: All kept -> all Copy
+        let ranges3 = vec![ExportRange { id: 1, in_frame: 0, out_frame: 29 }];
+        assert_eq!(
+            classify_gops(&metadata, &ranges3, false, None),
+            vec![GopType::Copy, GopType::Copy, GopType::Copy]
+        );
+    }
+
+    #[test]
+    fn test_classify_gops_defect_map_demotion() {
+        use crate::media::types::{DefectErrorType, StreamTypeMask};
+
+        let keyframes = vec![0, 30, 60];
+        let total_frames = 90;
+        let fps = 30.0;
+        let metadata = VideoMetadata {
+            total_frames,
+            width: 1280,
+            height: 720,
+            fps,
+            has_audio: true,
+            keyframes,
+            keyframes_pts: vec![0, 30, 60],
+        };
+
+        // GOP 0: frames 0..30 -> 0.0s to 1.0s
+        // GOP 1: frames 30..60 -> 1.0s to 2.0s
+        // GOP 2: frames 60..90 -> 2.0s to 3.0s
+
+        // All frames kept: normally all 3 GOPs are GopType::Copy
+        let ranges = vec![ExportRange { id: 1, in_frame: 0, out_frame: 89 }];
+        assert_eq!(
+            classify_gops(&metadata, &ranges, false, None),
+            vec![GopType::Copy, GopType::Copy, GopType::Copy]
+        );
+
+        // Test 1: Video defect in GOP 1 (from 1.2s to 1.4s) demotes GOP 1 to Transcode
+        let mut defect_map = DefectMap::new();
+        defect_map.insert_or_coalesce(
+            1.2,
+            0.2,
+            StreamTypeMask::VIDEO,
+            DefectErrorType::CorruptBitstreamPayload,
+            Some(1),
+        );
+        assert_eq!(
+            classify_gops(&metadata, &ranges, false, Some(&defect_map)),
+            vec![GopType::Copy, GopType::Transcode, GopType::Copy]
+        );
+
+        // Test 2: Audio-only defect should NOT demote video GOP to Transcode
+        let mut audio_defect_map = DefectMap::new();
+        audio_defect_map.insert_or_coalesce(
+            1.2,
+            0.2,
+            StreamTypeMask::AUDIO,
+            DefectErrorType::TimestampDiscontinuity,
+            Some(1),
+        );
+        assert_eq!(
+            classify_gops(&metadata, &ranges, false, Some(&audio_defect_map)),
+            vec![GopType::Copy, GopType::Copy, GopType::Copy]
+        );
+
+        // Test 3: Video defect straddling boundary between GOP 0 and GOP 1 (0.95s to 1.05s)
+        let mut straddle_map = DefectMap::new();
+        straddle_map.insert_or_coalesce(
+            0.95,
+            0.10,
+            StreamTypeMask::VIDEO,
+            DefectErrorType::CorruptBitstreamPayload,
+            None,
+        );
+        assert_eq!(
+            classify_gops(&metadata, &ranges, false, Some(&straddle_map)),
+            vec![GopType::Transcode, GopType::Transcode, GopType::Copy]
+        );
+
+        // Test 4: Defect in a GOP that is Cut remains Cut (not demoted)
+        let cut_gop1_ranges = vec![
+            ExportRange { id: 1, in_frame: 0, out_frame: 29 },
+            ExportRange { id: 2, in_frame: 60, out_frame: 89 },
+        ];
+        assert_eq!(
+            classify_gops(&metadata, &cut_gop1_ranges, false, Some(&defect_map)),
+            vec![GopType::Copy, GopType::Cut, GopType::Copy]
+        );
+    }
+
+    #[test]
+    fn test_synthesize_frame_helpers() {
+        ffmpeg::init().unwrap();
+        let blank = create_blank_frame(ffmpeg::format::Pixel::YUV420P, 64, 64);
+        assert_eq!(blank.format(), ffmpeg::format::Pixel::YUV420P);
+        assert_eq!(blank.width(), 64);
+        assert_eq!(blank.height(), 64);
+
+        let cloned = clone_video_frame(&blank);
+        assert_eq!(cloned.format(), ffmpeg::format::Pixel::YUV420P);
+        assert_eq!(cloned.width(), 64);
+        assert_eq!(cloned.height(), 64);
     }
 
     #[test]
@@ -984,6 +1315,7 @@ mod tests {
             metadata,
             status.clone(),
             cancel_flag,
+            None,
         );
 
         assert!(result.is_ok(), "export_video failed: {:?}", result.err());
